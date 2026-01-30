@@ -242,7 +242,7 @@ fn print_banner() {
     print("\n");
     print(" ┌─────────────────────────────────────────────┐\n");
     print(" │ Welcome~! Meow-chan is online nya~! ♪(=^･ω･^)ﾉ │\n");
-    print(" │ Ready to help with all your cyber-needs!    │\n");
+    print(" │ Press ESC to cancel requests~               │\n");
     print(" └─────────────────────────────────────────────┘\n\n");
 }
 
@@ -545,6 +545,12 @@ fn read_streaming_response_with_progress(stream: &TcpStream, start_time: u64) ->
 
     // Read response in chunks
     loop {
+        // Check for escape key press to cancel
+        if check_escape_pressed() {
+            print("\n[cancelled]");
+            return Err("Request cancelled");
+        }
+
         match stream.read(&mut buf) {
             Ok(0) => {
                 // EOF - if we haven't received any response, this is an error
@@ -780,6 +786,22 @@ fn print_elapsed(ms: u64) {
 // ============================================================================
 // Input Handling
 // ============================================================================
+
+/// Check if escape key was pressed (non-blocking)
+/// Returns true if ESC (0x1B) was detected
+fn check_escape_pressed() -> bool {
+    let mut buf = [0u8; 8];
+    let n = read(fd::STDIN, &mut buf);
+    if n > 0 {
+        // Check for escape key (0x1B)
+        for i in 0..(n as usize) {
+            if buf[i] == 0x1B {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 /// Read a line from stdin (blocking with polling)
 /// Returns None on EOF (Ctrl+D on empty line)
