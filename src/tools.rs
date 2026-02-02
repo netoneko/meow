@@ -975,16 +975,9 @@ fn tool_git_clone(url: &str) -> ToolResult {
     tool_shell(&format!("scratch clone {}", url))
 }
 
-/// Pull from remote (fetch + checkout)
+/// Pull from remote (fetch + fast-forward merge)
 fn tool_git_pull() -> ToolResult {
-    // First fetch
-    let fetch_result = tool_shell("scratch fetch");
-    if !fetch_result.success {
-        return fetch_result;
-    }
-    
-    // Note: actual merge/checkout after fetch not yet implemented in scratch
-    ToolResult::ok(format!("{}\nNote: Pull fetched updates. Manual checkout may be needed.", fetch_result.output))
+    tool_shell("scratch pull")
 }
 
 /// Fetch from remote
