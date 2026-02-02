@@ -488,7 +488,7 @@ fn find_matching_brace(s: &str) -> Option<usize> {
 // ============================================================================
 
 // Keep file operations reasonable to avoid OOM
-const MAX_FILE_SIZE: usize = 32 * 1024; // 32KB max
+const MAX_FILE_SIZE: usize = 512 * 1024; // 512KB max
 
 fn tool_file_read(filename: &str) -> ToolResult {
     let resolved = match resolve_path_or_err(filename) {
@@ -513,7 +513,7 @@ fn tool_file_read(filename: &str) -> ToolResult {
     let size = stat.st_size as usize;
     if size > MAX_FILE_SIZE {
         close(fd);
-        return ToolResult::err("File too large (max 32KB)");
+        return ToolResult::err("File too large (max 512KB)");
     }
     
     let mut buf = alloc::vec![0u8; size];

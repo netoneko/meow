@@ -206,8 +206,14 @@ After cloning, use Cd to enter the repository before running other git commands.
 - The system will execute the command and provide the result
 - Then you can continue your response based on the result
 - You can use multiple tools in sequence by waiting for each result
+
+CRITICAL
+- Do NOT simulate or make up tool results. Do NOT write what you think the output would be.
+- ONLY output the function call format above, nothing else.
 - Every tool call should be a separate JSON command block in a separate response
 - If you state an intent to use the tool, you should actually check if you called the tool, your output should contain the tool call (if you intend to read a file, you should call the FileRead tool and so on)
+
+CRITICAL: If you find yourself writing phrases like "the API returned..." or "according to the tool..." STOP IMMEDIATELY - you are hallucinating tool results. Output the actual function call instead.
 
 ### Sandbox:
 - All file operations are sandboxed to the current working directory (set via Cd)
@@ -1151,6 +1157,23 @@ fn read_streaming_with_http_stream_tls(
                 libakuma::sleep_ms(10);
             }
             StreamResult::Done => {
+                // Process any remaining data in pending_lines that didn't end with newline
+                let remaining = pending_lines.trim();
+                if !remaining.is_empty() {
+                    if let Some((content, _done)) = parse_streaming_line(remaining, provider) {
+                        if !content.is_empty() {
+                            if !first_token_received {
+                                first_token_received = true;
+                                let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
+                                print(" ");
+                                print_elapsed(elapsed_ms);
+                                print("\n");
+                            }
+                            print(&content);
+                            full_response.push_str(&content);
+                        }
+                    }
+                }
                 break;
             }
             StreamResult::Error(e) => {
@@ -1165,6 +1188,9 @@ fn read_streaming_with_http_stream_tls(
     Ok(full_response)
 }
 
+// Default max tokens for model output - high enough to not truncate tool calls
+const DEFAULT_MAX_TOKENS: usize = 16384;
+
 fn build_chat_request(model: &str, provider: &Provider, history: &[Message]) -> (String, String) {
     let mut messages_json = String::from("[");
     for (i, msg) in history.iter().enumerate() {
@@ -1177,16 +1203,18 @@ fn build_chat_request(model: &str, provider: &Provider, history: &[Message]) -> 
 
     match provider.api_type {
         ApiType::Ollama => {
+            // Use num_predict option to set max output tokens
             let body = format!(
-                "{{\"model\":\"{}\",\"messages\":{},\"stream\":true}}",
-                model, messages_json
+                "{{\"model\":\"{}\",\"messages\":{},\"stream\":true,\"options\":{{\"num_predict\":{}}}}}",
+                model, messages_json, DEFAULT_MAX_TOKENS
             );
             (String::from("/api/chat"), body)
         }
         ApiType::OpenAI => {
+            // Use max_tokens for OpenAI-compatible APIs
             let body = format!(
-                "{{\"model\":\"{}\",\"messages\":{},\"stream\":true}}",
-                model, messages_json
+                "{{\"model\":\"{}\",\"messages\":{},\"stream\":true,\"max_tokens\":{}}}",
+                model, messages_json, DEFAULT_MAX_TOKENS
             );
             // Use base_path from URL if provided
             let base = provider.base_path();
@@ -1263,6 +1291,29 @@ fn read_streaming_response_with_progress(
             Ok(0) => {
                 if !any_data_received {
                     return Err("Connection closed by server");
+                }
+                // Process any remaining data in pending_data before returning
+                if let Ok(remaining_str) = core::str::from_utf8(&pending_data) {
+                    let remaining = remaining_str.trim();
+                    if !remaining.is_empty() {
+                        for line in remaining.lines() {
+                            if let Some((content, _done)) = parse_streaming_line(line, provider) {
+                                if !content.is_empty() {
+                                    if !first_token_received {
+                                        first_token_received = true;
+                                        let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
+                                        for _ in 0..(7 + dots_printed) {
+                                            print("\x08 \x08");
+                                        }
+                                        print_elapsed(elapsed_ms);
+                                        print("\n");
+                                    }
+                                    print(&content);
+                                    full_response.push_str(&content);
+                                }
+                            }
+                        }
+                    }
                 }
                 break;
             }
