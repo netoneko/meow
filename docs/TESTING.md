@@ -1,5 +1,12 @@
 # Testing
 
+## Set up the repo
+
+```bash
+pkg install meow
+scratch clone https://github.com/netoneko/meow.git
+```
+
 ## Running a single non-interactive promt test
 
 ```bash
