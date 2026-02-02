@@ -206,8 +206,14 @@ After cloning, use Cd to enter the repository before running other git commands.
 - The system will execute the command and provide the result
 - Then you can continue your response based on the result
 - You can use multiple tools in sequence by waiting for each result
+
+CRITICAL
+- Do NOT simulate or make up tool results. Do NOT write what you think the output would be.
+- ONLY output the function call format above, nothing else.
 - Every tool call should be a separate JSON command block in a separate response
 - If you state an intent to use the tool, you should actually check if you called the tool, your output should contain the tool call (if you intend to read a file, you should call the FileRead tool and so on)
+
+CRITICAL: If you find yourself writing phrases like "the API returned..." or "according to the tool..." STOP IMMEDIATELY - you are hallucinating tool results. Output the actual function call instead.
 
 ### Sandbox:
 - All file operations are sandboxed to the current working directory (set via Cd)
@@ -909,6 +915,70 @@ fn send_with_retry(
     Err("Max retries exceeded")
 }
 
+const MAX_TOOL_ITERATIONS: usize = 20;
+
+/// Extract intent phrases like "Let me..." from text, capturing until newline or sentence end
+fn extract_intent_phrases(text: &str) -> Vec<String> {
+    let starters = ["Let me", "I'll ", "I will ", "First, ", "Now I'll", "Now let me", "First I'll", "First let me"];
+    
+    // Phrases that look like intents but are actually offers/questions, not action statements
+    let exclusions = [
+        "let me know",
+        "let me explain",
+        "let me summarize", 
+        "let me clarify",
+        "i'll help",
+        "i'll be happy",
+        "i'll wait",
+        "i will help",
+        "i will be happy",
+        "i will wait",
+        "if you need",
+        "if you want",
+        "if you'd like",
+    ];
+    
+    let mut intents = Vec::new();
+    
+    for starter in starters {
+        let lower_text = text.to_lowercase();
+        let lower_starter = starter.to_lowercase();
+        
+        let mut search_start = 0;
+        while let Some(pos) = lower_text[search_start..].find(&lower_starter) {
+            let abs_pos = search_start + pos;
+            let after_starter = &text[abs_pos..];
+            
+            // Find end of this intent: newline or sentence end (. ! ?)
+            let mut end_pos = after_starter.len();
+            for (i, c) in after_starter.char_indices() {
+                if c == '\n' || c == '.' || c == '!' || c == '?' {
+                    end_pos = i + 1; // Include the punctuation
+                    break;
+                }
+            }
+            
+            let intent = after_starter[..end_pos].trim();
+            let intent_lower = intent.to_lowercase();
+            
+            // Check if this matches an exclusion pattern
+            let is_excluded = exclusions.iter().any(|excl| intent_lower.contains(excl));
+            
+            if !is_excluded && !intent.is_empty() && intent.len() > starter.len() {
+                // Avoid duplicates
+                let intent_str = String::from(intent);
+                if !intents.contains(&intent_str) {
+                    intents.push(intent_str);
+                }
+            }
+            
+            search_start = abs_pos + 1;
+        }
+    }
+    
+    intents
+}
+
 fn chat_once(
     model: &str,
     provider: &Provider,
@@ -919,10 +989,16 @@ fn chat_once(
     trim_history(history);
     history.push(Message::new("user", user_message));
 
-    let max_tool_iterations = 5;
-
-    for iteration in 0..max_tool_iterations {
+    // Track tool calls and stated intentions across all iterations
+    for iteration in 0..MAX_TOOL_ITERATIONS {
+        let mut total_tools_called: usize = 0;
+        let mut all_responses = String::new();
+    
         let assistant_response = send_with_retry(model, provider, history, iteration > 0)?;
+
+        // Accumulate all responses for intent counting
+        all_responses.push_str(&assistant_response);
+        all_responses.push('\n');
 
         // First check for CompactContext tool (handled specially)
         if let Some(compact_result) = try_execute_compact_context(&assistant_response, history) {
@@ -935,12 +1011,15 @@ fn chat_once(
                 print(&compact_result.output);
             }
             print("\n\n");
+            total_tools_called += 1;
             return Ok(());
         }
 
         let (text_before_tool, tool_result) = tools::find_and_execute_tool(&assistant_response);
 
         if let Some(result) = tool_result {
+            total_tools_called += 1;
+            
             if !text_before_tool.is_empty() {
                 history.push(Message::new("assistant", &text_before_tool));
             }
@@ -961,15 +1040,47 @@ fn chat_once(
                 result.output, current_cwd
             );
             history.push(Message::new("user", &tool_result_msg));
-            
+                        
             // Compact after tool execution to release memory
             compact_history(history);
 
             continue;
         }
 
+        // No tool found - this is the final response
         if !assistant_response.is_empty() {
             history.push(Message::new("assistant", &assistant_response));
+        }
+
+        // Extract intent phrases from all accumulated responses
+        let intent_phrases = extract_intent_phrases(&all_responses);
+
+        print(&format!("Intent phrases: {:?}, tools called: {:?}\n", intent_phrases.len(), total_tools_called));
+
+        // Check for mismatch: stated intentions but no tool calls
+        if !intent_phrases.is_empty() && total_tools_called == 0 {
+            // Model stated intent but never called any tools
+            print(&format!(
+                "\n[!] Detected {} intent phrase(s) but {} tool call(s) - prompting self-check\n",
+                intent_phrases.len(), total_tools_called
+            ));
+            
+            // Format the intents as a list
+            let mut intents_list = String::new();
+            for (i, intent) in intent_phrases.iter().enumerate() {
+                intents_list.push_str(&format!("  {}. \"{}\"\n", i + 1, intent));
+            }
+            
+            // Add a prompt for the model to self-check with the actual stated intents
+            let self_check_msg = format!(
+                "[System Notice] You stated the following intention(s) but made 0 tool calls:\n{}\n\
+                Did you forget to output the tool call JSON? Please complete the actions you stated.",
+                intents_list
+            );
+            history.push(Message::new("user", &self_check_msg));
+            
+            // Give the model another chance to complete the tool call
+            continue;
         }
 
         // Check if we should hint about context compaction
@@ -1151,6 +1262,23 @@ fn read_streaming_with_http_stream_tls(
                 libakuma::sleep_ms(10);
             }
             StreamResult::Done => {
+                // Process any remaining data in pending_lines that didn't end with newline
+                let remaining = pending_lines.trim();
+                if !remaining.is_empty() {
+                    if let Some((content, _done)) = parse_streaming_line(remaining, provider) {
+                        if !content.is_empty() {
+                            if !first_token_received {
+                                first_token_received = true;
+                                let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
+                                print(" ");
+                                print_elapsed(elapsed_ms);
+                                print("\n");
+                            }
+                            print(&content);
+                            full_response.push_str(&content);
+                        }
+                    }
+                }
                 break;
             }
             StreamResult::Error(e) => {
@@ -1165,6 +1293,9 @@ fn read_streaming_with_http_stream_tls(
     Ok(full_response)
 }
 
+// Default max tokens for model output - high enough to not truncate tool calls
+const DEFAULT_MAX_TOKENS: usize = 16384;
+
 fn build_chat_request(model: &str, provider: &Provider, history: &[Message]) -> (String, String) {
     let mut messages_json = String::from("[");
     for (i, msg) in history.iter().enumerate() {
@@ -1177,16 +1308,18 @@ fn build_chat_request(model: &str, provider: &Provider, history: &[Message]) -> 
 
     match provider.api_type {
         ApiType::Ollama => {
+            // Use num_predict option to set max output tokens
             let body = format!(
-                "{{\"model\":\"{}\",\"messages\":{},\"stream\":true}}",
-                model, messages_json
+                "{{\"model\":\"{}\",\"messages\":{},\"stream\":true,\"options\":{{\"num_predict\":{}}}}}",
+                model, messages_json, DEFAULT_MAX_TOKENS
             );
             (String::from("/api/chat"), body)
         }
         ApiType::OpenAI => {
+            // Use max_tokens for OpenAI-compatible APIs
             let body = format!(
-                "{{\"model\":\"{}\",\"messages\":{},\"stream\":true}}",
-                model, messages_json
+                "{{\"model\":\"{}\",\"messages\":{},\"stream\":true,\"max_tokens\":{}}}",
+                model, messages_json, DEFAULT_MAX_TOKENS
             );
             // Use base_path from URL if provided
             let base = provider.base_path();
@@ -1263,6 +1396,29 @@ fn read_streaming_response_with_progress(
             Ok(0) => {
                 if !any_data_received {
                     return Err("Connection closed by server");
+                }
+                // Process any remaining data in pending_data before returning
+                if let Ok(remaining_str) = core::str::from_utf8(&pending_data) {
+                    let remaining = remaining_str.trim();
+                    if !remaining.is_empty() {
+                        for line in remaining.lines() {
+                            if let Some((content, _done)) = parse_streaming_line(line, provider) {
+                                if !content.is_empty() {
+                                    if !first_token_received {
+                                        first_token_received = true;
+                                        let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
+                                        for _ in 0..(7 + dots_printed) {
+                                            print("\x08 \x08");
+                                        }
+                                        print_elapsed(elapsed_ms);
+                                        print("\n");
+                                    }
+                                    print(&content);
+                                    full_response.push_str(&content);
+                                }
+                            }
+                        }
+                    }
                 }
                 break;
             }
