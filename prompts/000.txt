@@ -1,0 +1,1 @@
+can you create a new file meow.js with a console.log with a random cybepunk greeting, show the written file context, add this file to git using scratch command, then commit, then push to current branch
