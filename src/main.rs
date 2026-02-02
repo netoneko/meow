@@ -915,6 +915,8 @@ fn send_with_retry(
     Err("Max retries exceeded")
 }
 
+const MAX_TOOL_ITERATIONS: usize = 20;
+
 fn chat_once(
     model: &str,
     provider: &Provider,
@@ -925,9 +927,7 @@ fn chat_once(
     trim_history(history);
     history.push(Message::new("user", user_message));
 
-    let max_tool_iterations = 5;
-
-    for iteration in 0..max_tool_iterations {
+    for iteration in 0..MAX_TOOL_ITERATIONS {
         let assistant_response = send_with_retry(model, provider, history, iteration > 0)?;
 
         // First check for CompactContext tool (handled specially)
