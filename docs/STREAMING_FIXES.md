@@ -90,13 +90,101 @@ Ok(0) => {
 }
 ```
 
+## Issue 3: Stream Interruption Recovery
+
+### Symptom
+
+The model's response gets cut off mid-stream (connection closes before `done=true`), but meow would either:
+1. Silently accept the truncated response as complete, or
+2. Retry from scratch, losing the partial response and re-evaluating the entire context
+
+Example output showing truncation:
+```
+[continuing..] ~(=^‥^)ノ [18.6s]
+I'll create the files with the prompts~ (ฅ^•ﻌ•^ฅ)
+
+First, let me write the coding prompt to prompts/002.txt:Intent phrases: 3, tools called: 0
+```
+
+The response ended at "002.txt:" without the tool call JSON.
+
+### Cause
+
+When the server closes the connection (`Ok(0)` in HTTP, `StreamResult::Done` in TLS) before sending the done signal, the code was returning whatever partial data was received as a successful response. This meant:
+- Partial responses were treated as complete
+- The retry logic never triggered (only triggers on `Err`)
+- Even if retry did trigger, it would regenerate the entire response from scratch
+
+### Fix: Append Partial + Continue
+
+Instead of retrying from scratch, meow now detects incomplete streams and asks the model to continue:
+
+1. **Added `StreamResponse` enum**:
+```rust
+enum StreamResponse {
+    Complete(String),  // Server sent done signal
+    Partial(String),   // Connection closed before done signal
+}
+```
+
+2. **Streaming functions track completion**:
+```rust
+let mut stream_completed = false;
+// ... set to true only when done signal received ...
+
+if !stream_completed && !full_response.is_empty() {
+    print("\n[!] Stream interrupted, will continue...\n");
+    return Ok(StreamResponse::Partial(full_response));
+}
+```
+
+3. **Main loop handles partial responses**:
+```rust
+let stream_result = send_with_retry(model, provider, history, iteration > 0)?;
+
+let assistant_response = match stream_result {
+    StreamResponse::Complete(response) => response,
+    StreamResponse::Partial(partial) => {
+        // Add partial as assistant message
+        history.push(Message::new("assistant", &partial));
+        // Ask model to continue
+        history.push(Message::new("user", 
+            "[System: Your response was cut off mid-stream. Please continue exactly where you left off.]"));
+        continue;  // Next iteration continues from where we left off
+    }
+};
+```
+
+### Benefits
+
+- **No regeneration**: The partial response is preserved, model continues from where it stopped
+- **KV cache efficiency**: Ollama caches key-value states for prompts, so the unchanged prefix evaluates much faster
+- **No duplicate content**: Model sees its own partial output and continues naturally
+- **Bounded by MAX_TOOL_ITERATIONS**: Safety limit (20) prevents infinite continuation loops
+
+### User-visible behavior
+
+When a stream is interrupted:
+```
+[jacking in..] ~(=^‥^)ノ [5.2s]
+I'll read the file to check...
+[!] Stream interrupted, will continue...
+[continuing..] ~(=^‥^)ノ [1.8s]
+
+```json
+{"command": "FileRead", "path": "src/main.rs"}
+```
+
+The second request is typically faster due to Ollama's KV cache.
+
 ## Notes
 
 - The `max_tokens` fix is the primary solution for the "forgets to call tools" issue
 - The stream processing fix is a safety net for edge cases where connections close unexpectedly
-- When the model properly sends its done signal (`"done":true` for Ollama, `data: [DONE]` for OpenAI), we return immediately - the stream-close handling is a fallback
+- The stream continuation fix handles cases where the connection drops mid-response
+- When the model properly sends its done signal (`"done":true` for Ollama, `data: [DONE]` for OpenAI), we return immediately
 - The 16384 token limit is generous enough for most responses while being within typical model context windows
 
 ## Related Files
 
-- `src/main.rs`: `build_chat_request()`, `read_streaming_with_http_stream_tls()`, `read_streaming_response_with_progress()`
+- `src/main.rs`: `StreamResponse`, `build_chat_request()`, `read_streaming_with_http_stream_tls()`, `read_streaming_response_with_progress()`, `chat_once()`

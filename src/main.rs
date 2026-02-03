@@ -791,13 +791,21 @@ fn compact_history(history: &mut Vec<Message>) {
 
 const MAX_RETRIES: u32 = 10;
 
+/// Result of streaming a response from the model
+enum StreamResponse {
+    /// Response completed normally (server sent done signal)
+    Complete(String),
+    /// Response was interrupted mid-stream (connection closed before done signal)
+    Partial(String),
+}
+
 /// Attempt to send request with retries and exponential backoff
 fn send_with_retry(
     model: &str,
     provider: &Provider,
     history: &[Message],
     is_continuation: bool,
-) -> Result<String, &'static str> {
+) -> Result<StreamResponse, &'static str> {
     let mut backoff_ms: u64 = 500;
 
     if is_continuation {
@@ -994,7 +1002,23 @@ fn chat_once(
         let mut total_tools_called: usize = 0;
         let mut all_responses = String::new();
     
-        let assistant_response = send_with_retry(model, provider, history, iteration > 0)?;
+        let stream_result = send_with_retry(model, provider, history, iteration > 0)?;
+        
+        // Handle partial responses (stream interrupted before completion)
+        let assistant_response = match stream_result {
+            StreamResponse::Complete(response) => response,
+            StreamResponse::Partial(partial) => {
+                // Add partial response as assistant message
+                if !partial.is_empty() {
+                    history.push(Message::new("assistant", &partial));
+                    // Add continuation prompt
+                    history.push(Message::new("user", 
+                        "[System: Your response was cut off mid-stream. Please continue exactly where you left off.]"));
+                }
+                // Continue to next iteration to get the rest
+                continue;
+            }
+        };
 
         // Accumulate all responses for intent counting
         all_responses.push_str(&assistant_response);
@@ -1199,10 +1223,11 @@ fn read_streaming_with_http_stream_tls(
     stream: &mut HttpStreamTls<'_>,
     start_time: u64,
     provider: &Provider,
-) -> Result<String, &'static str> {
+) -> Result<StreamResponse, &'static str> {
     let mut full_response = String::new();
     let mut pending_lines = String::new();
     let mut first_token_received = false;
+    let mut stream_completed = false;
 
     const RESPONSE_WARNING_THRESHOLD: usize = 64 * 1024;
     let mut warned_large_response = false;
@@ -1249,7 +1274,8 @@ fn read_streaming_with_http_stream_tls(
                                 }
                             }
                             if done {
-                                return Ok(full_response);
+                                stream_completed = true;
+                                return Ok(StreamResponse::Complete(full_response));
                             }
                         }
                     }
@@ -1265,7 +1291,7 @@ fn read_streaming_with_http_stream_tls(
                 // Process any remaining data in pending_lines that didn't end with newline
                 let remaining = pending_lines.trim();
                 if !remaining.is_empty() {
-                    if let Some((content, _done)) = parse_streaming_line(remaining, provider) {
+                    if let Some((content, done)) = parse_streaming_line(remaining, provider) {
                         if !content.is_empty() {
                             if !first_token_received {
                                 first_token_received = true;
@@ -1276,6 +1302,9 @@ fn read_streaming_with_http_stream_tls(
                             }
                             print(&content);
                             full_response.push_str(&content);
+                        }
+                        if done {
+                            stream_completed = true;
                         }
                     }
                 }
@@ -1288,9 +1317,17 @@ fn read_streaming_with_http_stream_tls(
         }
     }
 
+    // Check if stream completed properly
+    if !stream_completed && !full_response.is_empty() {
+        // Return partial response for continuation
+        print("\n[!] Stream interrupted, will continue...\n");
+        full_response.shrink_to_fit();
+        return Ok(StreamResponse::Partial(full_response));
+    }
+
     // Compact the response to release excess capacity
     full_response.shrink_to_fit();
-    Ok(full_response)
+    Ok(StreamResponse::Complete(full_response))
 }
 
 // Default max tokens for model output - high enough to not truncate tool calls
@@ -1373,7 +1410,7 @@ fn read_streaming_response_with_progress(
     stream: &TcpStream,
     start_time: u64,
     provider: &Provider,
-) -> Result<String, &'static str> {
+) -> Result<StreamResponse, &'static str> {
     let mut buf = [0u8; 1024];
     let mut pending_data = Vec::new();
     let mut headers_parsed = false;
@@ -1382,6 +1419,7 @@ fn read_streaming_response_with_progress(
     let mut dots_printed = 0u32;
     let mut first_token_received = false;
     let mut any_data_received = false;
+    let mut stream_completed = false;
 
     const RESPONSE_WARNING_THRESHOLD: usize = 64 * 1024;
     let mut warned_large_response = false;
@@ -1402,7 +1440,7 @@ fn read_streaming_response_with_progress(
                     let remaining = remaining_str.trim();
                     if !remaining.is_empty() {
                         for line in remaining.lines() {
-                            if let Some((content, _done)) = parse_streaming_line(line, provider) {
+                            if let Some((content, done)) = parse_streaming_line(line, provider) {
                                 if !content.is_empty() {
                                     if !first_token_received {
                                         first_token_received = true;
@@ -1415,6 +1453,9 @@ fn read_streaming_response_with_progress(
                                     }
                                     print(&content);
                                     full_response.push_str(&content);
+                                }
+                                if done {
+                                    stream_completed = true;
                                 }
                             }
                         }
@@ -1507,7 +1548,8 @@ fn read_streaming_response_with_progress(
                     }
 
                     if is_done {
-                        return Ok(full_response);
+                        stream_completed = true;
+                        return Ok(StreamResponse::Complete(full_response));
                     }
                 }
             }
@@ -1539,9 +1581,17 @@ fn read_streaming_response_with_progress(
         }
     }
 
+    // Check if stream completed properly
+    if !stream_completed && !full_response.is_empty() {
+        // Return partial response for continuation
+        print("\n[!] Stream interrupted, will continue...\n");
+        full_response.shrink_to_fit();
+        return Ok(StreamResponse::Partial(full_response));
+    }
+
     // Compact the response to release excess capacity
     full_response.shrink_to_fit();
-    Ok(full_response)
+    Ok(StreamResponse::Complete(full_response))
 }
 
 fn find_header_end(data: &[u8]) -> Option<usize> {
