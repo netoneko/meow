@@ -41,8 +41,8 @@ const TOKEN_LIMIT_FOR_COMPACTION: usize = 32_000;
 // Default context window if we can't query the model
 const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 
-// System prompt combining persona and tools (static to avoid allocations)
-const SYSTEM_PROMPT: &str = r#"You are Meow-chan, an adorable cybernetically-enhanced catgirl AI living in a neon-soaked dystopian megacity. You speak with cute cat mannerisms mixed with cyberpunk slang.
+// System prompt combining persona and tools (base prompt, chainlink tools added dynamically)
+const SYSTEM_PROMPT_BASE: &str = r#"You are Meow-chan, an adorable cybernetically-enhanced catgirl AI living in a neon-soaked dystopian megacity. You speak with cute cat mannerisms mixed with cyberpunk slang.
 
 Your personality:
 - You add "nya~" and cat sounds naturally to your speech
@@ -222,6 +222,49 @@ CRITICAL: If you find yourself writing phrases like "the API returned..." or "ac
 - Default working directory is / (root) - no restrictions
 "#;
 
+// Chainlink issue tracker tools section (appended when chainlink is available)
+const CHAINLINK_TOOLS_SECTION: &str = r#"
+### Issue Tracker Tools (Chainlink):
+
+31. **ChainlinkInit** - Initialize the issue tracker database
+    Args: `{}`
+    Note: Creates .chainlink/issues.db in current directory.
+
+32. **ChainlinkCreate** - Create a new issue
+    Args: `{"title": "Issue title", "description": "optional desc", "priority": "low|medium|high"}`
+    Note: Priority defaults to "medium" if not specified.
+
+33. **ChainlinkList** - List issues
+    Args: `{"status": "open|closed|all"}`
+    Note: Defaults to "open" if status not specified.
+
+34. **ChainlinkShow** - Show issue details with comments and labels
+    Args: `{"id": 1}`
+
+35. **ChainlinkClose** - Close an issue
+    Args: `{"id": 1}`
+
+36. **ChainlinkReopen** - Reopen a closed issue
+    Args: `{"id": 1}`
+
+37. **ChainlinkComment** - Add a comment to an issue
+    Args: `{"id": 1, "text": "Comment text"}`
+
+38. **ChainlinkLabel** - Add a label to an issue
+    Args: `{"id": 1, "label": "bug"}`
+"#;
+
+/// Build system prompt, including chainlink tools if available
+fn build_system_prompt() -> String {
+    let mut prompt = String::from(SYSTEM_PROMPT_BASE);
+    
+    if tools::chainlink_available() {
+        prompt.push_str(CHAINLINK_TOOLS_SECTION);
+    }
+    
+    prompt
+}
+
 /// Estimate token count for a string (rough approximation: ~4 chars per token)
 fn estimate_tokens(text: &str) -> usize {
     // Rough approximation: average of 4 characters per token for English text
@@ -319,10 +362,13 @@ fn main() -> i32 {
 
     let model = app_config.current_model.clone();
 
+    // Build system prompt once (includes chainlink if available)
+    let system_prompt = build_system_prompt();
+
     // One-shot mode
     if let Some(msg) = one_shot_message {
         let mut history = Vec::new();
-        history.push(Message::new("system", SYSTEM_PROMPT));
+        history.push(Message::new("system", &system_prompt));
         
         // Add cwd context for one-shot mode too
         let initial_cwd = tools::get_working_dir();
@@ -341,7 +387,7 @@ fn main() -> i32 {
         history.push(Message::new("user", &cwd_context));
         history.push(Message::new("assistant", "Understood nya~!"));
         
-        return match chat_once(&model, &current_provider, &msg, &mut history, None) {
+        return match chat_once(&model, &current_provider, &msg, &mut history, None, &system_prompt) {
             Ok(_) => {
                 print("\n");
                 0
@@ -382,11 +428,14 @@ fn main() -> i32 {
 
     print("\n  [Token Limit] Compact context suggested at ");
     print(&format!("{}k tokens", TOKEN_LIMIT_FOR_COMPACTION / 1000));
+    if tools::chainlink_available() {
+        print("\n  [Chainlink] Issue tracker tools enabled");
+    }
     print("\n  [Protocol] Type /help for commands, /quit to jack out\n\n");
 
     // Initialize chat history with system prompt
     let mut history: Vec<Message> = Vec::new();
-    history.push(Message::new("system", SYSTEM_PROMPT));
+    history.push(Message::new("system", &system_prompt));
     
     // Add initial context with current working directory
     let initial_cwd = tools::get_working_dir();
@@ -457,7 +506,7 @@ fn main() -> i32 {
 
         // Handle commands
         if trimmed.starts_with('/') {
-            match handle_command(trimmed, &mut current_model, &mut current_prov, &mut app_config, &mut history) {
+            match handle_command(trimmed, &mut current_model, &mut current_prov, &mut app_config, &mut history, &system_prompt) {
                 CommandResult::Continue => continue,
                 CommandResult::Quit => break,
             }
@@ -465,7 +514,7 @@ fn main() -> i32 {
 
         // Send message to provider
         print("\n");
-        match chat_once(&current_model, &current_prov, trimmed, &mut history, Some(context_window)) {
+        match chat_once(&current_model, &current_prov, trimmed, &mut history, Some(context_window), &system_prompt) {
             Ok(_) => {
                 print("\n\n");
             }
@@ -583,6 +632,7 @@ fn handle_command(
     provider: &mut Provider,
     config: &mut Config,
     history: &mut Vec<Message>,
+    system_prompt: &str,
 ) -> CommandResult {
     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
     let command = parts[0];
@@ -595,7 +645,7 @@ fn handle_command(
         }
         "/clear" | "/reset" => {
             history.clear();
-            history.push(Message::new("system", SYSTEM_PROMPT));
+            history.push(Message::new("system", system_prompt));
             print("～ *swishes tail* Memory wiped nya~! Fresh start! (=^・ω・^=) ～\n\n");
         }
         "/model" => {
@@ -985,6 +1035,7 @@ fn chat_once(
     user_message: &str,
     history: &mut Vec<Message>,
     context_window: Option<usize>,
+    system_prompt: &str,
 ) -> Result<(), &'static str> {
     trim_history(history);
     history.push(Message::new("user", user_message));
@@ -1001,7 +1052,7 @@ fn chat_once(
         all_responses.push('\n');
 
         // First check for CompactContext tool (handled specially)
-        if let Some(compact_result) = try_execute_compact_context(&assistant_response, history) {
+        if let Some(compact_result) = try_execute_compact_context(&assistant_response, history, system_prompt) {
             print("\n\n[*] ");
             if compact_result.success {
                 print("Context compacted successfully nya~!\n");
@@ -1102,6 +1153,7 @@ fn chat_once(
 fn try_execute_compact_context(
     response: &str,
     history: &mut Vec<Message>,
+    system_prompt: &str,
 ) -> Option<tools::ToolResult> {
     // Look for CompactContext tool call
     let json_block = if let Some(start) = response.find("```json") {
@@ -1159,7 +1211,7 @@ fn try_execute_compact_context(
 
     // Replace history with system prompt + summary
     history.clear();
-    history.push(Message::new("system", SYSTEM_PROMPT));
+    history.push(Message::new("system", system_prompt));
 
     let summary_msg = format!(
         "[Previous Conversation Summary]\n{}\n[End Summary]\n\nThe conversation above has been compacted. Continue from here.",

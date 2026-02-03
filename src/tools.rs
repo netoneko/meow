@@ -108,6 +108,17 @@ pub fn get_sandbox_root() -> String {
     WORKING_DIR.get_sandbox_root()
 }
 
+/// Check if chainlink binary is available in /bin
+pub fn chainlink_available() -> bool {
+    let fd = open("/bin/chainlink", open_flags::O_RDONLY);
+    if fd >= 0 {
+        close(fd);
+        true
+    } else {
+        false
+    }
+}
+
 /// Set the current working directory (internal, after validation)
 fn set_working_dir(path: &str) {
     // Normalize path - ensure it starts with /
@@ -373,6 +384,66 @@ pub fn execute_tool_command(json: &str) -> Option<ToolResult> {
         }
         "Pwd" => {
             Some(tool_pwd())
+        }
+        // Chainlink issue tracker tools
+        "ChainlinkInit" => {
+            if !chainlink_available() {
+                return Some(ToolResult::err("chainlink not found in /bin"));
+            }
+            Some(tool_chainlink_init())
+        }
+        "ChainlinkCreate" => {
+            if !chainlink_available() {
+                return Some(ToolResult::err("chainlink not found in /bin"));
+            }
+            let title = extract_string_field(json, "title")?;
+            let description = extract_string_field(json, "description");
+            let priority = extract_string_field(json, "priority");
+            Some(tool_chainlink_create(&title, description.as_deref(), priority.as_deref()))
+        }
+        "ChainlinkList" => {
+            if !chainlink_available() {
+                return Some(ToolResult::err("chainlink not found in /bin"));
+            }
+            let status = extract_string_field(json, "status");
+            Some(tool_chainlink_list(status.as_deref()))
+        }
+        "ChainlinkShow" => {
+            if !chainlink_available() {
+                return Some(ToolResult::err("chainlink not found in /bin"));
+            }
+            let id = extract_number_field(json, "id")?;
+            Some(tool_chainlink_show(id))
+        }
+        "ChainlinkClose" => {
+            if !chainlink_available() {
+                return Some(ToolResult::err("chainlink not found in /bin"));
+            }
+            let id = extract_number_field(json, "id")?;
+            Some(tool_chainlink_close(id))
+        }
+        "ChainlinkReopen" => {
+            if !chainlink_available() {
+                return Some(ToolResult::err("chainlink not found in /bin"));
+            }
+            let id = extract_number_field(json, "id")?;
+            Some(tool_chainlink_reopen(id))
+        }
+        "ChainlinkComment" => {
+            if !chainlink_available() {
+                return Some(ToolResult::err("chainlink not found in /bin"));
+            }
+            let id = extract_number_field(json, "id")?;
+            let text = extract_string_field(json, "text")?;
+            Some(tool_chainlink_comment(id, &text))
+        }
+        "ChainlinkLabel" => {
+            if !chainlink_available() {
+                return Some(ToolResult::err("chainlink not found in /bin"));
+            }
+            let id = extract_number_field(json, "id")?;
+            let label = extract_string_field(json, "label")?;
+            Some(tool_chainlink_label(id, &label))
         }
         _ => None,
     }
@@ -1077,6 +1148,53 @@ fn tool_git_tag(name: Option<&str>, delete: bool) -> ToolResult {
 /// Unstage all files (clear the index)
 fn tool_git_reset() -> ToolResult {
     tool_shell("scratch reset")
+}
+
+// ============================================================================
+// Chainlink Tools (issue tracker via /bin/chainlink)
+// ============================================================================
+
+fn tool_chainlink_init() -> ToolResult {
+    tool_shell("chainlink init")
+}
+
+fn tool_chainlink_create(title: &str, description: Option<&str>, priority: Option<&str>) -> ToolResult {
+    let mut cmd = format!("chainlink create \"{}\"", title.replace('"', "\\\""));
+    if let Some(desc) = description {
+        cmd.push_str(&format!(" -d \"{}\"", desc.replace('"', "\\\"")));
+    }
+    if let Some(prio) = priority {
+        cmd.push_str(&format!(" -p {}", prio));
+    }
+    tool_shell(&cmd)
+}
+
+fn tool_chainlink_list(status: Option<&str>) -> ToolResult {
+    match status {
+        Some(s) => tool_shell(&format!("chainlink list -s {}", s)),
+        None => tool_shell("chainlink list"),
+    }
+}
+
+fn tool_chainlink_show(id: usize) -> ToolResult {
+    tool_shell(&format!("chainlink show {}", id))
+}
+
+fn tool_chainlink_close(id: usize) -> ToolResult {
+    tool_shell(&format!("chainlink close {}", id))
+}
+
+fn tool_chainlink_reopen(id: usize) -> ToolResult {
+    tool_shell(&format!("chainlink reopen {}", id))
+}
+
+fn tool_chainlink_comment(id: usize, text: &str) -> ToolResult {
+    let escaped = text.replace('"', "\\\"");
+    tool_shell(&format!("chainlink comment {} \"{}\"", id, escaped))
+}
+
+fn tool_chainlink_label(id: usize, label: &str) -> ToolResult {
+    tool_shell(&format!("chainlink label {} \"{}\"", id, label))
 }
 
 // ============================================================================

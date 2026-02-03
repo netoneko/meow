@@ -111,6 +111,41 @@ To support multiple commands per response:
 |------|-------------|------|
 | `Shell` | Execute arbitrary command | `cmd` |
 
+### Issue Tracker (Chainlink)
+
+These tools are **only available when `/bin/chainlink` is present**. Meow detects chainlink at startup and dynamically adds these tools to the system prompt.
+
+| Tool | Description | Args |
+|------|-------------|------|
+| `ChainlinkInit` | Initialize issue database (.chainlink/issues.db) | (none) |
+| `ChainlinkCreate` | Create a new issue | `title`, `description`?, `priority`? |
+| `ChainlinkList` | List issues | `status`? (open/closed/all, default: open) |
+| `ChainlinkShow` | Show issue details with comments and labels | `id` |
+| `ChainlinkClose` | Close an issue | `id` |
+| `ChainlinkReopen` | Reopen a closed issue | `id` |
+| `ChainlinkComment` | Add a comment to an issue | `id`, `text` |
+| `ChainlinkLabel` | Add a label to an issue | `id`, `label` |
+
+**Priority values:** `low`, `medium` (default), `high`
+
+**Example usage:**
+
+```json
+{"command": {"tool": "ChainlinkInit", "args": {}}}
+```
+
+```json
+{"command": {"tool": "ChainlinkCreate", "args": {"title": "Fix memory leak", "priority": "high"}}}
+```
+
+```json
+{"command": {"tool": "ChainlinkList", "args": {"status": "open"}}}
+```
+
+```json
+{"command": {"tool": "ChainlinkComment", "args": {"id": 1, "text": "Fixed in latest commit"}}}
+```
+
 ## Sandbox
 
 All file operations are sandboxed to the working directory (set at startup or via `Cd`). Paths outside the sandbox are denied.
