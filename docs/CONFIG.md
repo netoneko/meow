@@ -34,7 +34,13 @@ api_key=sk-your-api-key-here
 base_url=https://api.groq.com/openai/v1
 api_type=openai
 api_key=gsk_your-groq-key-here
+
+[provider:gemini-openai-compat]
+base_url=https://generativelanguage.googleapis.com/v1beta/openai/
+api_type=openai
+api_key=your-openai-compatible-api-key
 ```
+
 
 ## Configuration Options
 
