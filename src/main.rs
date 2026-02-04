@@ -297,7 +297,7 @@ fn main() -> i32 {
     let mut model_override: Option<String> = None;
     let mut provider_override: Option<String> = None;
     let mut one_shot_message: Option<String> = None;
-    let mut use_tui = false;
+    let mut use_tui = true; // Default to TUI mode
 
     // Parse command line arguments
     let mut i = 1;
@@ -329,6 +329,8 @@ fn main() -> i32 {
                     print("meow: --provider requires a provider name\n");
                     return 1;
                 }
+            } else if arg_str == "--classic" {
+                use_tui = false;
             } else if arg_str == "--tui" {
                 use_tui = true;
             } else if arg_str == "-h" || arg_str == "--help" {
@@ -336,6 +338,7 @@ fn main() -> i32 {
                 return 0;
             } else if !arg_str.starts_with('-') {
                 one_shot_message = Some(String::from(arg_str));
+                use_tui = false; // Disable TUI for one-shot questions
             }
         }
         i += 1;
@@ -592,6 +595,8 @@ fn print_usage() {
     print("Options:\n");
     print("  -m, --model <NAME>      Neural link override\n");
     print("  -p, --provider <NAME>   Use specific provider\n");
+    print("  --tui                   Interactive TUI (default)\n");
+    print("  --classic               Old school neural link interface\n");
     print("  -h, --help              Display this transmission\n\n");
     print("Interactive Commands:\n");
     print("  /clear              Wipe memory banks nya~\n");
