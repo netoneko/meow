@@ -1,7 +1,9 @@
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::fmt;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, Ordering}; // Import AtomicBool and Ordering
 
 use libakuma::{
     get_terminal_attributes, set_terminal_attributes, 
@@ -34,6 +36,7 @@ pub struct App {
     pub scroll_offset: usize, // For scrolling chat history
     pub terminal_width: u16,
     pub terminal_height: u16,
+    pub dirty: AtomicBool, // Indicates if the UI needs to be redrawn
 }
 
 impl App {
@@ -44,6 +47,7 @@ impl App {
             scroll_offset: 0,
             terminal_width: 80, // Default, will try to determine actual size
             terminal_height: 24, // Default
+            dirty: AtomicBool::new(true), // Initially, the UI needs to be drawn
         }
     }
 
@@ -51,12 +55,17 @@ impl App {
     pub fn render(&mut self) {
         let mut stdout = Stdout;
 
-        // Clear screen and hide cursor
-        clear_screen();
+        // Hide cursor during drawing to prevent flicker
         hide_cursor();
 
         let chat_area_height = self.terminal_height.saturating_sub(4) as usize; // 1 for input, 1 for border, 2 for padding
         let chat_area_width = self.terminal_width.saturating_sub(2) as usize; // for border
+
+        // Clear the chat area by overwriting with spaces before drawing new content
+        for y in 0..chat_area_height {
+            set_cursor_position(0, y as u64);
+            let _ = write!(stdout, "{:width$}", "", width = self.terminal_width as usize);
+        }
 
         // Draw chat history
         // Calculate the actual start_line to ensure we display the latest messages
@@ -89,7 +98,7 @@ impl App {
                 let line_to_print = &msg[line_start_idx..line_end_idx];
                 
                 set_cursor_position(0, current_y as u64);
-                write!(stdout, "{}", line_to_print);
+                let _ = write!(stdout, "{}", line_to_print);
                 current_y += 1;
                 line_start_idx = line_end_idx;
                 if line_start_idx < msg.len() && msg.chars().nth(line_start_idx) == Some(' ') {
@@ -102,10 +111,14 @@ impl App {
             }
         }
 
-        // Draw input box
+        // Clear the input line area
         let input_line_start = self.terminal_height.saturating_sub(2) as u64;
         set_cursor_position(0, input_line_start);
-        write!(stdout, "{}", "> ".to_string() + &self.input);
+        let _ = write!(stdout, "{:width$}", "", width = self.terminal_width as usize);
+
+        // Draw input box
+        set_cursor_position(0, input_line_start);
+        let _ = write!(stdout, "{}", "> ".to_string() + &self.input);
 
         // Position cursor at the end of input
         let cursor_col = 2 + self.input.len() as u64;
@@ -133,11 +146,18 @@ pub fn run_tui() -> Result<(), &'static str> {
     let mut app = App::new();
     // TODO: Dynamically determine terminal_width and terminal_height
 
+    // Clear screen once at the beginning
+    clear_screen();
+
     app.history.push("Welcome to Meow-chan TUI!".to_string());
     app.history.push("Type /help for commands, ESC to quit.".to_string());
+    app.dirty.store(true, Ordering::Release); // Ensure initial render
 
     loop {
-        app.render();
+        if app.dirty.load(Ordering::Acquire) {
+            app.render();
+            app.dirty.store(false, Ordering::Release);
+        }
 
         let mut event_buf = [0u8; 16]; // Buffer for input events
         let bytes_read = poll_input_event(10, &mut event_buf); // Poll with 10ms timeout
@@ -156,14 +176,17 @@ pub fn run_tui() -> Result<(), &'static str> {
                         app.input.clear();
                         // TODO: Process input, send to LLM
                         app.history.push("Meow-chan: Nya~! Processing...".to_string()); // Placeholder
+                        app.dirty.store(true, Ordering::Release);
                     }
                 },
                 0x7F | 0x08 => { // Backspace or Delete
                     app.input.pop();
+                    app.dirty.store(true, Ordering::Release);
                 },
                 c if c >= 0x20 && c <= 0x7E => { // Printable ASCII characters
                     if app.input.len() < app.terminal_width as usize - 4 { // Prevent overflow
                         app.input.push(c as char);
+                        app.dirty.store(true, Ordering::Release);
                     }
                 },
                 _ => {} // Ignore other control characters for now
@@ -176,7 +199,7 @@ pub fn run_tui() -> Result<(), &'static str> {
     if result < 0 {
         // Log error, but still try to clean up terminal
         let mut stdout = Stdout;
-        write!(stdout, "Error restoring terminal attributes: {}\n", result);
+        let _ = write!(stdout, "Error restoring terminal attributes: {}\n", result);
     }
     
     show_cursor();
