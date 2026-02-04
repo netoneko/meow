@@ -13,12 +13,13 @@ use libakuma::{
 use crate::config::{Provider, Config};
 use crate::{Message, CommandResult};
 
-// Tokyo Night & Cyberpunk Palette
-const COLOR_VIOLET: &str = "\x1b[38;5;176m"; // User
+// Tokyo Night & Cyber-Steel Palette
+const COLOR_VIOLET: &str = "\x1b[38;5;177m"; // User
 const COLOR_BLUE: &str = "\x1b[38;5;111m";   // Meow
-const COLOR_FRAME: &str = "\x1b[38;5;226m";  // Cyberpunk Yellow
-const COLOR_GREEN: &str = "\x1b[38;5;120m";  // Tool/System
-const COLOR_YELLOW: &str = "\x1b[38;5;215m"; // Status
+const COLOR_GRAY_DIM: &str = "\x1b[38;5;240m"; // Outer Frame
+const COLOR_GRAY_BRIGHT: &str = "\x1b[38;5;250m"; // Headers
+const COLOR_GREEN: &str = "\x1b[38;5;120m";  // Online status
+const COLOR_YELLOW: &str = "\x1b[38;5;215m"; // Metrics
 const COLOR_RESET: &str = "\x1b[0m";
 const COLOR_BOLD: &str = "\x1b[1m";
 
@@ -86,15 +87,16 @@ impl App {
         let mut stdout = Stdout;
         let w = self.terminal_width as usize;
 
-        // 1. Top Bar (Double Line)
+        // 1. Top Bar
         set_cursor_position(0, 0);
         let header = " [ MEOW-CHAN v1.0 // NEURAL LINK ] ";
         let status = " [ ONLINE ] ";
-        let _ = write!(stdout, "{}{}", COLOR_FRAME, BOX_TL);
-        let _ = write!(stdout, "{}{}{}", COLOR_BOLD, COLOR_FRAME, header);
+        let _ = write!(stdout, "{}{}", COLOR_GRAY_DIM, BOX_TL);
+        let _ = write!(stdout, "{}{}{}", COLOR_BOLD, COLOR_GRAY_BRIGHT, header);
         let h_line_len = w.saturating_sub(header.len() + status.len() + 2);
+        let _ = write!(stdout, "{}", COLOR_GRAY_DIM);
         for _ in 0..h_line_len { let _ = write!(stdout, "{}", BOX_H); }
-        let _ = write!(stdout, "{}{}{}", status, COLOR_FRAME, BOX_TR);
+        let _ = write!(stdout, "{}{}{}{}", COLOR_GREEN, status, COLOR_GRAY_DIM, BOX_TR);
 
         // 2. Grid Info
         set_cursor_position(0, 1);
@@ -103,28 +105,29 @@ impl App {
         let _ = write!(stdout, "{}{}", COLOR_YELLOW, grid_info);
         let remaining = w.saturating_sub(grid_info.len() + 2);
         for _ in 0..remaining { let _ = write!(stdout, " "); }
-        let _ = write!(stdout, "{}{}", COLOR_FRAME, BOX_V);
+        let _ = write!(stdout, "{}{}", COLOR_GRAY_DIM, BOX_V);
 
         // 3. Separator (Single Line)
         set_cursor_position(0, 2);
-        let _ = write!(stdout, "{}", COLOR_FRAME);
+        let _ = write!(stdout, "{}", COLOR_GRAY_DIM);
         self.draw_horizontal_line(BOX_SEPL, BOX_SEP, BOX_SEPR);
 
-        // 4. History area borders
+        // 4. History area vertical borders
         let chat_height = self.terminal_height.saturating_sub(6) as usize;
         for y in 0..chat_height {
             set_cursor_position(0, (y + 3) as u64);
-            let _ = write!(stdout, "{}", BOX_V);
+            let _ = write!(stdout, "{}{}", COLOR_GRAY_DIM, BOX_V);
             set_cursor_position((self.terminal_width - 1) as u64, (y + 3) as u64);
-            let _ = write!(stdout, "{}", BOX_V);
+            let _ = write!(stdout, "{}{}", BOX_V, COLOR_RESET);
         }
 
-        // 5. Middle Separator (Double Line)
+        // 5. Middle Separator
         let mid_y = self.terminal_height.saturating_sub(3) as u64;
         set_cursor_position(0, mid_y);
+        let _ = write!(stdout, "{}", COLOR_GRAY_DIM);
         self.draw_horizontal_line(BOX_ML, BOX_H, BOX_MR);
 
-        // 6. Bottom Border (Double Line)
+        // 6. Bottom Border
         set_cursor_position(0, (self.terminal_height - 1) as u64);
         self.draw_horizontal_line(BOX_BL, BOX_H, BOX_BR);
         let _ = write!(stdout, "{}", COLOR_RESET);
@@ -140,10 +143,9 @@ impl App {
             let (prefix, color) = match msg.role.as_str() {
                 "user" => ("> ", COLOR_VIOLET),
                 "assistant" => ("[MEOW] ", COLOR_BLUE),
-                _ => ("[*] ", COLOR_GREEN),
+                _ => ("[*] ", COLOR_GRAY_BRIGHT),
             };
 
-            let prefix_len = prefix.len();
             let mut first_line = true;
             for chunk in msg.content.lines() {
                 let mut content = chunk;
@@ -153,24 +155,12 @@ impl App {
                 }
 
                 while !content.is_empty() {
-                    let line_prefix = if first_line { 
-                        prefix 
-                    } else { 
-                        match prefix_len {
-                            2 => "  ",
-                            4 => "    ",
-                            7 => "       ",
-                            _ => "       ",
-                        }
-                    };
+                    let line_prefix = if first_line { prefix } else { "       " };
                     let max_len = chat_area_width.saturating_sub(line_prefix.len());
                     
                     let mut byte_offset = content.len();
                     for (i, (b_idx, _)) in content.char_indices().enumerate() {
-                        if i == max_len {
-                            byte_offset = b_idx;
-                            break;
-                        }
+                        if i == max_len { byte_offset = b_idx; break; }
                     }
 
                     if byte_offset < content.len() {
@@ -205,10 +195,9 @@ impl App {
                 set_cursor_position(2, (y + 3) as u64);
                 let _ = write!(stdout, "{}", line);
             }
-            
-            // Restore right border in case it was overwritten
+            // Restore right border
             set_cursor_position((self.terminal_width - 1) as u64, (y + 3) as u64);
-            let _ = write!(stdout, "{}{}{}", COLOR_FRAME, BOX_V, COLOR_RESET);
+            let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, BOX_V, COLOR_RESET);
         }
     }
 
@@ -229,8 +218,36 @@ impl App {
         set_cursor_position(cursor_col, input_y);
         
         set_cursor_position((self.terminal_width - 1) as u64, input_y);
-        let _ = write!(stdout, "{}{}{}", COLOR_FRAME, BOX_V, COLOR_RESET);
+        let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, BOX_V, COLOR_RESET);
     }
+}
+
+fn probe_terminal_size() -> (u16, u16) {
+    let mut stdout = Stdout;
+    // 1. Move cursor to extremely large position
+    let _ = write!(stdout, "\x1b[999;999H");
+    // 2. Query cursor position
+    let _ = write!(stdout, "\x1b[6n");
+    
+    // 3. Read response: \x1b[row;colR
+    let mut buf = [0u8; 32];
+    let n = poll_input_event(500, &mut buf);
+    if n > 0 {
+        if let Ok(resp) = core::str::from_utf8(&buf[..n as usize]) {
+            if let Some(start) = resp.find('[') {
+                if let Some(end) = resp.find('R') {
+                    let parts = &resp[start+1..end];
+                    let mut split = parts.split(';');
+                    if let (Some(r_str), Some(c_str)) = (split.next(), split.next()) {
+                        let r = r_str.parse::<u16>().unwrap_or(25);
+                        let c = c_str.parse::<u16>().unwrap_or(100);
+                        return (c, r);
+                    }
+                }
+            }
+        }
+    }
+    (100, 25) // Default fallback
 }
 
 pub fn run_tui(
@@ -247,6 +264,11 @@ pub fn run_tui(
 
     let mut app = App::new();
     app.history = history.clone();
+    
+    // Auto-detect size
+    let (w, h) = probe_terminal_size();
+    app.terminal_width = w;
+    app.terminal_height = h;
     
     clear_screen();
 
@@ -298,9 +320,7 @@ pub fn run_tui(
                         
                         if user_input.starts_with('/') {
                             let (res, output) = crate::handle_command(&user_input, model, provider, config, history, system_prompt);
-                            if let Some(out) = output {
-                                app.history.push(Message::new("system", &out));
-                            }
+                            if let Some(out) = output { app.history.push(Message::new("system", &out)); }
                             app.history_dirty.store(true, Ordering::Release);
                             app.input_dirty.store(true, Ordering::Release);
                             if let CommandResult::Quit = res { break; }
@@ -308,7 +328,6 @@ pub fn run_tui(
                             app.history.push(Message::new("user", &user_input));
                             app.history_dirty.store(true, Ordering::Release);
                             app.input_dirty.store(true, Ordering::Release);
-                            
                             app.render_history();
                             app.render_input(&token_info);
 
@@ -322,9 +341,7 @@ pub fn run_tui(
                             let mut stdout = Stdout;
                             let _ = write!(stdout, "{}[MEOW] {}", COLOR_BLUE, COLOR_RESET);
                             let _ = write!(stdout, "{}", COLOR_BLUE);
-
                             let _ = crate::chat_once(model, provider, &user_input, history, Some(context_window), system_prompt);
-                            
                             let _ = write!(stdout, "{}", COLOR_RESET);
 
                             app.history = history.clone();
@@ -337,15 +354,9 @@ pub fn run_tui(
                     app.input.pop();
                     app.input_dirty.store(true, Ordering::Release);
                 },
-                12 => { // Ctrl-L
-                    if app.terminal_height == 25 { app.terminal_height = 50; }
-                    else { app.terminal_height = 25; }
-                    clear_screen();
-                    app.frame_dirty.store(true, Ordering::Release);
-                },
-                18 => { // Ctrl-R
-                    if app.terminal_width == 100 { app.terminal_width = 107; }
-                    else { app.terminal_width = 100; }
+                12 => { // Ctrl-L: Re-probe size
+                    let (w, h) = probe_terminal_size();
+                    app.terminal_width = w; app.terminal_height = h;
                     clear_screen();
                     app.frame_dirty.store(true, Ordering::Release);
                 },
