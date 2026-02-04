@@ -26,6 +26,7 @@ mod code_search;
 mod config;
 mod providers;
 mod tools;
+mod tui_app;
 
 use alloc::format;
 use alloc::string::String;
@@ -296,6 +297,7 @@ fn main() -> i32 {
     let mut model_override: Option<String> = None;
     let mut provider_override: Option<String> = None;
     let mut one_shot_message: Option<String> = None;
+    let mut use_tui = false;
 
     // Parse command line arguments
     let mut i = 1;
@@ -327,6 +329,8 @@ fn main() -> i32 {
                     print("meow: --provider requires a provider name\n");
                     return 1;
                 }
+            } else if arg_str == "--tui" {
+                use_tui = true;
             } else if arg_str == "-h" || arg_str == "--help" {
                 print_usage();
                 return 0;
@@ -352,6 +356,16 @@ fn main() -> i32 {
     // Apply model override
     if let Some(ref m) = model_override {
         app_config.current_model = m.clone();
+    }
+
+    if use_tui {
+        if let Err(e) = tui_app::run_tui() {
+            print("TUI Error: ");
+            print(e);
+            print("\n");
+            return 1;
+        }
+        return 0;
     }
 
     // Get current provider config (fallback to defaults if none configured)
