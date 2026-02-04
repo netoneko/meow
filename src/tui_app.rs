@@ -3,7 +3,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering}; // Import AtomicBool and Ordering
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use libakuma::{
     get_terminal_attributes, set_terminal_attributes, 
@@ -36,7 +36,8 @@ pub struct App {
     pub scroll_offset: usize, // For scrolling chat history
     pub terminal_width: u16,
     pub terminal_height: u16,
-    pub dirty: AtomicBool, // Indicates if the UI needs to be redrawn
+    pub input_dirty: AtomicBool, // Indicates if the input line needs to be redrawn
+    pub history_dirty: AtomicBool, // Indicates if the chat history needs to be redrawn
 }
 
 impl App {
@@ -47,16 +48,14 @@ impl App {
             scroll_offset: 0,
             terminal_width: 80, // Default, will try to determine actual size
             terminal_height: 24, // Default
-            dirty: AtomicBool::new(true), // Initially, the UI needs to be drawn
+            input_dirty: AtomicBool::new(true), // Initially, the input needs to be drawn
+            history_dirty: AtomicBool::new(true), // Initially, the history needs to be drawn
         }
     }
 
-    /// Renders the current UI state to the terminal.
-    pub fn render(&mut self) {
+    /// Renders the chat history area.
+    pub fn render_history(&mut self) {
         let mut stdout = Stdout;
-
-        // Hide cursor during drawing to prevent flicker
-        hide_cursor();
 
         let chat_area_height = self.terminal_height.saturating_sub(4) as usize; // 1 for input, 1 for border, 2 for padding
         let chat_area_width = self.terminal_width.saturating_sub(2) as usize; // for border
@@ -68,7 +67,6 @@ impl App {
         }
 
         // Draw chat history
-        // Calculate the actual start_line to ensure we display the latest messages
         let num_history_lines = self.history.len();
         let display_start_index = if num_history_lines > chat_area_height {
             num_history_lines.saturating_sub(chat_area_height).saturating_sub(self.scroll_offset)
@@ -110,6 +108,11 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Renders the input line and positions the cursor.
+    pub fn render_input(&mut self) {
+        let mut stdout = Stdout;
 
         // Clear the input line area
         let input_line_start = self.terminal_height.saturating_sub(2) as u64;
@@ -123,7 +126,6 @@ impl App {
         // Position cursor at the end of input
         let cursor_col = 2 + self.input.len() as u64;
         set_cursor_position(cursor_col, input_line_start);
-        show_cursor();
     }
 }
 
@@ -151,13 +153,24 @@ pub fn run_tui() -> Result<(), &'static str> {
 
     app.history.push("Welcome to Meow-chan TUI!".to_string());
     app.history.push("Type /help for commands, ESC to quit.".to_string());
-    app.dirty.store(true, Ordering::Release); // Ensure initial render
+    app.history_dirty.store(true, Ordering::Release); // Ensure initial history render
+    app.input_dirty.store(true, Ordering::Release); // Ensure initial input render
 
     loop {
-        if app.dirty.load(Ordering::Acquire) {
-            app.render();
-            app.dirty.store(false, Ordering::Release);
+        // Hide cursor during drawing to prevent flicker
+        hide_cursor();
+
+        if app.history_dirty.load(Ordering::Acquire) {
+            app.render_history();
+            app.history_dirty.store(false, Ordering::Release);
         }
+        if app.input_dirty.load(Ordering::Acquire) {
+            app.render_input();
+            app.input_dirty.store(false, Ordering::Release);
+        }
+
+        // Show cursor after all drawing is done and input cursor is positioned
+        show_cursor();
 
         let mut event_buf = [0u8; 16]; // Buffer for input events
         let bytes_read = poll_input_event(10, &mut event_buf); // Poll with 10ms timeout
@@ -176,17 +189,18 @@ pub fn run_tui() -> Result<(), &'static str> {
                         app.input.clear();
                         // TODO: Process input, send to LLM
                         app.history.push("Meow-chan: Nya~! Processing...".to_string()); // Placeholder
-                        app.dirty.store(true, Ordering::Release);
+                        app.history_dirty.store(true, Ordering::Release); // History changed
+                        app.input_dirty.store(true, Ordering::Release); // Input cleared
                     }
                 },
                 0x7F | 0x08 => { // Backspace or Delete
                     app.input.pop();
-                    app.dirty.store(true, Ordering::Release);
+                    app.input_dirty.store(true, Ordering::Release);
                 },
                 c if c >= 0x20 && c <= 0x7E => { // Printable ASCII characters
                     if app.input.len() < app.terminal_width as usize - 4 { // Prevent overflow
                         app.input.push(c as char);
-                        app.dirty.store(true, Ordering::Release);
+                        app.input_dirty.store(true, Ordering::Release);
                     }
                 },
                 _ => {} // Ignore other control characters for now
