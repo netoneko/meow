@@ -157,23 +157,27 @@ pub fn run_tui() -> Result<(), &'static str> {
     app.input_dirty.store(true, Ordering::Release); // Ensure initial input render
 
     loop {
-        // Hide cursor during drawing to prevent flicker
-        hide_cursor();
+        let needs_render = app.history_dirty.load(Ordering::Acquire) || app.input_dirty.load(Ordering::Acquire);
 
-        if app.history_dirty.load(Ordering::Acquire) {
-            app.render_history();
-            app.history_dirty.store(false, Ordering::Release);
-        }
-        if app.input_dirty.load(Ordering::Acquire) {
-            app.render_input();
-            app.input_dirty.store(false, Ordering::Release);
+        if needs_render {
+            hide_cursor(); // Hide once before any drawing
+
+            if app.history_dirty.load(Ordering::Acquire) {
+                app.render_history();
+                app.history_dirty.store(false, Ordering::Release);
+            }
+            if app.input_dirty.load(Ordering::Acquire) {
+                app.render_input();
+                app.input_dirty.store(false, Ordering::Release);
+            }
+            show_cursor(); // Show once after all drawing
         }
 
-        // Show cursor after all drawing is done and input cursor is positioned
-        show_cursor();
+        // Adaptive poll_input_event timeout
+        let poll_timeout = if needs_render { 1 } else { u64::MAX }; // 1ms if rendering, otherwise block indefinitely
 
         let mut event_buf = [0u8; 16]; // Buffer for input events
-        let bytes_read = poll_input_event(10, &mut event_buf); // Poll with 10ms timeout
+        let bytes_read = poll_input_event(poll_timeout, &mut event_buf);
 
         if bytes_read > 0 {
             let key_code = event_buf[0]; // Assuming single byte key codes for now
