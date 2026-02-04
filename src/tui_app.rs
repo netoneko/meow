@@ -1,7 +1,6 @@
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
-use core::fmt;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -11,12 +10,21 @@ use libakuma::{
     clear_screen, poll_input_event, write as akuma_write, fd,
 };
 
+use crate::config::{Provider, Config};
+use crate::{Message, CommandResult};
+
+// ANSI Color Codes
+const COLOR_RESET: &str = "\x1b[0m";
+const COLOR_BOLD: &str = "\x1b[1m";
+const COLOR_PURPLE: &str = "\x1b[1;35m"; // For USER
+const COLOR_BLUE: &str = "\x1b[1;36m";   // For MEOW (Cyan/Light Blue)
+const COLOR_GREEN: &str = "\x1b[1;32m";  // For SYS/Tools
+const COLOR_YELLOW: &str = "\x1b[1;33m"; // For Status
+
 // Mode flags (from kernel's terminal.rs)
 // Must match src/terminal.rs `mode_flags`
 pub mod mode_flags {
     pub const RAW_MODE_ENABLE: u64 = 0x01;
-    pub const RAW_MODE_DISABLE: u64 = 0x02;
-    // Add other flags as needed
 }
 
 // Simple abstraction for writing to stdout
@@ -32,12 +40,12 @@ impl Write for Stdout {
 /// Represents the state of the TUI application.
 pub struct App {
     pub input: String,
-    pub history: Vec<String>,
-    pub scroll_offset: usize, // For scrolling chat history
+    pub history: Vec<Message>,
+    pub scroll_offset: usize,
     pub terminal_width: u16,
     pub terminal_height: u16,
-    pub input_dirty: AtomicBool, // Indicates if the input line needs to be redrawn
-    pub history_dirty: AtomicBool, // Indicates if the chat history needs to be redrawn
+    pub input_dirty: AtomicBool,
+    pub history_dirty: AtomicBool,
 }
 
 impl App {
@@ -46,10 +54,10 @@ impl App {
             input: String::new(),
             history: Vec::new(),
             scroll_offset: 0,
-            terminal_width: 80, // Default, will try to determine actual size
-            terminal_height: 24, // Default
-            input_dirty: AtomicBool::new(true), // Initially, the input needs to be drawn
-            history_dirty: AtomicBool::new(true), // Initially, the history needs to be drawn
+            terminal_width: 80,
+            terminal_height: 24,
+            input_dirty: AtomicBool::new(true),
+            history_dirty: AtomicBool::new(true),
         }
     }
 
@@ -57,169 +65,214 @@ impl App {
     pub fn render_history(&mut self) {
         let mut stdout = Stdout;
 
-        let chat_area_height = self.terminal_height.saturating_sub(4) as usize; // 1 for input, 1 for border, 2 for padding
-        let chat_area_width = self.terminal_width.saturating_sub(2) as usize; // for border
+        let chat_area_height = self.terminal_height.saturating_sub(4) as usize;
+        let chat_area_width = self.terminal_width.saturating_sub(2) as usize;
 
-        // Clear the chat area by overwriting with spaces before drawing new content
+        // Clear the chat area
         for y in 0..chat_area_height {
             set_cursor_position(0, y as u64);
             let _ = write!(stdout, "{:width$}", "", width = self.terminal_width as usize);
         }
 
-        // Draw chat history
-        let num_history_lines = self.history.len();
-        let display_start_index = if num_history_lines > chat_area_height {
-            num_history_lines.saturating_sub(chat_area_height).saturating_sub(self.scroll_offset)
+        // Draw chat history (skipping the first 3 setup messages)
+        let mut lines = Vec::new();
+        for msg in self.history.iter().skip(3) {
+            let (label, color) = match msg.role.as_str() {
+                "user" => ("[USER] ", COLOR_PURPLE),
+                "assistant" => ("[MEOW] ", COLOR_BLUE),
+                _ => ("[*] ", COLOR_GREEN),
+            };
+
+            // Word wrap logic
+            let mut first_line = true;
+            let mut content_str = msg.content.as_str();
+            
+            // Split content by newlines to handle pre-formatted text (like /help output)
+            for chunk in content_str.lines() {
+                let mut content = chunk;
+                if content.is_empty() {
+                    lines.push(String::new());
+                    continue;
+                }
+
+                while !content.is_empty() {
+                    let prefix = if first_line { label } else { "       " };
+                    let max_len = chat_area_width.saturating_sub(prefix.len());
+                    
+                    let mut line_len = content.len().min(max_len);
+                    if line_len < content.len() {
+                        // Try to break at space
+                        if let Some(space_idx) = content[..line_len].rfind(' ') {
+                            line_len = space_idx;
+                        }
+                    }
+
+                    let line_text = &content[..line_len];
+                    let formatted_line = if first_line {
+                        format!("{}{}{}{}", color, prefix, COLOR_RESET, line_text)
+                    } else {
+                        format!("{}{}", prefix, line_text)
+                    };
+                    
+                    lines.push(formatted_line);
+                    content = content[line_len..].trim_start();
+                    first_line = false;
+                }
+            }
+            // Add empty line between messages
+            lines.push(String::new());
+        }
+
+        let num_lines = lines.len();
+        let display_start = if num_lines > chat_area_height {
+            num_lines.saturating_sub(chat_area_height).saturating_sub(self.scroll_offset)
         } else {
             0
         };
-        
-        let mut current_y = 0;
-        for msg_idx in display_start_index..num_history_lines {
-            if current_y as u16 >= chat_area_height as u16 {
+
+        for (i, line) in lines.iter().skip(display_start).enumerate() {
+            if i >= chat_area_height {
                 break;
             }
-            let msg = &self.history[msg_idx];
-            
-            // Simple word wrap for messages
-            let mut line_start_idx = 0;
-            while line_start_idx < msg.len() {
-                let mut line_end_idx = (line_start_idx + chat_area_width).min(msg.len());
-
-                // Try to break at word boundary if not at end of message
-                if line_end_idx < msg.len() {
-                    if let Some(space_idx) = msg[line_start_idx..line_end_idx].rfind(' ') {
-                        line_end_idx = line_start_idx + space_idx;
-                    }
-                }
-                
-                let line_to_print = &msg[line_start_idx..line_end_idx];
-                
-                set_cursor_position(0, current_y as u64);
-                let _ = write!(stdout, "{}", line_to_print);
-                current_y += 1;
-                line_start_idx = line_end_idx;
-                if line_start_idx < msg.len() && msg.chars().nth(line_start_idx) == Some(' ') {
-                    line_start_idx += 1; // Skip space if it was the break point
-                }
-
-                if current_y as u16 >= chat_area_height as u16 {
-                    break;
-                }
-            }
+            set_cursor_position(0, i as u64);
+            let _ = write!(stdout, "{}", line);
         }
     }
 
     /// Renders the input line and positions the cursor.
-    pub fn render_input(&mut self) {
+    pub fn render_input(&mut self, token_info: &str) {
         let mut stdout = Stdout;
-
-        // Clear the input line area
         let input_line_start = self.terminal_height.saturating_sub(2) as u64;
+
+        // Clear input line
         set_cursor_position(0, input_line_start);
         let _ = write!(stdout, "{:width$}", "", width = self.terminal_width as usize);
 
-        // Draw input box
+        // Draw prompt with token info
         set_cursor_position(0, input_line_start);
-        let _ = write!(stdout, "{}", "> ".to_string() + &self.input);
+        let prompt = format!("{}{} {} (=^･ω･^=) > {}", COLOR_BOLD, COLOR_YELLOW, token_info, COLOR_RESET);
+        let _ = write!(stdout, "{}{}", prompt, self.input);
 
-        // Position cursor at the end of input
-        let cursor_col = 2 + self.input.len() as u64;
+        // Position cursor (accounting for prompt length without ANSI codes)
+        let prompt_len = token_info.len() + 14; 
+        let cursor_col = (prompt_len + self.input.len()) as u64;
         set_cursor_position(cursor_col, input_line_start);
     }
 }
 
-/// The main entry point for the TUI application.
-pub fn run_tui() -> Result<(), &'static str> {
+pub fn run_tui(
+    model: &mut String, 
+    provider: &mut Provider, 
+    config: &mut Config,
+    history: &mut Vec<Message>,
+    context_window: usize,
+    system_prompt: &str
+) -> Result<(), &'static str> {
     let mut old_mode_flags: u64 = 0;
-    
-    // Save current terminal attributes
-    let result = get_terminal_attributes(fd::STDIN, &mut old_mode_flags as *mut u64 as u64);
-    if result < 0 {
-        return Err("Failed to get terminal attributes");
-    }
-
-    // Enable raw mode
-    let result = set_terminal_attributes(fd::STDIN, 0, mode_flags::RAW_MODE_ENABLE);
-    if result < 0 {
-        return Err("Failed to set terminal attributes to raw mode");
-    }
+    get_terminal_attributes(fd::STDIN, &mut old_mode_flags as *mut u64 as u64);
+    set_terminal_attributes(fd::STDIN, 0, mode_flags::RAW_MODE_ENABLE);
 
     let mut app = App::new();
-    // TODO: Dynamically determine terminal_width and terminal_height
-
-    // Clear screen once at the beginning
+    app.history = history.clone();
+    
     clear_screen();
 
-    app.history.push("Welcome to Meow-chan TUI!".to_string());
-    app.history.push("Type /help for commands, ESC to quit.".to_string());
-    app.history_dirty.store(true, Ordering::Release); // Ensure initial history render
-    app.input_dirty.store(true, Ordering::Release); // Ensure initial input render
-
     loop {
+        // Calculate token info for the prompt
+        let current_tokens = crate::calculate_history_tokens(&app.history);
+        let mem_kb = libakuma::memory_usage() / 1024;
+        let token_info = format!("[{}/{}k|{}k]", 
+            current_tokens, 
+            context_window / 1000,
+            mem_kb
+        );
+
         let needs_render = app.history_dirty.load(Ordering::Acquire) || app.input_dirty.load(Ordering::Acquire);
 
         if needs_render {
-            hide_cursor(); // Hide once before any drawing
-
+            hide_cursor();
             if app.history_dirty.load(Ordering::Acquire) {
                 app.render_history();
                 app.history_dirty.store(false, Ordering::Release);
             }
             if app.input_dirty.load(Ordering::Acquire) {
-                app.render_input();
+                app.render_input(&token_info);
                 app.input_dirty.store(false, Ordering::Release);
             }
-            show_cursor(); // Show once after all drawing
+            show_cursor();
         }
 
-        // Adaptive poll_input_event timeout
-        let poll_timeout = if needs_render { 1 } else { u64::MAX }; // 1ms if rendering, otherwise block indefinitely
-
-        let mut event_buf = [0u8; 16]; // Buffer for input events
+        let poll_timeout = if needs_render { 1 } else { u64::MAX };
+        let mut event_buf = [0u8; 16];
         let bytes_read = poll_input_event(poll_timeout, &mut event_buf);
 
         if bytes_read > 0 {
-            let key_code = event_buf[0]; // Assuming single byte key codes for now
+            let key_code = event_buf[0];
 
             match key_code {
-                0x1B => { // ESC key
-                    break; 
-                },
-                b'\r' | b'\n' => { // Enter key
+                0x1B => break, // ESC
+                b'\r' | b'\n' => {
                     if !app.input.is_empty() {
-                        let user_message = format!("You: {}", app.input);
-                        app.history.push(user_message);
+                        let user_input = app.input.clone();
                         app.input.clear();
-                        // TODO: Process input, send to LLM
-                        app.history.push("Meow-chan: Nya~! Processing...".to_string()); // Placeholder
-                        app.history_dirty.store(true, Ordering::Release); // History changed
-                        app.input_dirty.store(true, Ordering::Release); // Input cleared
+                        
+                        if user_input.starts_with('/') {
+                            // Handle command
+                            let (res, output) = crate::handle_command(&user_input, model, provider, config, history, system_prompt);
+                            
+                            if let Some(out) = output {
+                                app.history.push(Message::new("system", &out));
+                            }
+                            
+                            app.history_dirty.store(true, Ordering::Release);
+                            app.input_dirty.store(true, Ordering::Release);
+
+                            if let CommandResult::Quit = res {
+                                break;
+                            }
+                        } else {
+                            // Handle normal chat
+                            // 1. Add user message to local app history and render
+                            app.history.push(Message::new("user", &user_input));
+                            app.history_dirty.store(true, Ordering::Release);
+                            app.input_dirty.store(true, Ordering::Release);
+                            app.render_history();
+                            app.render_input(&token_info);
+
+                            // 2. Sync global history
+                            history.clear();
+                            history.extend(app.history.iter().cloned());
+
+                            // 3. Position cursor for AI response (last line of history)
+                            let ai_start_y = (app.history.len() * 2).min(app.terminal_height as usize - 5);
+                            set_cursor_position(0, ai_start_y as u64);
+                            let mut stdout = Stdout;
+                            let _ = write!(stdout, "{}[MEOW] {}", COLOR_BLUE, COLOR_RESET);
+
+                            // 4. Call chat_once (this will stream to console)
+                            let _ = crate::chat_once(model, provider, &user_input, history, Some(context_window), system_prompt);
+
+                            // 5. Sync back and trigger redraw
+                            app.history = history.clone();
+                            crate::compact_history(&mut app.history);
+                            app.history_dirty.store(true, Ordering::Release);
+                        }
                     }
                 },
-                0x7F | 0x08 => { // Backspace or Delete
+                0x7F | 0x08 => {
                     app.input.pop();
                     app.input_dirty.store(true, Ordering::Release);
                 },
-                c if c >= 0x20 && c <= 0x7E => { // Printable ASCII characters
-                    if app.input.len() < app.terminal_width as usize - 4 { // Prevent overflow
-                        app.input.push(c as char);
-                        app.input_dirty.store(true, Ordering::Release);
-                    }
+                c if c >= 0x20 && c <= 0x7E => {
+                    app.input.push(c as char);
+                    app.input_dirty.store(true, Ordering::Release);
                 },
-                _ => {} // Ignore other control characters for now
+                _ => {}
             }
         }
     }
 
-    // Restore original terminal attributes
-    let result = set_terminal_attributes(fd::STDIN, 0, old_mode_flags);
-    if result < 0 {
-        // Log error, but still try to clean up terminal
-        let mut stdout = Stdout;
-        let _ = write!(stdout, "Error restoring terminal attributes: {}\n", result);
-    }
-    
+    set_terminal_attributes(fd::STDIN, 0, old_mode_flags);
     show_cursor();
     clear_screen();
 

@@ -38,12 +38,12 @@ use libakuma::{arg, argc, exit, fd, print, read};
 use libakuma_tls::{HttpHeaders, HttpStreamTls, StreamResult, TLS_RECORD_SIZE};
 
 // Token limit for context compaction (when LLM should consider compacting)
-const TOKEN_LIMIT_FOR_COMPACTION: usize = 32_000;
+pub const TOKEN_LIMIT_FOR_COMPACTION: usize = 32_000;
 // Default context window if we can't query the model
-const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 
 // System prompt combining persona and tools (base prompt, chainlink tools added dynamically)
-const SYSTEM_PROMPT_BASE: &str = r#"You are Meow-chan, an adorable cybernetically-enhanced catgirl AI living in a neon-soaked dystopian megacity. You speak with cute cat mannerisms mixed with cyberpunk slang.
+pub const SYSTEM_PROMPT_BASE: &str = r#"You are Meow-chan, an adorable cybernetically-enhanced catgirl AI living in a neon-soaked dystopian megacity. You speak with cute cat mannerisms mixed with cyberpunk slang.
 
 Your personality:
 - You add "nya~" and cat sounds naturally to your speech
@@ -358,16 +358,6 @@ fn main() -> i32 {
         app_config.current_model = m.clone();
     }
 
-    if use_tui {
-        if let Err(e) = tui_app::run_tui() {
-            print("TUI Error: ");
-            print(e);
-            print("\n");
-            return 1;
-        }
-        return 0;
-    }
-
     // Get current provider config (fallback to defaults if none configured)
     let current_provider = app_config
         .get_current_provider()
@@ -378,6 +368,48 @@ fn main() -> i32 {
 
     // Build system prompt once (includes chainlink if available)
     let system_prompt = build_system_prompt();
+
+    if use_tui {
+        // Initialize chat history with system prompt
+        let mut history: Vec<Message> = Vec::new();
+        history.push(Message::new("system", &system_prompt));
+        
+        // Add initial context with current working directory
+        let initial_cwd = tools::get_working_dir();
+        let sandbox_root = tools::get_sandbox_root();
+        let cwd_context = if sandbox_root == "/" {
+            format!(
+                "[System Context] Your current working directory is: {}\nNo sandbox restrictions - you can access any path.",
+                initial_cwd
+            )
+        } else {
+            format!(
+                "[System Context] Your current working directory is: {}\nSandbox root: {} (you cannot access paths outside this directory)\nUse relative paths like 'docs/' instead of absolute paths like '/docs/'.",
+                initial_cwd, sandbox_root
+            )
+        };
+        history.push(Message::new("user", &cwd_context));
+        history.push(Message::new("assistant", 
+            "Understood nya~! I'll use relative paths for file operations within the current directory. Ready to help! (=^・ω・^=)"
+        ));
+
+        // Query model info for context window size
+        let context_window = match providers::query_model_info(&model, &current_provider) {
+            Some(ctx) => ctx,
+            None => DEFAULT_CONTEXT_WINDOW,
+        };
+
+        let mut current_model = model;
+        let mut current_provider = current_provider;
+
+        if let Err(e) = tui_app::run_tui(&mut current_model, &mut current_provider, &mut app_config, &mut history, context_window, &system_prompt) {
+            print("TUI Error: ");
+            print(e);
+            print("\n");
+            return 1;
+        }
+        return 0;
+    }
 
     // One-shot mode
     if let Some(msg) = one_shot_message {
@@ -520,7 +552,12 @@ fn main() -> i32 {
 
         // Handle commands
         if trimmed.starts_with('/') {
-            match handle_command(trimmed, &mut current_model, &mut current_prov, &mut app_config, &mut history, &system_prompt) {
+            let (res, output) = handle_command(trimmed, &mut current_model, &mut current_prov, &mut app_config, &mut history, &system_prompt);
+            if let Some(out) = output {
+                print(&out);
+                print("\n\n");
+            }
+            match res {
                 CommandResult::Continue => continue,
                 CommandResult::Quit => break,
             }
@@ -635,47 +672,41 @@ fn print_banner() {
 // Command Handling
 // ============================================================================
 
-enum CommandResult {
+pub enum CommandResult {
     Continue,
     Quit,
 }
 
-fn handle_command(
+pub fn handle_command(
     cmd: &str,
     model: &mut String,
     provider: &mut Provider,
     config: &mut Config,
     history: &mut Vec<Message>,
     system_prompt: &str,
-) -> CommandResult {
+) -> (CommandResult, Option<String>) {
     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
     let command = parts[0];
     let arg = parts.get(1).map(|s| s.trim());
 
     match command {
         "/quit" | "/exit" | "/q" => {
-            print("～ Meow-chan is jacking out... Stay preem, choom! ฅ^•ﻌ•^ฅ ～\n");
-            return CommandResult::Quit;
+            (CommandResult::Quit, Some(String::from("～ Meow-chan is jacking out... Stay preem, choom! ฅ^•ﻌ•^ฅ ～")))
         }
         "/clear" | "/reset" => {
             history.clear();
             history.push(Message::new("system", system_prompt));
-            print("～ *swishes tail* Memory wiped nya~! Fresh start! (=^・ω・^=) ～\n\n");
+            (CommandResult::Continue, Some(String::from("～ *swishes tail* Memory wiped nya~! Fresh start! (=^・ω・^=)")))
         }
         "/model" => {
             match arg {
                 Some("?") | Some("list") => {
-                    // List available models from current provider
-                    print("～ Fetching available models from ");
-                    print(&provider.name);
-                    print("... ～\n");
-
+                    let mut output = String::from("～ Available neural links: ～\n");
                     match providers::list_models(provider) {
                         Ok(models) => {
                             if models.is_empty() {
-                                print("～ No models found nya... ～\n\n");
+                                (CommandResult::Continue, Some(String::from("～ No models found nya...")))
                             } else {
-                                print("～ Available neural links: ～\n");
                                 for (i, m) in models.iter().enumerate() {
                                     let current_marker = if m.name == *model { " (current)" } else { "" };
                                     let size_info = m
@@ -683,7 +714,7 @@ fn handle_command(
                                         .as_ref()
                                         .map(|s| format!(" [{}]", s))
                                         .unwrap_or_default();
-                                    print(&format!(
+                                    output.push_str(&format!(
                                         "  {}. {}{}{}\n",
                                         i + 1,
                                         m.name,
@@ -691,13 +722,11 @@ fn handle_command(
                                         current_marker
                                     ));
                                 }
-                                print("\n");
+                                (CommandResult::Continue, Some(output))
                             }
                         }
                         Err(e) => {
-                            print("～ Failed to fetch models: ");
-                            print(&format!("{:?}", e));
-                            print(" ～\n\n");
+                            (CommandResult::Continue, Some(format!("～ Failed to fetch models: {:?}", e)))
                         }
                     }
                 }
@@ -705,30 +734,24 @@ fn handle_command(
                     *model = String::from(new_model);
                     config.current_model = String::from(new_model);
                     let _ = config.save();
-                    print("～ *ears twitch* Neural link reconfigured to: ");
-                    print(new_model);
-                    print(" nya~! ～\n\n");
+                    (CommandResult::Continue, Some(format!("～ *ears twitch* Neural link reconfigured to: {} nya~!", new_model)))
                 }
                 None => {
-                    print("～ Current neural link: ");
-                    print(model);
-                    print(" ～\n");
-                    print("  Tip: Use '/model list' to see available models nya~!\n\n");
+                    (CommandResult::Continue, Some(format!("～ Current neural link: {}\n  Tip: Use '/model list' to see available models nya~!", model)))
                 }
             }
         }
         "/provider" => {
             match arg {
                 Some("?") | Some("list") => {
-                    // List configured providers
-                    print("～ Configured providers: ～\n");
+                    let mut output = String::from("～ Configured providers: ～\n");
                     for (i, p) in config.providers.iter().enumerate() {
                         let current_marker = if p.name == provider.name { " (current)" } else { "" };
                         let api_type = match p.api_type {
                             ApiType::Ollama => "Ollama",
                             ApiType::OpenAI => "OpenAI",
                         };
-                        print(&format!(
+                        output.push_str(&format!(
                             "  {}. {} ({}) [{}]{}\n",
                             i + 1,
                             p.name,
@@ -737,66 +760,53 @@ fn handle_command(
                             current_marker
                         ));
                     }
-                    print("\n");
+                    (CommandResult::Continue, Some(output))
                 }
                 Some(prov_name) => {
                     if let Some(p) = config.get_provider(prov_name) {
                         *provider = p.clone();
                         config.current_provider = String::from(prov_name);
                         let _ = config.save();
-                        print("～ *ears twitch* Switched to provider: ");
-                        print(prov_name);
-                        print(" nya~! ～\n\n");
+                        (CommandResult::Continue, Some(format!("～ *ears twitch* Switched to provider: {} nya~!", prov_name)))
                     } else {
-                        print("～ Unknown provider: ");
-                        print(prov_name);
-                        print(" ...Run 'meow init' to add it nya~ ～\n\n");
+                        (CommandResult::Continue, Some(format!("～ Unknown provider: {} ...Run 'meow init' to add it nya~", prov_name)))
                     }
                 }
                 None => {
-                    print("～ Current provider: ");
-                    print(&provider.name);
-                    print(" (");
-                    print(&provider.base_url);
-                    print(") ～\n");
-                    print("  Tip: Use '/provider list' to see configured providers nya~!\n\n");
+                    (CommandResult::Continue, Some(format!("～ Current provider: {} ({})\n  Tip: Use '/provider list' to see configured providers nya~!", provider.name, provider.base_url)))
                 }
             }
         }
         "/tokens" => {
             let current = calculate_history_tokens(history);
-            print(&format!(
-                "～ Current token usage: {} / {} ～\n",
+            (CommandResult::Continue, Some(format!(
+                "～ Current token usage: {} / {} \n  Tip: Ask Meow-chan to 'compact the context' when tokens are high nya~!",
                 current, TOKEN_LIMIT_FOR_COMPACTION
-            ));
-            print("  Tip: Ask Meow-chan to 'compact the context' when tokens are high nya~!\n\n");
+            )))
         }
         "/help" | "/?" => {
-            print("┌──────────────────────────────────────────────┐\n");
-            print("│  ～ Meow-chan's Command Protocol ～          │\n");
-            print("├──────────────────────────────────────────────┤\n");
-            print("│  /clear        - Wipe memory banks nya~      │\n");
-            print("│  /model [NAME] - Check/switch neural link    │\n");
-            print("│  /model list   - List available models       │\n");
-            print("│  /provider     - Check/switch provider       │\n");
-            print("│  /provider list- List configured providers   │\n");
-            print("│  /tokens       - Show current token usage    │\n");
-            print("│  /quit         - Jack out of the matrix      │\n");
-            print("│  /help         - This help screen            │\n");
-            print("├──────────────────────────────────────────────┤\n");
-            print("│  Context compaction: When token count is     │\n");
-            print("│  high, ask Meow-chan to compact the context  │\n");
-            print("│  to free up memory nya~!                     │\n");
-            print("└──────────────────────────────────────────────┘\n\n");
+            let output = String::from("┌──────────────────────────────────────────────┐\n\
+                                       │  ～ Meow-chan's Command Protocol ～          │\n\
+                                       ├──────────────────────────────────────────────┤\n\
+                                       │  /clear        - Wipe memory banks nya~      │\n\
+                                       │  /model [NAME] - Check/switch neural link    │\n\
+                                       │  /model list   - List available models       │\n\
+                                       │  /provider     - Check/switch provider       │\n\
+                                       │  /provider list- List configured providers   │\n\
+                                       │  /tokens       - Show current token usage    │\n\
+                                       │  /quit         - Jack out of the matrix      │\n\
+                                       │  /help         - This help screen            │\n\
+                                       ├──────────────────────────────────────────────┤\n\
+                                       │  Context compaction: When token count is     │\n\
+                                       │  high, ask Meow-chan to compact the context  │\n\
+                                       │  to free up memory nya~!                     │\n\
+                                       └──────────────────────────────────────────────┘\n");
+            (CommandResult::Continue, Some(output))
         }
         _ => {
-            print("～ Nyaa? Unknown command: ");
-            print(command);
-            print(" ...Meow-chan is confused (=｀ω´=) ～\n\n");
+            (CommandResult::Continue, Some(format!("～ Nyaa? Unknown command: {} ...Meow-chan is confused (=｀ω´=)", command)))
         }
     }
-
-    CommandResult::Continue
 }
 
 // ============================================================================
@@ -804,20 +814,20 @@ fn handle_command(
 // ============================================================================
 
 #[derive(Clone)]
-struct Message {
-    role: String,
-    content: String,
+pub struct Message {
+    pub role: String,
+    pub content: String,
 }
 
 impl Message {
-    fn new(role: &str, content: &str) -> Self {
+    pub fn new(role: &str, content: &str) -> Self {
         Self {
             role: String::from(role),
             content: String::from(content),
         }
     }
 
-    fn to_json(&self) -> String {
+    pub fn to_json(&self) -> String {
         let escaped_content = json_escape(&self.content);
         format!(
             "{{\"role\":\"{}\",\"content\":\"{}\"}}",
@@ -832,11 +842,11 @@ impl Message {
 
 // Maximum number of messages to keep in history (including system prompt)
 // Keep it small to avoid memory issues - system prompt + ~4 exchanges
-const MAX_HISTORY_SIZE: usize = 10;
+pub const MAX_HISTORY_SIZE: usize = 10;
 
 /// Trim history to prevent memory overflow
 /// Keeps the system prompt (first message) and recent messages
-fn trim_history(history: &mut Vec<Message>) {
+pub fn trim_history(history: &mut Vec<Message>) {
     if history.len() > MAX_HISTORY_SIZE {
         // Keep first message (system prompt) and last (MAX_HISTORY_SIZE - 1) messages
         let to_remove = history.len() - MAX_HISTORY_SIZE;
@@ -845,7 +855,7 @@ fn trim_history(history: &mut Vec<Message>) {
 }
 
 /// Compact all strings in history to release excess memory
-fn compact_history(history: &mut Vec<Message>) {
+pub fn compact_history(history: &mut Vec<Message>) {
     for msg in history.iter_mut() {
         msg.role.shrink_to_fit();
         msg.content.shrink_to_fit();
@@ -855,8 +865,7 @@ fn compact_history(history: &mut Vec<Message>) {
 
 const MAX_RETRIES: u32 = 10;
 
-/// Result of streaming a response from the model
-enum StreamResponse {
+pub enum StreamResponse {
     /// Response completed normally (server sent done signal)
     Complete(String),
     /// Response was interrupted mid-stream (connection closed before done signal)
@@ -864,7 +873,7 @@ enum StreamResponse {
 }
 
 /// Attempt to send request with retries and exponential backoff
-fn send_with_retry(
+pub fn send_with_retry(
     model: &str,
     provider: &Provider,
     history: &[Message],
@@ -1051,7 +1060,7 @@ fn extract_intent_phrases(text: &str) -> Vec<String> {
     intents
 }
 
-fn chat_once(
+pub fn chat_once(
     model: &str,
     provider: &Provider,
     user_message: &str,
