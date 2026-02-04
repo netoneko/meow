@@ -10,18 +10,8 @@ use libakuma::{
     clear_screen, poll_input_event, write as akuma_write, fd,
 };
 
-use crate::config::{Provider, Config};
+use crate::config::{Provider, Config, COLOR_VIOLET, COLOR_BLUE, COLOR_GRAY_DIM, COLOR_GRAY_BRIGHT, COLOR_GREEN, COLOR_YELLOW, COLOR_RESET, COLOR_BOLD};
 use crate::{Message, CommandResult};
-
-// Tokyo Night & Cyber-Steel Palette
-const COLOR_VIOLET: &str = "\x1b[38;5;177m"; // User
-const COLOR_BLUE: &str = "\x1b[38;5;111m";   // Meow
-const COLOR_GRAY_DIM: &str = "\x1b[38;5;240m"; // Outer Frame
-const COLOR_GRAY_BRIGHT: &str = "\x1b[38;5;250m"; // Headers
-const COLOR_GREEN: &str = "\x1b[38;5;120m";  // Online status
-const COLOR_YELLOW: &str = "\x1b[38;5;215m"; // Metrics
-const COLOR_RESET: &str = "\x1b[0m";
-const COLOR_BOLD: &str = "\x1b[1m";
 
 // Box Drawing Characters
 const BOX_TL: &str = "╔";
@@ -66,7 +56,7 @@ impl App {
             input: String::new(),
             history: Vec::new(),
             scroll_offset: 0,
-            terminal_width: 100,
+            terminal_width: 100, 
             terminal_height: 25,
             input_dirty: AtomicBool::new(true),
             history_dirty: AtomicBool::new(true),
@@ -87,7 +77,6 @@ impl App {
         let mut stdout = Stdout;
         let w = self.terminal_width as usize;
 
-        // 1. Top Bar
         set_cursor_position(0, 0);
         let header = " [ MEOW-CHAN v1.0 // NEURAL LINK ] ";
         let status = " [ ONLINE ] ";
@@ -98,7 +87,6 @@ impl App {
         for _ in 0..h_line_len { let _ = write!(stdout, "{}", BOX_H); }
         let _ = write!(stdout, "{}{}{}{}", COLOR_GREEN, status, COLOR_GRAY_DIM, BOX_TR);
 
-        // 2. Grid Info
         set_cursor_position(0, 1);
         let _ = write!(stdout, "{}{}", BOX_V, COLOR_RESET);
         let grid_info = format!(" > GRID: {} | PROV: {} ", model, provider);
@@ -107,27 +95,23 @@ impl App {
         for _ in 0..remaining { let _ = write!(stdout, " "); }
         let _ = write!(stdout, "{}{}", COLOR_GRAY_DIM, BOX_V);
 
-        // 3. Separator (Single Line)
         set_cursor_position(0, 2);
         let _ = write!(stdout, "{}", COLOR_GRAY_DIM);
         self.draw_horizontal_line(BOX_SEPL, BOX_SEP, BOX_SEPR);
 
-        // 4. History area vertical borders
         let chat_height = self.terminal_height.saturating_sub(6) as usize;
         for y in 0..chat_height {
             set_cursor_position(0, (y + 3) as u64);
-            let _ = write!(stdout, "{}{}", COLOR_GRAY_DIM, BOX_V);
+            let _ = write!(stdout, "{}", BOX_V);
             set_cursor_position((self.terminal_width - 1) as u64, (y + 3) as u64);
-            let _ = write!(stdout, "{}{}", BOX_V, COLOR_RESET);
+            let _ = write!(stdout, "{}", BOX_V);
         }
 
-        // 5. Middle Separator
         let mid_y = self.terminal_height.saturating_sub(3) as u64;
         set_cursor_position(0, mid_y);
         let _ = write!(stdout, "{}", COLOR_GRAY_DIM);
         self.draw_horizontal_line(BOX_ML, BOX_H, BOX_MR);
 
-        // 6. Bottom Border
         set_cursor_position(0, (self.terminal_height - 1) as u64);
         self.draw_horizontal_line(BOX_BL, BOX_H, BOX_BR);
         let _ = write!(stdout, "{}", COLOR_RESET);
@@ -195,7 +179,6 @@ impl App {
                 set_cursor_position(2, (y + 3) as u64);
                 let _ = write!(stdout, "{}", line);
             }
-            // Restore right border
             set_cursor_position((self.terminal_width - 1) as u64, (y + 3) as u64);
             let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, BOX_V, COLOR_RESET);
         }
@@ -210,11 +193,12 @@ impl App {
         let _ = write!(stdout, "{:width$}", "", width = w - 2);
         
         set_cursor_position(2, input_y);
-        let prompt = format!("{}{} {} > {}", COLOR_BOLD, COLOR_YELLOW, token_info, COLOR_RESET);
-        let _ = write!(stdout, "{}{}{}", prompt, COLOR_VIOLET, self.input);
+        let prompt_text = format!("{} > ", token_info);
+        let _ = write!(stdout, "{}{}{}{}", COLOR_BOLD, COLOR_YELLOW, prompt_text, COLOR_RESET);
+        let _ = write!(stdout, "{}{}", COLOR_VIOLET, self.input);
 
-        let prompt_display_len = token_info.len() + 4; 
-        let cursor_col = (2 + prompt_display_len + self.input.len()) as u64;
+        // Cursor position: start at 2, add length of token_info + " > " (3 chars) + input
+        let cursor_col = (2 + token_info.len() + 3 + self.input.len()) as u64;
         set_cursor_position(cursor_col, input_y);
         
         set_cursor_position((self.terminal_width - 1) as u64, input_y);
@@ -224,14 +208,9 @@ impl App {
 
 fn probe_terminal_size() -> (u16, u16) {
     let mut stdout = Stdout;
-    // 1. Move cursor to extremely large position
-    let _ = write!(stdout, "\x1b[999;999H");
-    // 2. Query cursor position
-    let _ = write!(stdout, "\x1b[6n");
-    
-    // 3. Read response: \x1b[row;colR
+    let _ = write!(stdout, "\x1b[999;999H\x1b[6n");
     let mut buf = [0u8; 32];
-    let n = poll_input_event(500, &mut buf);
+    let n = poll_input_event(200, &mut buf);
     if n > 0 {
         if let Ok(resp) = core::str::from_utf8(&buf[..n as usize]) {
             if let Some(start) = resp.find('[') {
@@ -247,7 +226,7 @@ fn probe_terminal_size() -> (u16, u16) {
             }
         }
     }
-    (100, 25) // Default fallback
+    (100, 25)
 }
 
 pub fn run_tui(
@@ -264,11 +243,8 @@ pub fn run_tui(
 
     let mut app = App::new();
     app.history = history.clone();
-    
-    // Auto-detect size
     let (w, h) = probe_terminal_size();
-    app.terminal_width = w;
-    app.terminal_height = h;
+    app.terminal_width = w; app.terminal_height = h;
     
     clear_screen();
 
@@ -276,11 +252,7 @@ pub fn run_tui(
         let current_tokens = crate::calculate_history_tokens(&app.history);
         let mem_kb = libakuma::memory_usage() / 1024;
         let mem_display = if mem_kb > 1024 { format!("{}M", mem_kb/1024) } else { format!("{}K", mem_kb) };
-        let token_info = format!("[ {} / {}k ] [ {} ]", 
-            current_tokens, 
-            context_window / 1000,
-            mem_display
-        );
+        let token_info = format!("[ {} / {}k ] [ {} ]", current_tokens, context_window / 1000, mem_display);
 
         if app.frame_dirty.load(Ordering::Acquire) {
             app.render_frame(model, &provider.name);
@@ -290,7 +262,6 @@ pub fn run_tui(
         }
 
         let needs_render = app.history_dirty.load(Ordering::Acquire) || app.input_dirty.load(Ordering::Acquire);
-
         if needs_render {
             hide_cursor();
             if app.history_dirty.load(Ordering::Acquire) {
@@ -304,20 +275,23 @@ pub fn run_tui(
             show_cursor();
         }
 
-        let poll_timeout = if needs_render { 1 } else { u64::MAX };
         let mut event_buf = [0u8; 16];
-        let bytes_read = poll_input_event(poll_timeout, &mut event_buf);
+        let bytes_read = poll_input_event(if needs_render { 1 } else { u64::MAX }, &mut event_buf);
 
         if bytes_read > 0 {
             let key_code = event_buf[0];
-
             match key_code {
-                0x1B => break,
+                0x1B => { 
+                    if bytes_read > 1 {
+                        // Consume escape sequence (e.g. arrow keys)
+                        continue;
+                    }
+                    if config.exit_on_escape { break; }
+                },
                 b'\r' | b'\n' => {
                     if !app.input.is_empty() {
                         let user_input = app.input.clone();
                         app.input.clear();
-                        
                         if user_input.starts_with('/') {
                             let (res, output) = crate::handle_command(&user_input, model, provider, config, history, system_prompt);
                             if let Some(out) = output { app.history.push(Message::new("system", &out)); }
@@ -330,20 +304,16 @@ pub fn run_tui(
                             app.input_dirty.store(true, Ordering::Release);
                             app.render_history();
                             app.render_input(&token_info);
-
                             history.clear();
                             history.extend(app.history.iter().cloned());
-
                             let chat_area_height = app.terminal_height.saturating_sub(6) as usize;
                             let ai_start_y = (app.history.len() * 2).min(chat_area_height + 2);
                             set_cursor_position(2, ai_start_y as u64);
-                            
                             let mut stdout = Stdout;
                             let _ = write!(stdout, "{}[MEOW] {}", COLOR_BLUE, COLOR_RESET);
                             let _ = write!(stdout, "{}", COLOR_BLUE);
                             let _ = crate::chat_once(model, provider, &user_input, history, Some(context_window), system_prompt);
                             let _ = write!(stdout, "{}", COLOR_RESET);
-
                             app.history = history.clone();
                             crate::compact_history(&mut app.history);
                             app.history_dirty.store(true, Ordering::Release);
@@ -354,11 +324,10 @@ pub fn run_tui(
                     app.input.pop();
                     app.input_dirty.store(true, Ordering::Release);
                 },
-                12 => { // Ctrl-L: Re-probe size
+                12 => { // Ctrl-L
                     let (w, h) = probe_terminal_size();
                     app.terminal_width = w; app.terminal_height = h;
-                    clear_screen();
-                    app.frame_dirty.store(true, Ordering::Release);
+                    clear_screen(); app.frame_dirty.store(true, Ordering::Release);
                 },
                 c if c >= 0x20 && c <= 0x7E => {
                     app.input.push(c as char);
@@ -372,6 +341,5 @@ pub fn run_tui(
     set_terminal_attributes(fd::STDIN, 0, old_mode_flags);
     show_cursor();
     clear_screen();
-
     Ok(())
 }
