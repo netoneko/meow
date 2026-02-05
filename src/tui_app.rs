@@ -250,6 +250,92 @@ pub fn tui_is_cancelled() -> bool {
     CANCELLED.swap(false, Ordering::SeqCst)
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum InputEvent {
+    Char(char),
+    Backspace,
+    Delete,
+    Enter,
+    ShiftEnter,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    AltLeft,
+    AltRight,
+    CtrlA,
+    CtrlE,
+    CtrlU,
+    CtrlW,
+    CtrlL,
+    Esc,
+    Unknown,
+}
+
+/// Parse raw input bytes into an InputEvent
+fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
+    if buf.is_empty() { return (InputEvent::Unknown, 0); }
+    
+    match buf[0] {
+        0x1B => { // ESC
+            if buf.len() == 1 {
+                return (InputEvent::Esc, 1);
+            }
+            
+            // CSI sequences: ESC [ ...
+            if buf.len() >= 3 && buf[1] == 0x5B {
+                match buf[2] {
+                    0x41 => return (InputEvent::Up, 3),
+                    0x42 => return (InputEvent::Down, 3),
+                    0x43 => return (InputEvent::Right, 3),
+                    0x44 => return (InputEvent::Left, 3),
+                    0x48 => return (InputEvent::Home, 3),
+                    0x46 => return (InputEvent::End, 3),
+                    b'3' if buf.len() >= 4 && buf[3] == b'~' => return (InputEvent::Delete, 4),
+                    b'1' if buf.len() >= 6 && &buf[2..6] == b"1;3D" => return (InputEvent::AltLeft, 6),
+                    b'1' if buf.len() >= 6 && &buf[2..6] == b"1;3C" => return (InputEvent::AltRight, 6),
+                    b'1' if buf.len() >= 7 && &buf[2..7] == b"13;2u" => return (InputEvent::ShiftEnter, 7),
+                    b'1' if buf.len() >= 7 && &buf[2..7] == b"13;5u" => return (InputEvent::ShiftEnter, 7), // Ctrl+Enter as ShiftEnter
+                    _ => {}
+                }
+            }
+            
+            // Alt+Enter / Alt+LF
+            if buf.len() == 2 && (buf[1] == b'\r' || buf[1] == b'\n') {
+                return (InputEvent::ShiftEnter, 2);
+            }
+            
+            // Alt+b / Alt+f
+            if buf.len() == 2 && buf[1] == b'b' { return (InputEvent::AltLeft, 2); }
+            if buf.len() == 2 && buf[1] == b'f' { return (InputEvent::AltRight, 2); }
+            
+            // Unknown or incomplete sequence
+            if buf.len() > 1 && buf[1] != 0x5B {
+                return (InputEvent::Esc, 1); // Treat as Esc and let next byte be processed
+            }
+            
+            (InputEvent::Unknown, 1)
+        }
+        0x01 => (InputEvent::CtrlA, 1),
+        0x05 => (InputEvent::CtrlE, 1),
+        0x08 | 0x7F => (InputEvent::Backspace, 1),
+        0x0C => (InputEvent::CtrlL, 1),
+        0x0D => {
+            if buf.len() >= 2 && buf[1] == 0x0A {
+                return (InputEvent::ShiftEnter, 2);
+            }
+            (InputEvent::Enter, 1)
+        }
+        0x0A => (InputEvent::ShiftEnter, 1), // LF usually treated as ShiftEnter if raw \r is handled
+        0x15 => (InputEvent::CtrlU, 1),
+        0x17 => (InputEvent::CtrlW, 1),
+        c if c >= 0x20 && c <= 0x7E => (InputEvent::Char(c as char), 1),
+        _ => (InputEvent::Unknown, 1),
+    }
+}
+
 /// Non-blocking check for input and redraw of footer during AI streaming.
 pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize) {
     if !TUI_ACTIVE.load(Ordering::SeqCst) { return; }
@@ -258,63 +344,114 @@ pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize
     let bytes_read = poll_input_event(0, &mut event_buf);
     
     if bytes_read > 0 {
-        let key = event_buf[0];
+        let mut consumed = 0usize;
+        let bytes_read = bytes_read as usize;
         let input = get_global_input();
-        let mut idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
-        
-        match key {
-            0x1B => { // ESC or Sequence
-                if bytes_read == 1 {
-                    CANCELLED.store(true, Ordering::SeqCst);
-                } else if bytes_read == 2 && (event_buf[1] == b'\r' || event_buf[1] == b'\n') {
-                    // Alt+Enter or Alt+LF
-                    input.insert(idx, '\n');
-                    idx += 1;
-                } else if bytes_read >= 7 && event_buf[1] == 0x5B && &event_buf[2..7] == b"13;2u" {
-                    // Shift+Enter (CSI u)
-                    input.insert(idx, '\n');
-                    idx += 1;
-                } else if bytes_read >= 7 && event_buf[1] == 0x5B && &event_buf[2..7] == b"13;5u" {
-                    // Ctrl+Enter (CSI u)
-                    input.insert(idx, '\n');
-                    idx += 1;
+        let mut redraw = false;
+
+        while consumed < bytes_read {
+            let (event, n) = parse_input(&event_buf[consumed..bytes_read]);
+            if n == 0 { break; }
+            consumed += n;
+            
+            let mut idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
+            match event {
+                InputEvent::Char(c) => {
+                    input.insert(idx, c);
+                    CURSOR_IDX.store((idx + 1) as u16, Ordering::SeqCst);
+                    redraw = true;
                 }
-            }
-            0x7F | 0x08 => { // Backspace
-                if idx > 0 && !input.is_empty() {
-                    input.remove(idx - 1);
-                    idx -= 1;
+                InputEvent::Backspace => {
+                    if idx > 0 && !input.is_empty() {
+                        input.remove(idx - 1);
+                        CURSOR_IDX.store((idx - 1) as u16, Ordering::SeqCst);
+                        redraw = true;
+                    }
                 }
-            }
-            b'\n' => { // LF: Newline
-                if bytes_read == 1 {
+                InputEvent::Delete => {
+                    if idx < input.chars().count() {
+                        input.remove(idx);
+                        redraw = true;
+                    }
+                }
+                InputEvent::Left => {
+                    if idx > 0 {
+                        CURSOR_IDX.store((idx - 1) as u16, Ordering::SeqCst);
+                        redraw = true;
+                    }
+                }
+                InputEvent::Right => {
+                    if idx < input.chars().count() {
+                        CURSOR_IDX.store((idx + 1) as u16, Ordering::SeqCst);
+                        redraw = true;
+                    }
+                }
+                InputEvent::Home | InputEvent::CtrlA => {
+                    CURSOR_IDX.store(0, Ordering::SeqCst);
+                    redraw = true;
+                }
+                InputEvent::End | InputEvent::CtrlE => {
+                    CURSOR_IDX.store(input.chars().count() as u16, Ordering::SeqCst);
+                    redraw = true;
+                }
+                InputEvent::ShiftEnter => {
                     input.insert(idx, '\n');
-                    idx += 1;
+                    CURSOR_IDX.store((idx + 1) as u16, Ordering::SeqCst);
+                    redraw = true;
                 }
-            }
-            b'\r' => { // Submit
-                if bytes_read == 1 && !input.is_empty() {
-                    let msg = input.clone();
-                    add_to_history(&msg);
+                InputEvent::Enter => {
+                    if !input.is_empty() {
+                        let msg = input.clone();
+                        add_to_history(&msg);
+                        input.clear();
+                        CURSOR_IDX.store(0, Ordering::SeqCst);
+                        get_message_queue().push_back(msg);
+                        redraw = true;
+                    }
+                }
+                InputEvent::CtrlU => {
                     input.clear();
-                    idx = 0;
-                    get_message_queue().push_back(msg);
-                } else if bytes_read == 2 && event_buf[1] == b'\n' {
-                    // Shift+Enter (some terminals send \r\n)
-                    input.insert(idx, '\n');
-                    idx += 1;
+                    CURSOR_IDX.store(0, Ordering::SeqCst);
+                    redraw = true;
                 }
+                InputEvent::CtrlW => {
+                    let old_idx = idx;
+                    let mut new_idx = idx;
+                    while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b == b' ') { new_idx -= 1; }
+                    while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b != b' ') { new_idx -= 1; }
+                    for _ in 0..(old_idx - new_idx) {
+                        if new_idx < input.len() {
+                            input.remove(new_idx);
+                        }
+                    }
+                    CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst);
+                    redraw = true;
+                }
+                InputEvent::AltLeft => {
+                    let mut new_idx = idx;
+                    while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b == b' ') { new_idx -= 1; }
+                    while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b != b' ') { new_idx -= 1; }
+                    CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst);
+                    redraw = true;
+                }
+                InputEvent::AltRight => {
+                    let mut new_idx = idx;
+                    let len = input.chars().count();
+                    while new_idx < len && input.as_bytes().get(new_idx).map_or(false, |&b| b == b' ') { new_idx += 1; }
+                    while new_idx < len && input.as_bytes().get(new_idx).map_or(false, |&b| b != b' ') { new_idx += 1; }
+                    CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst);
+                    redraw = true;
+                }
+                InputEvent::Esc => {
+                    CANCELLED.store(true, Ordering::SeqCst);
+                }
+                _ => {}
             }
-            c if c >= 0x20 && c <= 0x7E => {
-                input.insert(idx, c as char);
-                idx += 1;
-            }
-            _ => {}
         }
         
-        CURSOR_IDX.store(idx as u16, Ordering::SeqCst);
-        // Redraw footer with new input
-        render_footer_internal(input, current_tokens, token_limit, mem_kb);
+        if redraw {
+            render_footer_internal(input, current_tokens, token_limit, mem_kb);
+        }
     }
 }
 
@@ -518,159 +655,142 @@ pub fn run_tui(
         let bytes_read = poll_input_event(100, &mut event_buf);
 
         if bytes_read > 0 {
-            let key_code = event_buf[0];
-            let mut idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
+            let mut consumed = 0usize;
+            let bytes_read = bytes_read as usize;
             let input = get_global_input();
+            let mut quit_loop = false;
 
-            match key_code {
-                0x1B => { 
-                    if bytes_read >= 7 && event_buf[1] == 0x5B && &event_buf[2..7] == b"13;2u" {
-                        // Shift+Enter (CSI u)
-                        input.insert(idx, '\n');
-                        idx += 1;
-                    } else if bytes_read >= 7 && event_buf[1] == 0x5B && &event_buf[2..7] == b"13;5u" {
-                        // Ctrl+Enter (CSI u)
-                        input.insert(idx, '\n');
-                        idx += 1;
-                    } else if bytes_read == 2 && (event_buf[1] == b'\r' || event_buf[1] == b'\n') {
-                        // Alt+Enter or Alt+LF
-                        input.insert(idx, '\n');
-                        idx += 1;
-                    } else if bytes_read > 2 && event_buf[1] == 0x5B {
-                        let history = get_command_history();
-                        match event_buf[2] {
-                            0x41 => { // Up Arrow
-                                if history.is_empty() { continue; }
-                                unsafe {
-                                    if HISTORY_INDEX == history.len() {
-                                        *get_saved_input() = input.clone();
-                                    }
-                                    if HISTORY_INDEX > 0 {
-                                        HISTORY_INDEX -= 1;
-                                        *input = history[HISTORY_INDEX].clone();
-                                        idx = input.chars().count();
-                                    }
-                                }
-                            }
-                            0x42 => { // Down Arrow
-                                if history.is_empty() { continue; }
-                                unsafe {
-                                    if HISTORY_INDEX < history.len() {
-                                        HISTORY_INDEX += 1;
-                                        if HISTORY_INDEX == history.len() {
-                                            *input = get_saved_input().clone();
-                                        } else {
-                                            *input = history[HISTORY_INDEX].clone();
-                                        }
-                                        idx = input.chars().count();
-                                    }
-                                }
-                            }
-                            0x43 => { // Right Arrow
-                                if idx < input.chars().count() {
-                                    idx += 1;
-                                }
-                            }
-                            0x44 => { // Left Arrow
-                                if idx > 0 {
-                                    idx -= 1;
-                                }
-                            }
-                            _ => {
-                                // Check for Alt+Arrows (often \x1b[1;3D or \x1b[1;3C)
-                                if bytes_read >= 6 && event_buf[1] == 0x5B && event_buf[2] == b'1' && event_buf[3] == b';' && event_buf[4] == b'3' {
-                                    if event_buf[5] == 0x44 { // Alt+Left
-                                        while idx > 0 && input.as_bytes().get(idx-1).map_or(false, |&b| b == b' ') { idx -= 1; }
-                                        while idx > 0 && input.as_bytes().get(idx-1).map_or(false, |&b| b != b' ') { idx -= 1; }
-                                    } else if event_buf[5] == 0x43 { // Alt+Right
-                                        let len = input.chars().count();
-                                        while idx < len && input.as_bytes().get(idx).map_or(false, |&b| b == b' ') { idx += 1; }
-                                        while idx < len && input.as_bytes().get(idx).map_or(false, |&b| b != b' ') { idx += 1; }
-                                    }
-                                }
-                            }
-                        }
-                    } else if bytes_read == 2 {
-                        // Alt shortcuts (usually ESC + key)
-                        match event_buf[1] {
-                            b'b' => { // Alt+B: Back word
-                                while idx > 0 && input.as_bytes().get(idx-1).map_or(false, |&b| b == b' ') { idx -= 1; }
-                                while idx > 0 && input.as_bytes().get(idx-1).map_or(false, |&b| b != b' ') { idx -= 1; }
-                            }
-                            b'f' => { // Alt+F: Forward word
-                                let len = input.chars().count();
-                                while idx < len && input.as_bytes().get(idx).map_or(false, |&b| b == b' ') { idx += 1; }
-                                while idx < len && input.as_bytes().get(idx).map_or(false, |&b| b != b' ') { idx += 1; }
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        if bytes_read == 1 && config.exit_on_escape { break; }
+            while consumed < bytes_read {
+                let (event, n) = parse_input(&event_buf[consumed..bytes_read]);
+                if n == 0 { break; }
+                consumed += n;
+                
+                let mut idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
+                match event {
+                    InputEvent::Char(c) => {
+                        input.insert(idx, c);
+                        CURSOR_IDX.store((idx + 1) as u16, Ordering::SeqCst);
                     }
-                },
-                0x01 => { // Ctrl+A: Home
-                    idx = 0;
-                }
-                0x05 => { // Ctrl+E: End
-                    idx = input.chars().count();
-                }
-                0x15 => { // Ctrl+U: Clear line
-                    input.clear();
-                    idx = 0;
-                }
-                0x17 => { // Ctrl+W: Delete word
-                    let old_idx = idx;
-                    while idx > 0 && input.as_bytes().get(idx-1).map_or(false, |&b| b == b' ') { idx -= 1; }
-                    while idx > 0 && input.as_bytes().get(idx-1).map_or(false, |&b| b != b' ') { idx -= 1; }
-                    for _ in 0..(old_idx - idx) {
-                        if idx < input.len() {
+                    InputEvent::Backspace => {
+                        if idx > 0 && !input.is_empty() {
+                            input.remove(idx - 1);
+                            CURSOR_IDX.store((idx - 1) as u16, Ordering::SeqCst);
+                        }
+                    }
+                    InputEvent::Delete => {
+                        if idx < input.chars().count() {
                             input.remove(idx);
                         }
                     }
-                }
-                b'\n' => { // LF (Shift+Enter usually): Newline
-                    if bytes_read == 1 {
-                        input.insert(idx, '\n');
-                        idx += 1;
-                    }
-                },
-                b'\r' => { // Enter: Submit
-                    if bytes_read == 1 {
-                        let user_input = input.clone();
-                        if !user_input.is_empty() {
-                            add_to_history(&user_input);
-                            input.clear();
-                            idx = 0;
-                            get_message_queue().push_back(user_input);
+                    InputEvent::Left => {
+                        if idx > 0 {
+                            CURSOR_IDX.store((idx - 1) as u16, Ordering::SeqCst);
                         }
-                    } else if bytes_read == 2 && event_buf[1] == b'\n' {
-                        // Shift+Enter (some terminals send \r\n)
+                    }
+                    InputEvent::Right => {
+                        if idx < input.chars().count() {
+                            CURSOR_IDX.store((idx + 1) as u16, Ordering::SeqCst);
+                        }
+                    }
+                    InputEvent::Up => {
+                        let history = get_command_history();
+                        if !history.is_empty() {
+                            unsafe {
+                                if HISTORY_INDEX == history.len() {
+                                    *get_saved_input() = input.clone();
+                                }
+                                if HISTORY_INDEX > 0 {
+                                    HISTORY_INDEX -= 1;
+                                    *input = history[HISTORY_INDEX].clone();
+                                    CURSOR_IDX.store(input.chars().count() as u16, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    }
+                    InputEvent::Down => {
+                        let history = get_command_history();
+                        if !history.is_empty() {
+                            unsafe {
+                                if HISTORY_INDEX < history.len() {
+                                    HISTORY_INDEX += 1;
+                                    if HISTORY_INDEX == history.len() {
+                                        *input = get_saved_input().clone();
+                                    } else {
+                                        *input = history[HISTORY_INDEX].clone();
+                                    }
+                                    CURSOR_IDX.store(input.chars().count() as u16, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    }
+                    InputEvent::Home | InputEvent::CtrlA => {
+                        CURSOR_IDX.store(0, Ordering::SeqCst);
+                    }
+                    InputEvent::End | InputEvent::CtrlE => {
+                        CURSOR_IDX.store(input.chars().count() as u16, Ordering::SeqCst);
+                    }
+                    InputEvent::ShiftEnter => {
                         input.insert(idx, '\n');
-                        idx += 1;
+                        CURSOR_IDX.store((idx + 1) as u16, Ordering::SeqCst);
                     }
-                },
-                0x7F | 0x08 => { // Backspace
-                    if idx > 0 && !input.is_empty() {
-                        input.remove(idx - 1);
-                        idx -= 1;
+                    InputEvent::Enter => {
+                        if !input.is_empty() {
+                            let msg = input.clone();
+                            add_to_history(&msg);
+                            input.clear();
+                            CURSOR_IDX.store(0, Ordering::SeqCst);
+                            get_message_queue().push_back(msg);
+                            break; // Exit input processing for this event_buf
+                        }
                     }
-                },
-                12 => { // Ctrl-L: Re-probe
-                    let (nw, nh) = probe_terminal_size();
-                    app.terminal_width = nw; app.terminal_height = nh;
-                    TERM_WIDTH.store(nw, Ordering::SeqCst);
-                    TERM_HEIGHT.store(nh, Ordering::SeqCst);
-                    clear_screen();
-                    print_greeting();
-                    set_scroll_region(1, nh - 4);
-                },
-                c if c >= 0x20 && c <= 0x7E => {
-                    input.insert(idx, c as char);
-                    idx += 1;
-                },
-                _ => {}
+                    InputEvent::CtrlU => {
+                        input.clear();
+                        CURSOR_IDX.store(0, Ordering::SeqCst);
+                    }
+                    InputEvent::CtrlW => {
+                        let old_idx = idx;
+                        let mut new_idx = idx;
+                        while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b == b' ') { new_idx -= 1; }
+                        while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b != b' ') { new_idx -= 1; }
+                        for _ in 0..(old_idx - new_idx) {
+                            if new_idx < input.len() {
+                                input.remove(new_idx);
+                            }
+                        }
+                        CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst);
+                    }
+                    InputEvent::AltLeft => {
+                        let mut new_idx = idx;
+                        while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b == b' ') { new_idx -= 1; }
+                        while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b != b' ') { new_idx -= 1; }
+                        CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst);
+                    }
+                    InputEvent::AltRight => {
+                        let mut new_idx = idx;
+                        let len = input.chars().count();
+                        while new_idx < len && input.as_bytes().get(new_idx).map_or(false, |&b| b == b' ') { new_idx += 1; }
+                        while new_idx < len && input.as_bytes().get(new_idx).map_or(false, |&b| b != b' ') { new_idx += 1; }
+                        CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst);
+                    }
+                    InputEvent::CtrlL => {
+                        let (nw, nh) = probe_terminal_size();
+                        app.terminal_width = nw; app.terminal_height = nh;
+                        TERM_WIDTH.store(nw, Ordering::SeqCst);
+                        TERM_HEIGHT.store(nh, Ordering::SeqCst);
+                        clear_screen();
+                        print_greeting();
+                        set_scroll_region(1, nh - 4);
+                    }
+                    InputEvent::Esc => {
+                        if config.exit_on_escape { 
+                            quit_loop = true;
+                            break; 
+                        }
+                    }
+                    _ => {}
+                }
             }
-            CURSOR_IDX.store(idx as u16, Ordering::SeqCst);
+            if quit_loop { break; }
         }
 
         // Process one message from the queue if available
