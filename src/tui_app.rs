@@ -424,6 +424,11 @@ pub fn run_tui(
     // Scroll region ends at h-4 to leave room for 4-line footer
     set_scroll_region(1, h - 4);
     print_greeting();
+    
+    // Show initial hotkeys tip
+    let mut stdout = Stdout;
+    let _ = write!(stdout, "  {}TIP:{} Type {}/hotkeys{} to see input shortcuts nya~! ♪(=^･ω･^)ﾉ\n\n", 
+        COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, COLOR_RESET);
 
     // Start AI cursor at the bottom of the scroll region (Line h-4 is row h-5)
     CUR_ROW.store(h - 5, Ordering::SeqCst);
@@ -486,25 +491,36 @@ pub fn run_tui(
                                     idx -= 1;
                                 }
                             }
-                            _ => {}
+                            _ => {
+                                // Check for Alt+Arrows (often \x1b[1;3D or \x1b[1;3C)
+                                if bytes_read >= 6 && event_buf[1] == 0x5B && event_buf[2] == b'1' && event_buf[3] == b';' && event_buf[4] == b'3' {
+                                    if event_buf[5] == 0x44 { // Alt+Left
+                                        while idx > 0 && input.as_bytes().get(idx-1).map_or(false, |&b| b == b' ') { idx -= 1; }
+                                        while idx > 0 && input.as_bytes().get(idx-1).map_or(false, |&b| b != b' ') { idx -= 1; }
+                                    } else if event_buf[5] == 0x43 { // Alt+Right
+                                        let len = input.chars().count();
+                                        while idx < len && input.as_bytes().get(idx).map_or(false, |&b| b == b' ') { idx += 1; }
+                                        while idx < len && input.as_bytes().get(idx).map_or(false, |&b| b != b' ') { idx += 1; }
+                                    }
+                                }
+                            }
                         }
                     } else if bytes_read == 2 {
                         // Alt shortcuts (usually ESC + key)
                         match event_buf[1] {
                             b'b' => { // Alt+B: Back word
-                                while idx > 0 && input.as_bytes()[idx-1] == b' ' { idx -= 1; }
-                                while idx > 0 && input.as_bytes()[idx-1] != b' ' { idx -= 1; }
+                                while idx > 0 && input.as_bytes().get(idx-1).map_or(false, |&b| b == b' ') { idx -= 1; }
+                                while idx > 0 && input.as_bytes().get(idx-1).map_or(false, |&b| b != b' ') { idx -= 1; }
                             }
                             b'f' => { // Alt+F: Forward word
                                 let len = input.chars().count();
-                                while idx < len && input.as_bytes()[idx] == b' ' { idx += 1; }
-                                while idx < len && input.as_bytes()[idx] != b' ' { idx += 1; }
+                                while idx < len && input.as_bytes().get(idx).map_or(false, |&b| b == b' ') { idx += 1; }
+                                while idx < len && input.as_bytes().get(idx).map_or(false, |&b| b != b' ') { idx += 1; }
                             }
                             _ => {}
                         }
                     } else {
-                        if bytes_read > 1 { continue; }
-                        if config.exit_on_escape { break; }
+                        if bytes_read == 1 && config.exit_on_escape { break; }
                     }
                 },
                 0x01 => { // Ctrl+A: Home
@@ -513,12 +529,18 @@ pub fn run_tui(
                 0x05 => { // Ctrl+E: End
                     idx = input.chars().count();
                 }
+                0x15 => { // Ctrl+U: Clear line
+                    input.clear();
+                    idx = 0;
+                }
                 0x17 => { // Ctrl+W: Delete word
                     let old_idx = idx;
-                    while idx > 0 && input.as_bytes()[idx-1] == b' ' { idx -= 1; }
-                    while idx > 0 && input.as_bytes()[idx-1] != b' ' { idx -= 1; }
+                    while idx > 0 && input.as_bytes().get(idx-1).map_or(false, |&b| b == b' ') { idx -= 1; }
+                    while idx > 0 && input.as_bytes().get(idx-1).map_or(false, |&b| b != b' ') { idx -= 1; }
                     for _ in 0..(old_idx - idx) {
-                        input.remove(idx);
+                        if idx < input.len() {
+                            input.remove(idx);
+                        }
                     }
                 }
                 b'\r' | b'\n' => {
@@ -610,6 +632,8 @@ pub fn run_tui(
     // Reset scroll region and attributes
     set_scroll_region(1, app.terminal_height);
     set_terminal_attributes(fd::STDIN, 0, old_mode_flags);
+    clear_screen();
+    set_cursor_position(0, 0);
     show_cursor();
     Ok(())
 }
