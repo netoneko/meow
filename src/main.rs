@@ -32,7 +32,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use config::{ApiType, Config, Provider, TOKEN_LIMIT_FOR_COMPACTION, DEFAULT_CONTEXT_WINDOW, SYSTEM_PROMPT_BASE, COLOR_PEARL, COLOR_GREEN_LIGHT, COLOR_GRAY_BRIGHT, COLOR_RESET};
+use config::{ApiType, Config, Provider, TOKEN_LIMIT_FOR_COMPACTION, DEFAULT_CONTEXT_WINDOW, SYSTEM_PROMPT_BASE, COLOR_PEARL, COLOR_GREEN_LIGHT, COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_GRAY_DIM, COLOR_MEOW};
 use libakuma::net::{resolve, TcpStream};
 use libakuma::{arg, argc, exit, fd, read};
 use libakuma_tls::{HttpHeaders, HttpStreamTls, StreamResult, TLS_RECORD_SIZE};
@@ -633,6 +633,7 @@ pub fn send_with_retry(
             }
             
             print("] waiting");
+            print(COLOR_RESET);
             
             match read_streaming_with_http_stream_tls(&mut http_stream, start_time, provider, current_tokens, token_limit, mem_kb) {
                 Ok(response) => return Ok(response),
@@ -658,6 +659,7 @@ pub fn send_with_retry(
             }
 
             print("] waiting");
+            print(COLOR_RESET);
 
             match read_streaming_response_with_progress(&stream, start_time, provider, current_tokens, token_limit, mem_kb) {
                 Ok(response) => return Ok(response),
@@ -763,7 +765,12 @@ pub fn chat_once(
         let mem_kb = libakuma::memory_usage() / 1024;
         let token_limit = context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
 
+        // Set status message color
+        print(COLOR_GRAY_DIM);
         let stream_result = send_with_retry(model, provider, history, iteration > 0, current_tokens, token_limit, mem_kb)?;
+        
+        // Re-apply assistant color for the response content
+        print(COLOR_MEOW);
         
         // Handle partial responses (stream interrupted before completion)
         let assistant_response = match stream_result {
