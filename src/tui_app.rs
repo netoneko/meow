@@ -161,12 +161,12 @@ pub fn tui_print(s: &str) {
     CUR_COL.store(col, Ordering::SeqCst);
     CUR_ROW.store(row, Ordering::SeqCst);
 
-    // Return cursor to prompt (handles wrapping on Rows h-2 and h-1)
+    // Return cursor to prompt (handles wrapping and multiline)
     let input = get_global_input();
     let prompt_width = INPUT_LEN.load(Ordering::SeqCst) as usize;
-    let total_len = prompt_width + input.chars().count();
-    let cx = (total_len % w as usize) as u64;
-    let cy = (h as u64 - 2) + (total_len / w as usize) as u64;
+    let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
+    let (cx, cy_off) = calculate_input_cursor(input, idx, prompt_width, w as usize);
+    let cy = (h as u64 - 2) + cy_off;
     
     // Clamp cy to h-1 to prevent scroll trigger
     let clamped_cy = if cy >= h as u64 { h as u64 - 1 } else { cy };
@@ -206,6 +206,30 @@ pub fn get_model_and_provider() -> (String, String) {
             PROVIDER_NAME.as_ref().cloned().unwrap_or_else(|| String::from("unknown")),
         )
     }
+}
+
+/// Calculate the (x, y) coordinates of the cursor within the input box,
+/// accounting for wrapping and explicit newlines.
+fn calculate_input_cursor(input: &str, idx: usize, prompt_width: usize, width: usize) -> (u64, u64) {
+    let mut cx = prompt_width;
+    let mut cy = 0;
+    
+    for (i, c) in input.chars().enumerate() {
+        if i >= idx { break; }
+        
+        if c == '\n' {
+            cx = 0;
+            cy += 1;
+        } else {
+            cx += 1;
+            if cx >= width {
+                cx = 0;
+                cy += 1;
+            }
+        }
+    }
+    
+    (cx as u64, cy as u64)
 }
 
 pub fn add_to_history(cmd: &str) {
@@ -250,8 +274,14 @@ pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize
                     idx -= 1;
                 }
             }
-            b'\r' | b'\n' => {
-                if !input.is_empty() {
+            b'\n' => { // LF: Newline
+                if bytes_read == 1 {
+                    input.insert(idx, '\n');
+                    idx += 1;
+                }
+            }
+            b'\r' => { // Submit
+                if bytes_read == 1 && !input.is_empty() {
                     let msg = input.clone();
                     add_to_history(&msg);
                     input.clear();
@@ -347,17 +377,43 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let _ = write!(stdout, "{}", CLEAR_TO_EOL);
     
     set_cursor_position(0, h - 2);
-    let full_prompt = format!("{}{}{}{}{}", COLOR_YELLOW, prompt_prefix, COLOR_RESET, COLOR_VIOLET, input);
-    let _ = write!(stdout, "{}{}", full_prompt, COLOR_RESET);
+    let _ = write!(stdout, "{}{}", COLOR_YELLOW, prompt_prefix);
+    let _ = write!(stdout, "{}{}", COLOR_RESET, COLOR_VIOLET);
+    
+    // Manually render input to handle wraps and newlines
+    let mut cur_cx = prompt_width;
+    let mut cur_cy = h - 2;
+    
+    for c in input.chars() {
+        if c == '\n' {
+            cur_cx = 0;
+            cur_cy += 1;
+            if cur_cy < h {
+                set_cursor_position(cur_cx as u64, cur_cy);
+            }
+        } else {
+            let mut buf = [0u8; 4];
+            let _ = write!(stdout, "{}", c.encode_utf8(&mut buf));
+            cur_cx += 1;
+            if cur_cx >= w {
+                cur_cx = 0;
+                cur_cy += 1;
+                if cur_cy < h {
+                    set_cursor_position(cur_cx as u64, cur_cy);
+                }
+            }
+        }
+        if cur_cy >= h { break; } // Out of footer bounds
+    }
+    let _ = write!(stdout, "{}", COLOR_RESET);
 
     // 4. Position Cursor (handles wrapping on Row h-2 and h-1)
     let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
-    let total_len = prompt_width + idx;
-    let cx = (total_len % w) as u64;
-    let cy = (h - 2) + (total_len / w) as u64;
+    let (cx, cy_off) = calculate_input_cursor(input, idx, prompt_width, w);
+    let cy = (h - 2) + cy_off;
     
     // Clamp cy to h-1 to prevent scroll trigger
-    let clamped_cy = if cy >= h as u64 { h as u64 - 1 } else { cy };
+    let clamped_cy = if cy >= h { h - 1 } else { cy };
     set_cursor_position(cx, clamped_cy);
     show_cursor();
 }
@@ -544,18 +600,22 @@ pub fn run_tui(
                         }
                     }
                 }
-                b'\r' => { // Enter: Submit
-                    let user_input = input.clone();
-                    if !user_input.is_empty() {
-                        add_to_history(&user_input);
-                        input.clear();
-                        idx = 0;
-                        get_message_queue().push_back(user_input);
+                b'\n' => { // LF (Shift+Enter usually): Newline
+                    if bytes_read == 1 {
+                        input.insert(idx, '\n');
+                        idx += 1;
                     }
                 },
-                b'\n' => { // LF (Shift+Enter usually): Newline
-                    input.insert(idx, '\n');
-                    idx += 1;
+                b'\r' => { // Enter: Submit
+                    if bytes_read == 1 {
+                        let user_input = input.clone();
+                        if !user_input.is_empty() {
+                            add_to_history(&user_input);
+                            input.clear();
+                            idx = 0;
+                            get_message_queue().push_back(user_input);
+                        }
+                    }
                 },
                 0x7F | 0x08 => { // Backspace
                     if idx > 0 && !input.is_empty() {
