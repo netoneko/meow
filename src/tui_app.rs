@@ -110,7 +110,8 @@ pub fn tui_print(s: &str) {
         if in_esc {
             let mut buf = [0u8; 4];
             akuma_write(fd::STDOUT, c.encode_utf8(&mut buf).as_bytes());
-            if c >= '@' && c <= '~' { // Standard ANSI escape sequence terminator
+            // CSI sequence starts with '[', which is in the @ to ~ range but NOT a terminator.
+            if c != '[' && c >= '@' && c <= '~' {
                 in_esc = false;
             }
             continue;
@@ -296,7 +297,7 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
         String::new()
     };
 
-    let prompt_prefix = format!("[{}/{}|{}]{} (=^･ω･^=) > ", 
+    let prompt_prefix = format!("  [{}/{}|{}]{} (=^･ω･^=) > ", 
         token_display, limit_display, mem_display, queue_display);
     
     // Update global input len for tui_print
@@ -487,9 +488,16 @@ pub fn run_tui(
                 let (res, output) = crate::handle_command(&user_input, model, provider, config, history, system_prompt);
                 if let Some(out) = output {
                     let _ = write!(stdout, "  {}{}{}\n\n", COLOR_GRAY_BRIGHT, out, COLOR_RESET);
-                    app.history.push(Message::new("system", &out));
+                    // Add to both history vectors
+                    let msg = Message::new("system", &out);
+                    history.push(msg.clone());
+                    app.history.push(msg);
                 }
                 if let CommandResult::Quit = res { break; }
+                
+                // Ensure history is synced if command modified it (e.g. /clear)
+                app.history = history.clone();
+                
                 CUR_ROW.store(app.terminal_height - 4, Ordering::SeqCst);
                 CUR_COL.store(0, Ordering::SeqCst);
             } else {
