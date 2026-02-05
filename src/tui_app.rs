@@ -11,7 +11,7 @@ use libakuma::{
     clear_screen, poll_input_event, write as akuma_write, fd
 };
 
-use crate::config::{Provider, Config, COLOR_USER, COLOR_MEOW, COLOR_GRAY_DIM, COLOR_GRAY_BRIGHT, COLOR_YELLOW, COLOR_RESET, COLOR_BOLD, COLOR_VIOLET};
+use crate::config::{Provider, Config, COLOR_MEOW, COLOR_GRAY_DIM, COLOR_GRAY_BRIGHT, COLOR_YELLOW, COLOR_RESET, COLOR_BOLD, COLOR_VIOLET};
 use crate::{Message, CommandResult};
 
 // ANSI escapes
@@ -263,9 +263,21 @@ pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize
         let mut idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
         
         match key {
-            0x1B => { // ESC
+            0x1B => { // ESC or Sequence
                 if bytes_read == 1 {
                     CANCELLED.store(true, Ordering::SeqCst);
+                } else if bytes_read == 2 && (event_buf[1] == b'\r' || event_buf[1] == b'\n') {
+                    // Alt+Enter or Alt+LF
+                    input.insert(idx, '\n');
+                    idx += 1;
+                } else if bytes_read >= 7 && event_buf[1] == 0x5B && &event_buf[2..7] == b"13;2u" {
+                    // Shift+Enter (CSI u)
+                    input.insert(idx, '\n');
+                    idx += 1;
+                } else if bytes_read >= 7 && event_buf[1] == 0x5B && &event_buf[2..7] == b"13;5u" {
+                    // Ctrl+Enter (CSI u)
+                    input.insert(idx, '\n');
+                    idx += 1;
                 }
             }
             0x7F | 0x08 => { // Backspace
@@ -287,6 +299,10 @@ pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize
                     input.clear();
                     idx = 0;
                     get_message_queue().push_back(msg);
+                } else if bytes_read == 2 && event_buf[1] == b'\n' {
+                    // Shift+Enter (some terminals send \r\n)
+                    input.insert(idx, '\n');
+                    idx += 1;
                 }
             }
             c if c >= 0x20 && c <= 0x7E => {
@@ -377,7 +393,7 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let _ = write!(stdout, "{}", CLEAR_TO_EOL);
     
     set_cursor_position(0, h - 2);
-    let _ = write!(stdout, "{}{}", COLOR_YELLOW, prompt_prefix);
+    let _ = write!(stdout, "{}{}", COLOR_VIOLET, prompt_prefix);
     let _ = write!(stdout, "{}{}", COLOR_RESET, COLOR_VIOLET);
     
     // Manually render input to handle wraps and newlines
@@ -508,7 +524,19 @@ pub fn run_tui(
 
             match key_code {
                 0x1B => { 
-                    if bytes_read > 2 && event_buf[1] == 0x5B {
+                    if bytes_read >= 7 && event_buf[1] == 0x5B && &event_buf[2..7] == b"13;2u" {
+                        // Shift+Enter (CSI u)
+                        input.insert(idx, '\n');
+                        idx += 1;
+                    } else if bytes_read >= 7 && event_buf[1] == 0x5B && &event_buf[2..7] == b"13;5u" {
+                        // Ctrl+Enter (CSI u)
+                        input.insert(idx, '\n');
+                        idx += 1;
+                    } else if bytes_read == 2 && (event_buf[1] == b'\r' || event_buf[1] == b'\n') {
+                        // Alt+Enter or Alt+LF
+                        input.insert(idx, '\n');
+                        idx += 1;
+                    } else if bytes_read > 2 && event_buf[1] == 0x5B {
                         let history = get_command_history();
                         match event_buf[2] {
                             0x41 => { // Up Arrow
@@ -615,6 +643,10 @@ pub fn run_tui(
                             idx = 0;
                             get_message_queue().push_back(user_input);
                         }
+                    } else if bytes_read == 2 && event_buf[1] == b'\n' {
+                        // Shift+Enter (some terminals send \r\n)
+                        input.insert(idx, '\n');
+                        idx += 1;
                     }
                 },
                 0x7F | 0x08 => { // Backspace
