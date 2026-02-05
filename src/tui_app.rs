@@ -7,8 +7,7 @@ use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use libakuma::{
     get_terminal_attributes, set_terminal_attributes, 
     set_cursor_position, hide_cursor, show_cursor, 
-    clear_screen, poll_input_event, write as akuma_write, fd,
-    open, close, read_fd, open_flags
+    clear_screen, poll_input_event, write as akuma_write, fd
 };
 
 use crate::config::{Provider, Config, COLOR_USER, COLOR_MEOW, COLOR_GRAY_DIM, COLOR_GRAY_BRIGHT, COLOR_YELLOW, COLOR_RESET, COLOR_BOLD};
@@ -24,6 +23,22 @@ pub static TERM_WIDTH: AtomicU16 = AtomicU16::new(100);
 pub static TERM_HEIGHT: AtomicU16 = AtomicU16::new(25);
 pub static CUR_COL: AtomicU16 = AtomicU16::new(0);
 pub static INPUT_LEN: AtomicU16 = AtomicU16::new(0);
+
+const CAT_ASCII: &str = r#"
+                      =#=      .-
+                      +*#*:.:-**
+                      +%%#%##***
+                      +%%%#%%#**.
+                      +%@@@%%%+*:
+          :::::--=+++*%@%@%%%%*-
+     :-+##%%%%%%%%@%@#%%@%%%%##%+
+  .=##%%%%%%%%%@@@@@%#%%@%%%@@@%%-
+.*%%%%%%%@%%%%@%@@@@%%%%@%%%%%@@#-
+%@%%%%%%%%%%@%%%%%@@@%%%@@@@@%%%#+
+*%%%%%@%@@%@@@%%%%#%@@@@@@@%%@@%@@@*+--
+ ::=+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
+         .--+**%@@@@@%@@%%@@%*       :-.
+                  ::::---#@%%*"#;
 
 struct TuiGuard;
 impl TuiGuard {
@@ -145,19 +160,9 @@ fn set_scroll_region(top: u16, bottom: u16) {
 
 fn print_greeting() {
     let mut stdout = Stdout;
-    let mut buf = [0u8; 4096];
-    let fd = open("src/akuma_40.txt", open_flags::O_RDONLY);
-    if fd >= 0 {
-        let n = read_fd(fd, &mut buf);
-        close(fd);
-        if n > 0 {
-            let _ = write!(stdout, "\n{}\x1b[38;5;236m", COLOR_RESET);
-            if let Ok(s) = core::str::from_utf8(&buf[..n as usize]) {
-                let _ = write!(stdout, "{}", s);
-            }
-            let _ = write!(stdout, "{}\n  {}MEOW!{} ~(=^‥^)ノ\n\n", COLOR_RESET, COLOR_BOLD, COLOR_RESET);
-        }
-    }
+    let _ = write!(stdout, "\n{}\x1b[38;5;236m", COLOR_RESET);
+    let _ = write!(stdout, "{}", CAT_ASCII);
+    let _ = write!(stdout, "{}\n  {}MEOW!{} ~(=^‥^)ノ\n\n", COLOR_RESET, COLOR_BOLD, COLOR_RESET);
 }
 
 fn probe_terminal_size() -> (u16, u16) {
@@ -204,9 +209,9 @@ pub fn run_tui(
     TERM_HEIGHT.store(h, Ordering::SeqCst);
     
     clear_screen();
-    print_greeting();
     // Scroll region ends at h-3 to leave room for 3-line footer
     set_scroll_region(1, h - 3);
+    print_greeting();
 
     loop {
         let current_tokens = crate::calculate_history_tokens(&app.history);
