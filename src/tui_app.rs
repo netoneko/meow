@@ -279,6 +279,14 @@ fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
     if buf.is_empty() { return (InputEvent::Unknown, 0); }
     
     match buf[0] {
+        0x0D => {
+            // Check for CRLF (\r\n) - often sent for Shift+Enter or just Enter
+            if buf.len() >= 2 && buf[1] == 0x0A {
+                return (InputEvent::ShiftEnter, 2);
+            }
+            (InputEvent::Enter, 1)
+        }
+        0x0A => (InputEvent::ShiftEnter, 1), // LF alone is almost always Shift+Enter in raw mode
         0x1B => { // ESC
             if buf.len() == 1 {
                 return (InputEvent::Esc, 1);
@@ -298,21 +306,36 @@ fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
                     b'1' if buf.len() >= 6 && &buf[2..6] == b"1;3C" => return (InputEvent::AltRight, 6),
                     b'1' if buf.len() >= 7 && &buf[2..7] == b"13;2u" => return (InputEvent::ShiftEnter, 7),
                     b'1' if buf.len() >= 7 && &buf[2..7] == b"13;5u" => return (InputEvent::ShiftEnter, 7), // Ctrl+Enter as ShiftEnter
+                    b'2' if buf.len() >= 9 && &buf[2..9] == b"7;2;13~" => return (InputEvent::ShiftEnter, 9), // \x1b[27;2;13~
                     _ => {}
                 }
             }
             
             // Alt+Enter / Alt+LF
-            if buf.len() == 2 && (buf[1] == b'\r' || buf[1] == b'\n') {
+            if buf.len() >= 2 && (buf[1] == b'\r' || buf[1] == b'\n') {
                 return (InputEvent::ShiftEnter, 2);
             }
             
+            // ESC O ... sequences (SS3)
+            if buf.len() >= 3 && buf[1] == b'O' {
+                match buf[2] {
+                    b'A' => return (InputEvent::Up, 3),
+                    b'B' => return (InputEvent::Down, 3),
+                    b'C' => return (InputEvent::Right, 3),
+                    b'D' => return (InputEvent::Left, 3),
+                    b'H' => return (InputEvent::Home, 3),
+                    b'F' => return (InputEvent::End, 3),
+                    b'M' => return (InputEvent::Enter, 3), // Keypad Enter
+                    _ => {}
+                }
+            }
+            
             // Alt+b / Alt+f
-            if buf.len() == 2 && buf[1] == b'b' { return (InputEvent::AltLeft, 2); }
-            if buf.len() == 2 && buf[1] == b'f' { return (InputEvent::AltRight, 2); }
+            if buf.len() >= 2 && buf[1] == b'b' { return (InputEvent::AltLeft, 2); }
+            if buf.len() >= 2 && buf[1] == b'f' { return (InputEvent::AltRight, 2); }
             
             // Unknown or incomplete sequence
-            if buf.len() > 1 && buf[1] != 0x5B {
+            if buf.len() > 1 && buf[1] != 0x5B && buf[1] != b'O' {
                 return (InputEvent::Esc, 1); // Treat as Esc and let next byte be processed
             }
             
@@ -322,13 +345,6 @@ fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
         0x05 => (InputEvent::CtrlE, 1),
         0x08 | 0x7F => (InputEvent::Backspace, 1),
         0x0C => (InputEvent::CtrlL, 1),
-        0x0D => {
-            if buf.len() >= 2 && buf[1] == 0x0A {
-                return (InputEvent::ShiftEnter, 2);
-            }
-            (InputEvent::Enter, 1)
-        }
-        0x0A => (InputEvent::ShiftEnter, 1), // LF usually treated as ShiftEnter if raw \r is handled
         0x15 => (InputEvent::CtrlU, 1),
         0x17 => (InputEvent::CtrlW, 1),
         c if c >= 0x20 && c <= 0x7E => (InputEvent::Char(c as char), 1),
@@ -341,7 +357,8 @@ pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize
     if !TUI_ACTIVE.load(Ordering::SeqCst) { return; }
     
     let mut event_buf = [0u8; 16];
-    let bytes_read = poll_input_event(0, &mut event_buf);
+    // Use a tiny timeout to allow multi-byte sequences to arrive
+    let bytes_read = poll_input_event(10, &mut event_buf);
     
     if bytes_read > 0 {
         let mut consumed = 0usize;
@@ -441,6 +458,39 @@ pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize
                     while new_idx < len && input.as_bytes().get(new_idx).map_or(false, |&b| b != b' ') { new_idx += 1; }
                     CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst);
                     redraw = true;
+                }
+                InputEvent::Up => {
+                    let history = get_command_history();
+                    if !history.is_empty() {
+                        unsafe {
+                            if HISTORY_INDEX == history.len() {
+                                *get_saved_input() = input.clone();
+                            }
+                            if HISTORY_INDEX > 0 {
+                                HISTORY_INDEX -= 1;
+                                *input = history[HISTORY_INDEX].clone();
+                                CURSOR_IDX.store(input.chars().count() as u16, Ordering::SeqCst);
+                                redraw = true;
+                            }
+                        }
+                    }
+                }
+                InputEvent::Down => {
+                    let history = get_command_history();
+                    if !history.is_empty() {
+                        unsafe {
+                            if HISTORY_INDEX < history.len() {
+                                HISTORY_INDEX += 1;
+                                if HISTORY_INDEX == history.len() {
+                                    *input = get_saved_input().clone();
+                                } else {
+                                    *input = history[HISTORY_INDEX].clone();
+                                }
+                                CURSOR_IDX.store(input.chars().count() as u16, Ordering::SeqCst);
+                                redraw = true;
+                            }
+                        }
+                    }
                 }
                 InputEvent::Esc => {
                     CANCELLED.store(true, Ordering::SeqCst);
