@@ -17,16 +17,185 @@ use crate::{Message, CommandResult};
 // ANSI escapes
 const CLEAR_TO_EOL: &str = "\x1b[K";
 
-/// Calculate gap between LLM output area and footer based on terminal size.
-/// Returns 3-5 lines depending on terminal height to prevent repaint interference.
-fn output_footer_gap() -> u16 {
-    let h = TERM_HEIGHT.load(Ordering::SeqCst);
-    if h >= 40 {
-        5 // Large terminals get more buffer
-    } else if h >= 30 {
-        4
-    } else {
-        3 // Minimum gap for smaller terminals
+// =============================================================================
+// PaneLayout - Three-pane TUI state management
+// =============================================================================
+
+/// Manages the three-pane TUI layout:
+/// - Output pane (top): scrollable LLM output
+/// - Status pane (middle): connection status, timing
+/// - Footer pane (bottom): prompt input, model info
+pub struct PaneLayout {
+    pub term_width: u16,
+    pub term_height: u16,
+    
+    // Output pane - scrollable region
+    pub output_top: u16,        // Always 1
+    pub output_bottom: u16,     // Calculated based on footer size
+    pub output_row: u16,        // Current cursor row in output
+    pub output_col: u16,        // Current cursor col in output
+    
+    // Status pane - single fixed row
+    pub status_row: u16,        // Row for status display
+    pub status_text: String,    // Current status text (e.g., "[MEOW]")
+    pub status_dots: u8,        // Number of dots for progress
+    pub status_time_ms: Option<u64>, // Timing info
+    
+    // Footer pane - prompt and info
+    pub footer_top: u16,        // Separator row
+    pub footer_height: u16,     // Total footer height (2 + prompt lines)
+    pub prompt_scroll: u16,     // Scroll offset within prompt
+    pub cursor_idx: u16,        // Cursor position in input
+    pub input_prefix_len: u16,  // Length of prompt prefix
+}
+
+impl PaneLayout {
+    /// Create a new pane layout for the given terminal dimensions.
+    pub fn new(width: u16, height: u16) -> Self {
+        let footer_height = 4; // Initial: separator + status + 2 prompt lines
+        let gap = Self::calculate_gap(height);
+        let output_bottom = height.saturating_sub(footer_height + gap + 1);
+        let status_row = output_bottom + 1;
+        let footer_top = status_row + 1 + gap;
+        
+        Self {
+            term_width: width,
+            term_height: height,
+            output_top: 1,
+            output_bottom,
+            output_row: output_bottom,
+            output_col: 0,
+            status_row,
+            status_text: String::new(),
+            status_dots: 0,
+            status_time_ms: None,
+            footer_top,
+            footer_height,
+            prompt_scroll: 0,
+            cursor_idx: 0,
+            input_prefix_len: 0,
+        }
+    }
+    
+    /// Calculate the gap between output and footer based on terminal height.
+    fn calculate_gap(height: u16) -> u16 {
+        if height >= 40 {
+            5 // Large terminals get more buffer
+        } else if height >= 30 {
+            4
+        } else {
+            3 // Minimum gap for smaller terminals
+        }
+    }
+    
+    /// Get the current gap value.
+    pub fn gap(&self) -> u16 {
+        Self::calculate_gap(self.term_height)
+    }
+    
+    /// Recalculate pane boundaries when footer height changes.
+    pub fn recalculate(&mut self, new_footer_height: u16) {
+        let gap = self.gap();
+        self.footer_height = new_footer_height;
+        self.output_bottom = self.term_height.saturating_sub(new_footer_height + gap + 1);
+        self.status_row = self.output_bottom + 1;
+        self.footer_top = self.status_row + 1 + gap;
+        
+        // Clamp output cursor if needed
+        if self.output_row > self.output_bottom {
+            self.output_row = self.output_bottom;
+        }
+    }
+    
+    /// Set scroll region to only include output pane.
+    /// Note: scroll region bottom should be output_bottom + 1 to match original behavior
+    pub fn set_scroll_region(&self) {
+        let mut stdout = Stdout;
+        // Original: set_scroll_region(1, h - f_h - gap) where max_row = h - f_h - gap - 1
+        // So scroll region bottom = output_bottom + 1
+        let scroll_bottom = self.output_bottom + 1;
+        let _ = write!(stdout, "\x1b[{};{}r", self.output_top, scroll_bottom);
+    }
+    
+    /// Reset scroll region to full terminal.
+    pub fn reset_scroll_region(&self) {
+        let mut stdout = Stdout;
+        let _ = write!(stdout, "\x1b[1;{}r", self.term_height);
+    }
+    
+    /// Render the status pane (saves/restores cursor position).
+    pub fn render_status(&self) {
+        let mut stdout = Stdout;
+        
+        // Save cursor position
+        let _ = write!(stdout, "\x1b[s");
+        
+        // Move to status row and clear it
+        set_cursor_position(0, self.status_row as u64);
+        let _ = write!(stdout, "{}", CLEAR_TO_EOL);
+        
+        // Draw status content
+        if !self.status_text.is_empty() {
+            let _ = write!(stdout, "  {}{}", COLOR_GRAY_DIM, self.status_text);
+            
+            // Add dots for progress
+            for _ in 0..self.status_dots {
+                let _ = write!(stdout, ".");
+            }
+            
+            // Add timing if available
+            if let Some(ms) = self.status_time_ms {
+                if ms < 1000 {
+                    let _ = write!(stdout, " ~(=^‥^)ノ [{}ms]", ms);
+                } else {
+                    let secs = ms / 1000;
+                    let remainder = (ms % 1000) / 100;
+                    let _ = write!(stdout, " ~(=^‥^)ノ [{}.{}s]", secs, remainder);
+                }
+            }
+            
+            let _ = write!(stdout, "{}", COLOR_RESET);
+        }
+        
+        // Restore cursor position
+        let _ = write!(stdout, "\x1b[u");
+    }
+    
+    /// Update status text and re-render.
+    pub fn update_status(&mut self, text: &str, dots: u8, time_ms: Option<u64>) {
+        self.status_text = String::from(text);
+        self.status_dots = dots;
+        self.status_time_ms = time_ms;
+        self.render_status();
+    }
+    
+    /// Clear the status pane.
+    pub fn clear_status(&mut self) {
+        self.status_text.clear();
+        self.status_dots = 0;
+        self.status_time_ms = None;
+        self.render_status();
+    }
+    
+    /// Get max output row (alias for output_bottom).
+    #[allow(dead_code)]
+    pub fn output_max_row(&self) -> u16 {
+        self.output_bottom
+    }
+}
+
+// Global pane layout (initialized on TUI start)
+static mut PANE_LAYOUT: Option<PaneLayout> = None;
+
+/// Get the global pane layout.
+pub fn get_pane_layout() -> &'static mut PaneLayout {
+    unsafe {
+        if PANE_LAYOUT.is_none() {
+            let w = TERM_WIDTH.load(Ordering::SeqCst);
+            let h = TERM_HEIGHT.load(Ordering::SeqCst);
+            PANE_LAYOUT = Some(PaneLayout::new(w, h));
+        }
+        PANE_LAYOUT.as_mut().unwrap()
     }
 }
 
@@ -141,15 +310,23 @@ impl Write for Stdout {
 }
 
 /// TUI-aware print function that handles wrapping, indentation, and cursor management.
+/// Uses atomics as source of truth, with PaneLayout for boundary calculations.
 pub fn tui_print(s: &str) {
     if s.is_empty() { return; }
     
+    // Read from atomics (source of truth)
     let w = TERM_WIDTH.load(Ordering::SeqCst);
     let h = TERM_HEIGHT.load(Ordering::SeqCst);
     let mut col = CUR_COL.load(Ordering::SeqCst);
     let mut row = CUR_ROW.load(Ordering::SeqCst);
+    let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
+    
+    // Calculate max_row using layout's gap calculation
+    let layout = get_pane_layout();
+    let gap = layout.gap();
+    let max_row = h.saturating_sub(f_h + 1 + gap);
 
-    // Jump to the current AI position in the scroll area.
+    // Jump to the current output position in the scroll area.
     set_cursor_position(col as u64, row as u64);
     
     let mut in_esc = false;
@@ -157,7 +334,6 @@ pub fn tui_print(s: &str) {
         if in_esc {
             let mut buf = [0u8; 4];
             akuma_write(fd::STDOUT, c.encode_utf8(&mut buf).as_bytes());
-            // CSI sequence starts with '[', which is in the @ to ~ range but NOT a terminator.
             if c != '[' && c >= '@' && c <= '~' {
                 in_esc = false;
             }
@@ -173,9 +349,6 @@ pub fn tui_print(s: &str) {
 
         if c == '\n' {
             row += 1;
-            let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
-            let gap = output_footer_gap();
-            let max_row = h - (f_h + 1 + gap);
             if row > max_row {
                 row = max_row;
                 akuma_write(fd::STDOUT, b"\n");
@@ -184,7 +357,7 @@ pub fn tui_print(s: &str) {
             }
             akuma_write(fd::STDOUT, b"         ");
             col = 9;
-        } else if c == '\x08' { // Backspace
+        } else if c == '\x08' {
             if col > 9 {
                 col -= 1;
                 akuma_write(fd::STDOUT, b"\x08");
@@ -192,9 +365,6 @@ pub fn tui_print(s: &str) {
         } else {
             if col >= w - 1 {
                 row += 1;
-                let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
-                let gap = output_footer_gap();
-                let max_row = h - (f_h + 1 + gap);
                 if row > max_row {
                     row = max_row;
                     akuma_write(fd::STDOUT, b"\n");
@@ -209,16 +379,20 @@ pub fn tui_print(s: &str) {
         }
     }
     
+    // Update atomics (source of truth)
     CUR_COL.store(col, Ordering::SeqCst);
     CUR_ROW.store(row, Ordering::SeqCst);
+    
+    // Also update layout for consistency
+    layout.output_col = col;
+    layout.output_row = row;
 
-    // Return cursor to prompt
+    // Return cursor to prompt position
     let input = get_global_input();
     let prompt_prefix_len = INPUT_LEN.load(Ordering::SeqCst) as usize;
     let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
     let (cx, cy_off) = calculate_input_cursor(input, idx, prompt_prefix_len, w as usize);
     
-    let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
     let scroll_top = PROMPT_SCROLL_TOP.load(Ordering::SeqCst) as u64;
     
     // Prompt area starts at Row h - f_h + 2
@@ -228,6 +402,21 @@ pub fn tui_print(s: &str) {
     // Clamp to prompt area bounds
     let clamped_cy = if final_cy >= h as u64 { h as u64 - 1 } else { final_cy };
     set_cursor_position(cx, clamped_cy);
+}
+
+/// Update the status pane with connection/streaming status.
+/// Call this from main.rs during streaming to show progress.
+pub fn update_streaming_status(text: &str, dots: u8, time_ms: Option<u64>) {
+    if !TUI_ACTIVE.load(Ordering::SeqCst) { return; }
+    let layout = get_pane_layout();
+    layout.update_status(text, dots, time_ms);
+}
+
+/// Clear the status pane after streaming ends.
+pub fn clear_streaming_status() {
+    if !TUI_ACTIVE.load(Ordering::SeqCst) { return; }
+    let layout = get_pane_layout();
+    layout.clear_status();
 }
 
 /// Check if a cancellation request (ESC key) was received.
@@ -608,9 +797,25 @@ fn handle_input_event(
             let (nw, nh) = probe_terminal_size();
             TERM_WIDTH.store(nw, Ordering::SeqCst);
             TERM_HEIGHT.store(nh, Ordering::SeqCst);
+            
+            // Update PaneLayout with new dimensions
+            let layout = get_pane_layout();
+            layout.term_width = nw;
+            layout.term_height = nh;
+            layout.recalculate(FOOTER_HEIGHT.load(Ordering::SeqCst));
+            
             clear_screen();
             print_greeting();
-            set_scroll_region(1, nh - FOOTER_HEIGHT.load(Ordering::SeqCst) - output_footer_gap());
+            
+            // Set scroll region using layout
+            layout.set_scroll_region();
+            
+            // Reset output cursor position
+            layout.output_row = layout.output_bottom;
+            layout.output_col = 0;
+            CUR_ROW.store(layout.output_row, Ordering::SeqCst);
+            CUR_COL.store(0, Ordering::SeqCst);
+            
             *redraw = true;
         }
         InputEvent::Esc | InputEvent::Interrupt => {
@@ -673,8 +878,9 @@ impl App {
 
 fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize, mem_kb: usize) {
     let mut stdout = Stdout;
-    let w = TERM_WIDTH.load(Ordering::SeqCst) as usize;
-    let h = TERM_HEIGHT.load(Ordering::SeqCst) as u64;
+    let layout = get_pane_layout();
+    let w = layout.term_width as usize;
+    let h = layout.term_height as u64;
 
     let token_display = if current_tokens >= 1000 { format!("{}k", current_tokens / 1000) } else { format!("{}", current_tokens) };
     let limit_display = format!("{}k", token_limit / 1000);
@@ -686,14 +892,14 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let prompt_prefix = format!("  [{}/{}|{}]{} (=^･ω･^=) > ", token_display, limit_display, mem_display, queue_display);
     let prompt_prefix_len = prompt_prefix.chars().count();
     INPUT_LEN.store(prompt_prefix_len as u16, Ordering::SeqCst);
+    layout.input_prefix_len = prompt_prefix_len as u16;
 
     let wrapped_lines = count_wrapped_lines(input, prompt_prefix_len, w);
     let max_prompt_lines = core::cmp::min(10, (h / 3) as usize);
     let display_prompt_lines = core::cmp::min(wrapped_lines, max_prompt_lines);
     let new_footer_height = (display_prompt_lines + 2) as u16; 
-    let old_footer_height = FOOTER_HEIGHT.load(Ordering::SeqCst);
+    let old_footer_height = layout.footer_height;
     let is_streaming = STREAMING.load(Ordering::SeqCst);
-    let gap = output_footer_gap();
     
     // During streaming: allow footer to GROW but not SHRINK
     // (shrinking would leave old separator lines that we can't safely clear during streaming)
@@ -704,42 +910,51 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     };
     let effective_prompt_lines = (effective_footer_height as usize).saturating_sub(2);
     
-    // Handle footer height changes
+    // Handle footer height changes using PaneLayout coordination
     if effective_footer_height != old_footer_height {
-        FOOTER_HEIGHT.store(effective_footer_height, Ordering::SeqCst);
+        let old_output_bottom = layout.output_bottom;
         
         if effective_footer_height > old_footer_height {
             // Footer is GROWING - need to scroll content up BEFORE changing scroll region
             let growth = effective_footer_height - old_footer_height;
-            let old_scroll_bottom = (h as u16) - old_footer_height - gap;
             
             // Position cursor at the bottom of the OLD scroll region and print newlines
             // to scroll the LLM output up, making room for the larger footer
-            set_cursor_position(0, old_scroll_bottom as u64);
+            set_cursor_position(0, old_output_bottom as u64);
             for _ in 0..growth {
                 akuma_write(fd::STDOUT, b"\n");
             }
             
+            // Recalculate all pane boundaries
+            layout.recalculate(effective_footer_height);
+            
             // Now update scroll region to the new smaller size
-            set_scroll_region(1, (h as u16) - effective_footer_height - gap);
+            layout.set_scroll_region();
             
-            let max_row = h as u16 - (effective_footer_height + 1 + gap);
+            // Adjust output cursor to account for the scroll (subtract the growth)
+            layout.output_row = layout.output_row.saturating_sub(growth);
+            if layout.output_row > layout.output_bottom {
+                layout.output_row = layout.output_bottom;
+            }
             
-            // Adjust CUR_ROW to account for the scroll (subtract the growth)
-            let cur_row = CUR_ROW.load(Ordering::SeqCst);
-            let new_row = cur_row.saturating_sub(growth);
-            CUR_ROW.store(core::cmp::min(new_row, max_row), Ordering::SeqCst);
+            // Keep atomics in sync
+            CUR_ROW.store(layout.output_row, Ordering::SeqCst);
         } else {
             // Footer is SHRINKING (only happens when not streaming)
-            set_scroll_region(1, (h as u16) - effective_footer_height - gap);
+            layout.recalculate(effective_footer_height);
+            layout.set_scroll_region();
         }
+        
+        // Keep atomic in sync
+        FOOTER_HEIGHT.store(effective_footer_height, Ordering::SeqCst);
     }
 
     let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
     let (_cx_abs, cy_off_abs) = calculate_input_cursor(input, idx, prompt_prefix_len, w);
-    let mut scroll_top = PROMPT_SCROLL_TOP.load(Ordering::SeqCst);
+    let mut scroll_top = layout.prompt_scroll;
     if cy_off_abs < scroll_top as u64 { scroll_top = cy_off_abs as u16; } 
     else if cy_off_abs >= (scroll_top as u64 + effective_prompt_lines as u64) { scroll_top = (cy_off_abs - effective_prompt_lines as u64 + 1) as u64 as u16; }
+    layout.prompt_scroll = scroll_top;
     PROMPT_SCROLL_TOP.store(scroll_top, Ordering::SeqCst);
 
     hide_cursor();
@@ -796,13 +1011,9 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
 
     let (cx, cy_off) = calculate_input_cursor(input, idx, prompt_prefix_len, w);
     let final_cy = status_row + 1 + (cy_off - scroll_top as u64);
+    layout.cursor_idx = idx as u16;
     set_cursor_position(cx, final_cy);
     show_cursor();
-}
-
-fn set_scroll_region(top: u16, bottom: u16) {
-    let mut stdout = Stdout;
-    let _ = write!(stdout, "\x1b[{};{}r", top, bottom);
 }
 
 fn print_greeting() {
@@ -856,17 +1067,27 @@ pub fn run_tui(
     TERM_HEIGHT.store(h, Ordering::SeqCst);
     set_model_and_provider(model, &provider.name);
     
+    // Initialize PaneLayout
+    let layout = get_pane_layout();
+    layout.term_width = w;
+    layout.term_height = h;
+    layout.recalculate(FOOTER_HEIGHT.load(Ordering::SeqCst));
+    
     let mut stdout = Stdout;
     let _ = write!(stdout, "\x1b[>1u");
     let _ = write!(stdout, "\x1b[?1049h");
     clear_screen();
-    let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
-    let gap = output_footer_gap();
-    set_scroll_region(1, h - f_h - gap);
+    
+    // Set scroll region using PaneLayout
+    layout.set_scroll_region();
+    
     print_greeting();
     let _ = write!(stdout, "  {}TIP:{} Type {}/hotkeys{} to see input shortcuts nya~! ♪(=^･ω･^)ﾉ\n\n", COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, COLOR_RESET);
 
-    CUR_ROW.store(h - (f_h + 1 + gap), Ordering::SeqCst);
+    // Initialize cursor position using layout
+    layout.output_row = layout.output_bottom;
+    layout.output_col = 0;
+    CUR_ROW.store(layout.output_row, Ordering::SeqCst);
     CUR_COL.store(0, Ordering::SeqCst);
 
     loop {
@@ -901,7 +1122,8 @@ pub fn run_tui(
         if let Some(user_input) = get_message_queue().pop_front() {
             app.render_footer(current_tokens, context_window, mem_kb);
             let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
-            let gap = output_footer_gap();
+            let layout = get_pane_layout();
+            let gap = layout.gap();
             let mut stdout = Stdout;
             
             // Position cursor in the output area before printing
@@ -918,19 +1140,28 @@ pub fn run_tui(
                 }
                 if let CommandResult::Quit = res { break; }
                 app.history = history.clone();
-                CUR_ROW.store(app.terminal_height - (f_h + 1 + gap), Ordering::SeqCst);
+                
+                // Reset output position using atomics (source of truth)
+                let output_row = app.terminal_height.saturating_sub(f_h + 1 + gap);
+                CUR_ROW.store(output_row, Ordering::SeqCst);
                 CUR_COL.store(0, Ordering::SeqCst);
+                layout.output_row = output_row;
+                layout.output_col = 0;
             } else {
                 app.history.push(Message::new("user", &user_input));
                 history.clear(); history.extend(app.history.iter().cloned());
                 
-                // Single stream approach: print [MEOW] once, then everything flows after it
-                // No dynamic status updates - eliminates cursor sync issues
-                let output_row = app.terminal_height - (f_h + 1 + gap);
+                // Initialize output position using atomics (source of truth)
+                let output_row = app.terminal_height.saturating_sub(f_h + 1 + gap);
                 CUR_ROW.store(output_row, Ordering::SeqCst);
                 CUR_COL.store(0, Ordering::SeqCst);
+                layout.output_row = output_row;
+                layout.output_col = 0;
                 
                 STREAMING.store(true, Ordering::SeqCst);
+                
+                // Update status pane with connection status
+                layout.update_status("[MEOW]", 0, None);
                 
                 // Print [MEOW] - status and LLM output will flow after this in sequence
                 tui_print(&format!("\n\n  {}[MEOW] {}", COLOR_MEOW, COLOR_RESET));
@@ -938,13 +1169,20 @@ pub fn run_tui(
                 let _ = crate::chat_once(model, provider, &user_input, history, Some(context_window), system_prompt);
                 STREAMING.store(false, Ordering::SeqCst);
                 CANCELLED.store(false, Ordering::SeqCst); // Clear cancel flag after streaming ends
+                
+                // Clear status after streaming ends
+                layout.clear_status();
+                
                 let _ = write!(stdout, "{}\n", COLOR_RESET);
                 app.history = history.clone(); crate::compact_history(&mut app.history);
             }
         }
     }
 
-    set_scroll_region(1, app.terminal_height);
+    // Reset scroll region using layout
+    let layout = get_pane_layout();
+    layout.reset_scroll_region();
+    
     let mut stdout = Stdout;
     let _ = write!(stdout, "\x1b[<u");
     set_terminal_attributes(fd::STDIN, 0, old_mode_flags);

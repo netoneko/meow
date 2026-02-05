@@ -580,7 +580,18 @@ pub fn send_with_retry(
     mem_kb: usize,
 ) -> Result<StreamResponse, &'static str> {
     let mut backoff_ms: u64 = 500;
+    let mut dots: u8 = 0;
 
+    let status_prefix = if is_continuation {
+        "[MEOW] [continuing"
+    } else {
+        "[MEOW] [jacking in"
+    };
+    
+    // Update status pane
+    tui_app::update_streaming_status(status_prefix, dots, None);
+    
+    // Also print inline for non-TUI mode
     if is_continuation {
         print("[continuing");
     } else {
@@ -592,16 +603,20 @@ pub fn send_with_retry(
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
             print(&format!(" retry {}", attempt));
+            tui_app::update_streaming_status(&format!("{} retry {}", status_prefix, attempt), dots, None);
             poll_sleep(backoff_ms, current_tokens, token_limit, mem_kb);
             backoff_ms *= 2;
         }
 
         if tui_app::tui_is_cancelled() {
             print("\n[cancelled]");
+            tui_app::clear_streaming_status();
             return Err("Request cancelled");
         }
 
         print(".");
+        dots += 1;
+        tui_app::update_streaming_status(status_prefix, dots, None);
 
         // Connect (TCP for both HTTP and HTTPS)
         let stream = match connect_to_provider(provider) {
@@ -1068,6 +1083,8 @@ fn read_streaming_with_http_stream_tls(
                                 if !first_token_received {
                                     first_token_received = true;
                                     let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
+                                    // Update status pane with timing
+                                    tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
                                     print(" ");
                                     print_elapsed(elapsed_ms);
                                     print("\n");
@@ -1086,6 +1103,7 @@ fn read_streaming_with_http_stream_tls(
                             }
                             if done {
                                 stream_completed = true;
+                                tui_app::clear_streaming_status();
                                 return Ok(StreamResponse::Complete(full_response));
                             }
                         }
@@ -1107,6 +1125,7 @@ fn read_streaming_with_http_stream_tls(
                             if !first_token_received {
                                 first_token_received = true;
                                 let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
+                                tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
                                 print(" ");
                                 print_elapsed(elapsed_ms);
                                 print("\n");
@@ -1117,6 +1136,7 @@ fn read_streaming_with_http_stream_tls(
                         }
                         if done {
                             stream_completed = true;
+                            tui_app::clear_streaming_status();
                         }
                     }
                 }
@@ -1264,6 +1284,7 @@ fn read_streaming_response_with_progress(
                                     if !first_token_received {
                                         first_token_received = true;
                                         let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
+                                        tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
                                         if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
                                             print(" ");
                                             print_elapsed(elapsed_ms);
@@ -1282,6 +1303,7 @@ fn read_streaming_response_with_progress(
                                 }
                                 if done {
                                     stream_completed = true;
+                                    tui_app::clear_streaming_status();
                                 }
                             }
                         }
@@ -1344,6 +1366,7 @@ fn read_streaming_response_with_progress(
                                 if !first_token_received {
                                     first_token_received = true;
                                     let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
+                                    tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
                                     if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
                                         print(" ");
                                         print_elapsed(elapsed_ms);
@@ -1370,6 +1393,7 @@ fn read_streaming_response_with_progress(
                             }
                             if done {
                                 is_done = true;
+                                tui_app::clear_streaming_status();
                                 break;
                             }
                         }
