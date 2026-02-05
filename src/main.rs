@@ -580,57 +580,70 @@ pub fn send_with_retry(
     mem_kb: usize,
 ) -> Result<StreamResponse, &'static str> {
     let mut backoff_ms: u64 = 500;
-    let mut dots: u8 = 0;
+    let mut dots: u8 = 1;
+    let is_tui = tui_app::TUI_ACTIVE.load(core::sync::atomic::Ordering::SeqCst);
 
     let status_prefix = if is_continuation {
-        "[MEOW] [continuing"
+        "[MEOW] continuing"
     } else {
-        "[MEOW] [jacking in"
+        "[MEOW] jacking in"
     };
     
-    // Update status pane
+    // Update status pane (TUI mode)
     tui_app::update_streaming_status(status_prefix, dots, None);
     
-    // Also print inline for non-TUI mode
-    if is_continuation {
-        print("[continuing");
-    } else {
-        print("[jacking in");
+    // Print inline only for non-TUI mode
+    if !is_tui {
+        if is_continuation {
+            libakuma::print("[continuing");
+        } else {
+            libakuma::print("[jacking in");
+        }
     }
 
     let start_time = libakuma::uptime();
 
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
-            print(&format!(" retry {}", attempt));
+            if !is_tui {
+                libakuma::print(&format!(" retry {}", attempt));
+            }
             tui_app::update_streaming_status(&format!("{} retry {}", status_prefix, attempt), dots, None);
             poll_sleep(backoff_ms, current_tokens, token_limit, mem_kb);
             backoff_ms *= 2;
         }
 
         if tui_app::tui_is_cancelled() {
-            print("\n[cancelled]");
+            if !is_tui {
+                libakuma::print("\n[cancelled]");
+            }
             tui_app::clear_streaming_status();
             return Err("Request cancelled");
         }
 
-        print(".");
-        dots += 1;
+        // Cycle dots 1-5
+        dots = (dots % 5) + 1;
         tui_app::update_streaming_status(status_prefix, dots, None);
+        
+        if !is_tui {
+            libakuma::print(".");
+        }
 
         // Connect (TCP for both HTTP and HTTPS)
         let stream = match connect_to_provider(provider) {
             Ok(s) => s,
             Err(e) => {
                 if attempt == MAX_RETRIES - 1 {
-                    print(&format!("] {}", e));
+                    if !is_tui { libakuma::print(&format!("] {}", e)); }
                     return Err("Connection failed");
                 }
                 continue;
             }
         };
 
-        print(".");
+        // Update status to "waiting"
+        tui_app::update_streaming_status("[MEOW] waiting", dots, None);
+        if !is_tui { libakuma::print("."); }
 
         let (path, request_body) = build_chat_request(model, provider, history);
 
@@ -647,7 +660,7 @@ pub fn send_with_retry(
                 Ok(s) => s,
                 Err(e) => {
                     if attempt == MAX_RETRIES - 1 {
-                        print(&format!("] TLS error: {:?}", e));
+                        if !is_tui { libakuma::print(&format!("] TLS error: {:?}", e)); }
                         return Err("TLS handshake failed");
                     }
                     continue;
@@ -664,16 +677,18 @@ pub fn send_with_retry(
             // Send request over TLS
             if let Err(_) = http_stream.post(&host, &path, &request_body, &headers) {
                 if attempt == MAX_RETRIES - 1 {
-                    print("] ");
+                    if !is_tui { libakuma::print("] "); }
                     return Err("Failed to send request");
                 }
                 continue;
             }
             
-            print("] waiting");
-            print(COLOR_RESET);
+            if !is_tui { 
+                libakuma::print("] waiting");
+                libakuma::print(COLOR_RESET);
+            }
             
-            match read_streaming_with_http_stream_tls(&mut http_stream, start_time, provider, current_tokens, token_limit, mem_kb) {
+            match read_streaming_with_http_stream_tls(&mut http_stream, start_time, provider, current_tokens, token_limit, mem_kb, is_tui) {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     if e == "Request cancelled" {
@@ -682,7 +697,7 @@ pub fn send_with_retry(
                     if attempt == MAX_RETRIES - 1 {
                         return Err(e);
                     }
-                    print(&format!(" ({})", e));
+                    if !is_tui { libakuma::print(&format!(" ({})", e)); }
                     continue;
                 }
             }
@@ -690,16 +705,18 @@ pub fn send_with_retry(
             // HTTP path (existing code)
             if let Err(e) = send_post_request(&stream, &path, &request_body, provider) {
                 if attempt == MAX_RETRIES - 1 {
-                    print("] ");
+                    if !is_tui { libakuma::print("] "); }
                     return Err(e);
                 }
                 continue;
             }
 
-            print("] waiting");
-            print(COLOR_RESET);
+            if !is_tui {
+                libakuma::print("] waiting");
+                libakuma::print(COLOR_RESET);
+            }
 
-            match read_streaming_response_with_progress(&stream, start_time, provider, current_tokens, token_limit, mem_kb) {
+            match read_streaming_response_with_progress(&stream, start_time, provider, current_tokens, token_limit, mem_kb, is_tui) {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     if e == "Request cancelled" {
@@ -708,7 +725,7 @@ pub fn send_with_retry(
                     if attempt == MAX_RETRIES - 1 {
                         return Err(e);
                     }
-                    print(&format!(" ({})", e));
+                    if !is_tui { libakuma::print(&format!(" ({})", e)); }
                     continue;
                 }
             }
@@ -1045,18 +1062,22 @@ fn read_streaming_with_http_stream_tls(
     current_tokens: usize,
     token_limit: usize,
     mem_kb: usize,
+    is_tui: bool,
 ) -> Result<StreamResponse, &'static str> {
     let mut full_response = String::new();
     let mut pending_lines = String::new();
     let mut first_token_received = false;
     let mut stream_completed = false;
+    let mut waiting_dots: u8 = 1;
 
     const RESPONSE_WARNING_THRESHOLD: usize = 64 * 1024;
     let mut warned_large_response = false;
 
-    // Note: Dots are printed by the TLS transport layer while waiting for data
-
     loop {
+        // Cycle waiting dots 1-5
+        waiting_dots = (waiting_dots % 5) + 1;
+        tui_app::update_streaming_status("[MEOW] waiting", waiting_dots, None);
+        
         // Process background input during streaming FIRST
         // so that ESC/Ctrl+C can be caught in the same iteration
         tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
@@ -1085,9 +1106,11 @@ fn read_streaming_with_http_stream_tls(
                                     let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
                                     // Update status pane with timing
                                     tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
-                                    print(" ");
-                                    print_elapsed(elapsed_ms);
-                                    print("\n");
+                                    if !is_tui {
+                                        libakuma::print(" ");
+                                        print_elapsed(elapsed_ms);
+                                        libakuma::print("\n");
+                                    }
                                 }
                                 print(COLOR_MEOW);
                                 print(&content);
@@ -1126,9 +1149,11 @@ fn read_streaming_with_http_stream_tls(
                                 first_token_received = true;
                                 let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
                                 tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
-                                print(" ");
-                                print_elapsed(elapsed_ms);
-                                print("\n");
+                                if !is_tui {
+                                    libakuma::print(" ");
+                                    print_elapsed(elapsed_ms);
+                                    libakuma::print("\n");
+                                }
                             }
                             print(COLOR_MEOW);
                             print(&content);
@@ -1245,6 +1270,7 @@ fn read_streaming_response_with_progress(
     current_tokens: usize,
     token_limit: usize,
     mem_kb: usize,
+    is_tui: bool,
 ) -> Result<StreamResponse, &'static str> {
     let mut buf = [0u8; 1024];
     let mut pending_data = Vec::new();
@@ -1255,11 +1281,16 @@ fn read_streaming_response_with_progress(
     let mut first_token_received = false;
     let mut any_data_received = false;
     let mut stream_completed = false;
+    let mut waiting_dots: u8 = 1;
 
     const RESPONSE_WARNING_THRESHOLD: usize = 64 * 1024;
     let mut warned_large_response = false;
 
     loop {
+        // Cycle waiting dots 1-5
+        waiting_dots = (waiting_dots % 5) + 1;
+        tui_app::update_streaming_status("[MEOW] waiting", waiting_dots, None);
+        
         // Process background input during streaming FIRST
         // so that ESC/Ctrl+C can be caught in the same iteration
         tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
@@ -1285,11 +1316,7 @@ fn read_streaming_response_with_progress(
                                         first_token_received = true;
                                         let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
                                         tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
-                                        if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
-                                            print(" ");
-                                            print_elapsed(elapsed_ms);
-                                            print("\n");
-                                        } else {
+                                        if !is_tui {
                                             for _ in 0..(7 + dots_printed) {
                                                 libakuma::print("\x08 \x08");
                                             }
@@ -1367,11 +1394,7 @@ fn read_streaming_response_with_progress(
                                     first_token_received = true;
                                     let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
                                     tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
-                                    if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
-                                        print(" ");
-                                        print_elapsed(elapsed_ms);
-                                        print("\n");
-                                    } else {
+                                    if !is_tui {
                                         for _ in 0..(7 + dots_printed) {
                                             libakuma::print("\x08 \x08");
                                         }
@@ -1416,8 +1439,8 @@ fn read_streaming_response_with_progress(
                 {
                     read_attempts += 1;
 
-                    if read_attempts % 50 == 0 && !first_token_received {
-                        print(".");
+                    if read_attempts % 50 == 0 && !first_token_received && !is_tui {
+                        libakuma::print(".");
                         dots_printed += 1;
                     }
 

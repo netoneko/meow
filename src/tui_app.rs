@@ -11,7 +11,7 @@ use libakuma::{
     clear_screen, poll_input_event, write as akuma_write, fd
 };
 
-use crate::config::{Provider, Config, COLOR_MEOW, COLOR_GRAY_DIM, COLOR_GRAY_BRIGHT, COLOR_YELLOW, COLOR_RESET, COLOR_BOLD, COLOR_VIOLET};
+use crate::config::{Provider, Config, COLOR_GRAY_DIM, COLOR_GRAY_BRIGHT, COLOR_YELLOW, COLOR_RESET, COLOR_BOLD, COLOR_VIOLET};
 use crate::{Message, CommandResult};
 
 // ANSI escapes
@@ -925,12 +925,19 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     // Handle footer height changes using PaneLayout coordination
     if effective_footer_height != old_footer_height {
         let old_output_bottom = layout.output_bottom;
+        let old_status_row = layout.status_row;
         
         if effective_footer_height > old_footer_height {
             // Footer is GROWING - need to scroll content up BEFORE changing scroll region
             let growth = effective_footer_height - old_footer_height;
             
-            // Position cursor at the bottom of the OLD scroll region and print newlines
+            // First, clear the old status row and separator area that will become part of output/gap
+            for row in old_status_row..=(old_status_row + growth) {
+                set_cursor_position(0, row as u64);
+                let _ = write!(stdout, "{}", CLEAR_TO_EOL);
+            }
+            
+            // Position cursor at the bottom of the scroll region and print newlines
             // to scroll the LLM output up, making room for the larger footer
             set_cursor_position(0, old_output_bottom as u64);
             for _ in 0..growth {
@@ -953,6 +960,14 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
             CUR_ROW.store(layout.output_row, Ordering::SeqCst);
         } else {
             // Footer is SHRINKING (only happens when not streaming)
+            // Clear the old footer area before shrinking
+            let old_separator_row = h as u16 - old_footer_height;
+            let new_separator_row = h as u16 - effective_footer_height;
+            for row in old_separator_row..new_separator_row {
+                set_cursor_position(0, row as u64);
+                let _ = write!(stdout, "{}", CLEAR_TO_EOL);
+            }
+            
             layout.recalculate(effective_footer_height);
             layout.set_scroll_region();
         }
@@ -1198,11 +1213,11 @@ pub fn run_tui(
                 
                 STREAMING.store(true, Ordering::SeqCst);
                 
-                // Update status pane with connection status
-                layout.update_status("[MEOW]", 0, None);
+                // Update status pane with connection status (dots start at 1)
+                layout.update_status("[MEOW] jacking in", 1, None);
                 
-                // Print [MEOW] - status and LLM output will flow after this in sequence
-                tui_print(&format!("\n\n  {}[MEOW] {}", COLOR_MEOW, COLOR_RESET));
+                // Add some spacing before LLM response (status shown in status bar, not inline)
+                tui_print("\n\n");
                 
                 let _ = crate::chat_once(model, provider, &user_input, history, Some(context_window), system_prompt);
                 STREAMING.store(false, Ordering::SeqCst);
