@@ -24,6 +24,7 @@ pub static TERM_HEIGHT: AtomicU16 = AtomicU16::new(25);
 pub static CUR_COL: AtomicU16 = AtomicU16::new(0);
 pub static CUR_ROW: AtomicU16 = AtomicU16::new(0);
 pub static INPUT_LEN: AtomicU16 = AtomicU16::new(0);
+pub static CURSOR_IDX: AtomicU16 = AtomicU16::new(0);
 
 static mut GLOBAL_INPUT: Option<String> = None;
 static mut MESSAGE_QUEUE: Option<VecDeque<String>> = None;
@@ -235,26 +236,37 @@ pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize
     if bytes_read > 0 {
         let key = event_buf[0];
         let input = get_global_input();
+        let mut idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
+        
         match key {
             0x1B => { // ESC
-                // Only cancel if it's a single ESC byte, not an arrow key sequence
                 if bytes_read == 1 {
                     CANCELLED.store(true, Ordering::SeqCst);
                 }
             }
-            0x7F | 0x08 => { input.pop(); }
+            0x7F | 0x08 => { // Backspace
+                if idx > 0 && !input.is_empty() {
+                    input.remove(idx - 1);
+                    idx -= 1;
+                }
+            }
             b'\r' | b'\n' => {
                 if !input.is_empty() {
                     let msg = input.clone();
                     add_to_history(&msg);
                     input.clear();
+                    idx = 0;
                     get_message_queue().push_back(msg);
                 }
             }
-            c if c >= 0x20 && c <= 0x7E => { input.push(c as char); }
+            c if c >= 0x20 && c <= 0x7E => {
+                input.insert(idx, c as char);
+                idx += 1;
+            }
             _ => {}
         }
         
+        CURSOR_IDX.store(idx as u16, Ordering::SeqCst);
         // Redraw footer with new input
         render_footer_internal(input, current_tokens, token_limit, mem_kb);
     }
@@ -325,7 +337,7 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     set_cursor_position(0, h - 3);
     let _ = write!(stdout, "{}", CLEAR_TO_EOL);
     let (model, provider) = get_model_and_provider();
-    let status_info = format!("   [Provider: {}] [Model: {}]", provider, model);
+    let status_info = format!(" [Provider: {}] [Model: {}]", provider, model);
     let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, status_info, COLOR_RESET);
 
     // 3. Draw Prompt (starting at Row h-2, can wrap to Row h-1)
@@ -335,11 +347,12 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let _ = write!(stdout, "{}", CLEAR_TO_EOL);
     
     set_cursor_position(0, h - 2);
-    let full_prompt = format!("{}{}{}{}{}", COLOR_YELLOW, prompt_prefix, COLOR_RESET, COLOR_USER, input);
+    let full_prompt = format!("{}{}{}{}{}", COLOR_YELLOW, prompt_prefix, COLOR_RESET, COLOR_VIOLET, input);
     let _ = write!(stdout, "{}{}", full_prompt, COLOR_RESET);
 
     // 4. Position Cursor (handles wrapping on Row h-2 and h-1)
-    let total_len = prompt_width + input.chars().count();
+    let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
+    let total_len = prompt_width + idx;
     let cx = (total_len % w) as u64;
     let cy = (h - 2) + (total_len / w) as u64;
     
@@ -428,35 +441,64 @@ pub fn run_tui(
 
         if bytes_read > 0 {
             let key_code = event_buf[0];
+            let mut idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
+            let input = get_global_input();
+
             match key_code {
                 0x1B => { 
                     if bytes_read > 2 && event_buf[1] == 0x5B {
                         let history = get_command_history();
-                        if history.is_empty() { continue; }
-                        
                         match event_buf[2] {
                             0x41 => { // Up Arrow
+                                if history.is_empty() { continue; }
                                 unsafe {
                                     if HISTORY_INDEX == history.len() {
-                                        *get_saved_input() = get_global_input().clone();
+                                        *get_saved_input() = input.clone();
                                     }
                                     if HISTORY_INDEX > 0 {
                                         HISTORY_INDEX -= 1;
-                                        *get_global_input() = history[HISTORY_INDEX].clone();
+                                        *input = history[HISTORY_INDEX].clone();
+                                        idx = input.chars().count();
                                     }
                                 }
                             }
                             0x42 => { // Down Arrow
+                                if history.is_empty() { continue; }
                                 unsafe {
                                     if HISTORY_INDEX < history.len() {
                                         HISTORY_INDEX += 1;
                                         if HISTORY_INDEX == history.len() {
-                                            *get_global_input() = get_saved_input().clone();
+                                            *input = get_saved_input().clone();
                                         } else {
-                                            *get_global_input() = history[HISTORY_INDEX].clone();
+                                            *input = history[HISTORY_INDEX].clone();
                                         }
+                                        idx = input.chars().count();
                                     }
                                 }
+                            }
+                            0x43 => { // Right Arrow
+                                if idx < input.chars().count() {
+                                    idx += 1;
+                                }
+                            }
+                            0x44 => { // Left Arrow
+                                if idx > 0 {
+                                    idx -= 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if bytes_read == 2 {
+                        // Alt shortcuts (usually ESC + key)
+                        match event_buf[1] {
+                            b'b' => { // Alt+B: Back word
+                                while idx > 0 && input.as_bytes()[idx-1] == b' ' { idx -= 1; }
+                                while idx > 0 && input.as_bytes()[idx-1] != b' ' { idx -= 1; }
+                            }
+                            b'f' => { // Alt+F: Forward word
+                                let len = input.chars().count();
+                                while idx < len && input.as_bytes()[idx] == b' ' { idx += 1; }
+                                while idx < len && input.as_bytes()[idx] != b' ' { idx += 1; }
                             }
                             _ => {}
                         }
@@ -465,16 +507,34 @@ pub fn run_tui(
                         if config.exit_on_escape { break; }
                     }
                 },
+                0x01 => { // Ctrl+A: Home
+                    idx = 0;
+                }
+                0x05 => { // Ctrl+E: End
+                    idx = input.chars().count();
+                }
+                0x17 => { // Ctrl+W: Delete word
+                    let old_idx = idx;
+                    while idx > 0 && input.as_bytes()[idx-1] == b' ' { idx -= 1; }
+                    while idx > 0 && input.as_bytes()[idx-1] != b' ' { idx -= 1; }
+                    for _ in 0..(old_idx - idx) {
+                        input.remove(idx);
+                    }
+                }
                 b'\r' | b'\n' => {
-                    let user_input = get_global_input().clone();
+                    let user_input = input.clone();
                     if !user_input.is_empty() {
                         add_to_history(&user_input);
-                        get_global_input().clear();
+                        input.clear();
+                        idx = 0;
                         get_message_queue().push_back(user_input);
                     }
                 },
-                0x7F | 0x08 => {
-                    get_global_input().pop();
+                0x7F | 0x08 => { // Backspace
+                    if idx > 0 && !input.is_empty() {
+                        input.remove(idx - 1);
+                        idx -= 1;
+                    }
                 },
                 12 => { // Ctrl-L: Re-probe
                     let (nw, nh) = probe_terminal_size();
@@ -486,10 +546,12 @@ pub fn run_tui(
                     set_scroll_region(1, nh - 4);
                 },
                 c if c >= 0x20 && c <= 0x7E => {
-                    get_global_input().push(c as char);
+                    input.insert(idx, c as char);
+                    idx += 1;
                 },
                 _ => {}
             }
+            CURSOR_IDX.store(idx as u16, Ordering::SeqCst);
         }
 
         // Process one message from the queue if available

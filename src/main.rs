@@ -465,7 +465,7 @@ pub fn handle_command(
         }
         "/help" | "/?" => {
             let output = String::from("┌──────────────────────────────────────────────┐\n\
-                                       │  ～ Meow-chan's Command Protocol ～          │\n\
+                                       │  ～ Meow's Command Protocol ～               │\n\
                                        ├──────────────────────────────────────────────┤\n\
                                        │  /clear        - Wipe memory banks nya~      │\n\
                                        │  /model [NAME] - Check/switch neural link    │\n\
