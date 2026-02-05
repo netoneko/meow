@@ -476,7 +476,11 @@ pub fn handle_command(
                                        │ Alt+B / Opt+Left - Move back one word          │\n\
                                        │ Alt+F / Opt+Right- Move forward one word       │\n\
                                        │ Arrows           - Navigate history and line   │\n\
-                                       │ ESC              - Cancel current AI request   │\n\
+                                       │ ESC / Ctrl+C     - Cancel current AI request   │\n\
+                                       ├────────────────────────────────────────────────┤\n\
+                                       │ Note: Some terminals intercept Ctrl+W/U/C.     │\n\
+                                       │ Try: iTerm2 Prefs > Keys > Left Option = Esc+  │\n\
+                                       │ Or disable system shortcuts for these keys.    │\n\
                                        └────────────────────────────────────────────────┘\n");
             (CommandResult::Continue, Some(output))
         }
@@ -499,6 +503,29 @@ pub fn handle_command(
                                        │ memory nya~!                                   │\n\
                                        └────────────────────────────────────────────────┘\n");
             (CommandResult::Continue, Some(output))
+        }
+        "/rawtest" | "/keytest" => {
+            // Test mode to show raw key bytes for 10 seconds
+            let output = String::from("Raw key test mode for 10 seconds. Press keys to see their byte codes:\n");
+            libakuma::print(&output);
+            
+            let start = libakuma::uptime();
+            let duration_us = 10_000_000u64; // 10 seconds
+            let mut buf = [0u8; 16];
+            
+            while libakuma::uptime() - start < duration_us {
+                let n = libakuma::poll_input_event(100, &mut buf);
+                if n > 0 {
+                    let mut hex = String::from("  Bytes: ");
+                    for i in 0..(n as usize) {
+                        hex.push_str(&format!("{:02X} ", buf[i]));
+                    }
+                    hex.push('\n');
+                    libakuma::print(&hex);
+                }
+            }
+            
+            (CommandResult::Continue, Some(String::from("Raw key test complete.")))
         }
         _ => {
             (CommandResult::Continue, Some(format!("～ Nyaa? Unknown command: {} ...Meow-chan is confused (=｀ω´=)", command)))

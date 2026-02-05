@@ -611,11 +611,17 @@ fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
         0x0A => (InputEvent::ShiftEnter, 1),
         0x1B => { // ESC
             if buf.len() == 1 {
+                // Single ESC byte - could be standalone ESC or start of escape sequence
+                // Use time since last input to decide:
+                // - If >50ms since last input, treat as standalone ESC (user pressed ESC key)
+                // - Otherwise, wait for more bytes (might be escape sequence coming)
                 let now = libakuma::uptime();
                 unsafe {
                     if now.saturating_sub(LAST_INPUT_TIME) > 50000 {
                         return (InputEvent::Esc, 1);
                     } else {
+                        // Potential escape sequence starting - wait for more bytes
+                        // Return 0 consumed to break out of parse loop and wait for more input
                         return (InputEvent::Unknown, 0); 
                     }
                 }
@@ -646,7 +652,59 @@ fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
                                 return (InputEvent::Unknown, len);
                             }
                             b'u' => {
+                                // CSI u (Kitty keyboard protocol)
+                                // Format: ESC [ keycode ; modifier u
+                                // Modifier: 1=Shift, 2=Alt, 4=Ctrl (value is 1 + bits)
                                 if seq == b"13;2" || seq == b"13;5" { return (InputEvent::ShiftEnter, len); }
+                                
+                                // Parse keycode and optional modifier
+                                if let Some(semi_pos) = seq.iter().position(|&b| b == b';') {
+                                    // Has modifier: keycode;modifier
+                                    if let Ok(keycode_str) = core::str::from_utf8(&seq[..semi_pos]) {
+                                        if let Ok(keycode) = keycode_str.parse::<u32>() {
+                                            if let Ok(mod_str) = core::str::from_utf8(&seq[semi_pos+1..]) {
+                                                if let Ok(modifier) = mod_str.parse::<u32>() {
+                                                    let ctrl = (modifier.saturating_sub(1) & 4) != 0;
+                                                    let alt = (modifier.saturating_sub(1) & 2) != 0;
+                                                    
+                                                    // Ctrl + key
+                                                    if ctrl && !alt {
+                                                        match keycode {
+                                                            97 => return (InputEvent::CtrlA, len),  // a
+                                                            99 => return (InputEvent::Interrupt, len), // c
+                                                            101 => return (InputEvent::CtrlE, len), // e
+                                                            106 => return (InputEvent::ShiftEnter, len), // j (Ctrl+J = LF)
+                                                            108 => return (InputEvent::CtrlL, len), // l
+                                                            117 => return (InputEvent::CtrlU, len), // u
+                                                            119 => return (InputEvent::CtrlW, len), // w
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                    // Alt + key
+                                                    if alt && !ctrl {
+                                                        match keycode {
+                                                            98 => return (InputEvent::AltLeft, len),  // b
+                                                            102 => return (InputEvent::AltRight, len), // f
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // No modifier: just keycode
+                                    if let Ok(keycode_str) = core::str::from_utf8(seq) {
+                                        if let Ok(keycode) = keycode_str.parse::<u32>() {
+                                            match keycode {
+                                                27 => return (InputEvent::Esc, len), // ESC
+                                                13 => return (InputEvent::Enter, len), // Enter
+                                                127 => return (InputEvent::Backspace, len), // Backspace
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
                                 return (InputEvent::Unknown, len);
                             }
                             _ => return (InputEvent::Unknown, len),
