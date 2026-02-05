@@ -47,6 +47,9 @@ pub struct PaneLayout {
     pub prompt_scroll: u16,     // Scroll offset within prompt
     pub cursor_idx: u16,        // Cursor position in input
     pub input_prefix_len: u16,  // Length of prompt prefix
+    
+    // Animation state
+    pub repaint_counter: u16,   // Counter for slow animations (dots update every 10th repaint)
 }
 
 impl PaneLayout {
@@ -82,6 +85,7 @@ impl PaneLayout {
             prompt_scroll: 0,
             cursor_idx: 0,
             input_prefix_len: 0,
+            repaint_counter: 0,
         }
     }
     
@@ -169,8 +173,12 @@ impl PaneLayout {
     
     /// Update status text (does NOT render - rendering happens via tui_handle_input or render_footer).
     pub fn update_status(&mut self, text: &str, dots: u8, time_ms: Option<u64>) {
-        self.status_text = String::from(text);
-        self.status_dots = dots;
+        // Only reset dots/counter if the status text changes
+        if self.status_text != text {
+            self.status_text = String::from(text);
+            self.status_dots = if dots > 0 { dots } else { 1 }; // Start at 1 if not specified
+            self.repaint_counter = 0; // Reset counter for fresh animation
+        }
         self.status_time_ms = time_ms;
         // Don't render here - it interferes with cursor positioning
         // Status will be rendered during next footer render or tui_handle_input
@@ -179,7 +187,7 @@ impl PaneLayout {
     /// Clear the status pane (does NOT render).
     pub fn clear_status(&mut self) {
         self.status_text.clear();
-        self.status_dots = 0;
+        self.status_dots = 1; // Reset to 1 for idle animation
         self.status_time_ms = None;
         // Don't render here - will be cleared during next footer render
     }
@@ -316,7 +324,7 @@ impl Write for Stdout {
     }
 }
 
-/// TUI-aware print function that handles wrapping, indentation, and cursor management.
+/// TUI-aware print function that handles word-wrapping, indentation, and cursor management.
 /// Uses atomics as source of truth, with PaneLayout for boundary calculations.
 pub fn tui_print(s: &str) {
     if s.is_empty() { return; }
@@ -332,16 +340,72 @@ pub fn tui_print(s: &str) {
     let layout = get_pane_layout();
     let gap = layout.gap();
     let max_row = h.saturating_sub(f_h + 1 + gap);
+    let indent = 9u16; // Indentation for wrapped lines
 
     // Jump to the current output position in the scroll area.
     set_cursor_position(col as u64, row as u64);
     
+    // Word buffer for word-wrapping (buffer the current word)
+    let mut word_buf: alloc::vec::Vec<char> = alloc::vec::Vec::with_capacity(64);
+    let mut word_display_len: u16 = 0; // Visual length (excludes escape codes)
+    
     let mut in_esc = false;
-    for c in s.chars() {
-        if in_esc {
+    let mut esc_buf: alloc::vec::Vec<char> = alloc::vec::Vec::with_capacity(16);
+    
+    // Helper closure to wrap to next line
+    let wrap_line = |row: &mut u16, col: &mut u16, max_row: u16| {
+        *row += 1;
+        if *row > max_row {
+            *row = max_row;
+            akuma_write(fd::STDOUT, b"\n");
+        } else {
+            set_cursor_position(0, *row as u64);
+        }
+        akuma_write(fd::STDOUT, b"         ");
+        *col = indent;
+    };
+    
+    // Helper to flush the word buffer
+    let flush_word = |word_buf: &mut alloc::vec::Vec<char>, word_display_len: &mut u16, 
+                      col: &mut u16, row: &mut u16, max_row: u16, w: u16, indent: u16| {
+        if word_buf.is_empty() { return; }
+        
+        // Check if word fits on current line
+        if *col + *word_display_len > w - 1 && *col > indent {
+            // Word doesn't fit - wrap first
+            *row += 1;
+            if *row > max_row {
+                *row = max_row;
+                akuma_write(fd::STDOUT, b"\n");
+            } else {
+                set_cursor_position(0, *row as u64);
+            }
+            akuma_write(fd::STDOUT, b"         ");
+            *col = indent;
+        }
+        
+        // Print the buffered word
+        for c in word_buf.iter() {
             let mut buf = [0u8; 4];
             akuma_write(fd::STDOUT, c.encode_utf8(&mut buf).as_bytes());
+        }
+        *col += *word_display_len;
+        
+        word_buf.clear();
+        *word_display_len = 0;
+    };
+    
+    for c in s.chars() {
+        // Handle escape sequences - pass through without affecting word buffer
+        if in_esc {
+            esc_buf.push(c);
             if c != '[' && c >= '@' && c <= '~' {
+                // End of escape sequence - print it
+                for ec in esc_buf.iter() {
+                    let mut buf = [0u8; 4];
+                    akuma_write(fd::STDOUT, ec.encode_utf8(&mut buf).as_bytes());
+                }
+                esc_buf.clear();
                 in_esc = false;
             }
             continue;
@@ -349,42 +413,45 @@ pub fn tui_print(s: &str) {
         
         if c == '\x1b' {
             in_esc = true;
-            let mut buf = [0u8; 4];
-            akuma_write(fd::STDOUT, c.encode_utf8(&mut buf).as_bytes());
+            esc_buf.clear();
+            esc_buf.push(c);
             continue;
         }
 
         if c == '\n' {
-            row += 1;
-            if row > max_row {
-                row = max_row;
-                akuma_write(fd::STDOUT, b"\n");
-            } else {
-                set_cursor_position(0, row as u64);
-            }
-            akuma_write(fd::STDOUT, b"         ");
-            col = 9;
+            // Flush word buffer before newline
+            flush_word(&mut word_buf, &mut word_display_len, &mut col, &mut row, max_row, w, indent);
+            wrap_line(&mut row, &mut col, max_row);
         } else if c == '\x08' {
-            if col > 9 {
+            // Backspace
+            if col > indent {
                 col -= 1;
                 akuma_write(fd::STDOUT, b"\x08");
             }
-        } else {
+        } else if c == ' ' || c == '\t' {
+            // Space/tab - flush word buffer first, then print space
+            flush_word(&mut word_buf, &mut word_display_len, &mut col, &mut row, max_row, w, indent);
+            
+            // Check if space fits
             if col >= w - 1 {
-                row += 1;
-                if row > max_row {
-                    row = max_row;
-                    akuma_write(fd::STDOUT, b"\n");
-                }
-                set_cursor_position(0, row as u64);
-                akuma_write(fd::STDOUT, b"         ");
-                col = 9;
+                wrap_line(&mut row, &mut col, max_row);
             }
-            let mut buf = [0u8; 4];
-            akuma_write(fd::STDOUT, c.encode_utf8(&mut buf).as_bytes());
+            akuma_write(fd::STDOUT, b" ");
             col += 1;
+        } else {
+            // Regular character - add to word buffer
+            word_buf.push(c);
+            word_display_len += 1;
+            
+            // If word is too long for a line, flush it anyway (force break)
+            if word_display_len >= w - indent {
+                flush_word(&mut word_buf, &mut word_display_len, &mut col, &mut row, max_row, w, indent);
+            }
         }
     }
+    
+    // Flush any remaining word
+    flush_word(&mut word_buf, &mut word_display_len, &mut col, &mut row, max_row, w, indent);
     
     // Update atomics (source of truth)
     CUR_COL.store(col, Ordering::SeqCst);
@@ -893,6 +960,20 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let layout = get_pane_layout();
     let w = layout.term_width as usize;
     let h = layout.term_height as u64;
+    
+    // Increment repaint counter (wraps at 10000)
+    layout.repaint_counter = layout.repaint_counter.wrapping_add(1) % 10000;
+    let is_streaming = STREAMING.load(Ordering::SeqCst);
+    
+    // Update dots every 10th repaint (~500ms at 50ms poll rate)
+    if layout.repaint_counter % 10 == 0 {
+        layout.status_dots = (layout.status_dots % 5) + 1;
+    }
+    
+    // Set idle status when not streaming
+    if !is_streaming && layout.status_text.is_empty() {
+        layout.status_text = String::from("[MEOW] awaiting user input");
+    }
 
     let token_display = if current_tokens >= 1000 { format!("{}k", current_tokens / 1000) } else { format!("{}", current_tokens) };
     let limit_display = format!("{}k", token_limit / 1000);
@@ -911,7 +992,6 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let display_prompt_lines = core::cmp::min(wrapped_lines, max_prompt_lines);
     let new_footer_height = (display_prompt_lines + 2) as u16; 
     let old_footer_height = layout.footer_height;
-    let is_streaming = STREAMING.load(Ordering::SeqCst);
     
     // During streaming: allow footer to GROW but not SHRINK
     // (shrinking would leave old separator lines that we can't safely clear during streaming)
@@ -990,12 +1070,13 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     // Streaming status row is just above the separator
     let streaming_status_row = separator_row.saturating_sub(1);
     
-    // When footer shrinks, clear old footer lines that are now in the gap area.
-    // Only clear from old separator position to new separator position.
+    // When footer shrinks, clear old footer lines and old status row that are now in the gap area.
     // This never touches the scroll region (LLM output area).
     if effective_footer_height < old_footer_height {
         let old_separator_row = h - old_footer_height as u64;
-        for row in old_separator_row..separator_row {
+        let old_status_row = old_separator_row.saturating_sub(1);
+        // Clear from old status row through to the new separator
+        for row in old_status_row..separator_row {
             set_cursor_position(0, row);
             let _ = write!(stdout, "{}", CLEAR_TO_EOL);
         }
@@ -1006,16 +1087,21 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let _ = write!(stdout, "{}", CLEAR_TO_EOL);
     if !layout.status_text.is_empty() {
         let _ = write!(stdout, "  {}{}", COLOR_GRAY_DIM, layout.status_text);
+        // Animated dots (1-5), padded to 5 chars so everything stays in place
         for _ in 0..layout.status_dots {
             let _ = write!(stdout, ".");
         }
+        for _ in layout.status_dots..5 {
+            let _ = write!(stdout, " ");
+        }
+        // Show time when streaming response received
         if let Some(ms) = layout.status_time_ms {
             if ms < 1000 {
-                let _ = write!(stdout, " ~(=^‥^)ノ [{}ms]", ms);
+                let _ = write!(stdout, "~(=^‥^)ノ [{}ms]", ms);
             } else {
                 let secs = ms / 1000;
                 let remainder = (ms % 1000) / 100;
-                let _ = write!(stdout, " ~(=^‥^)ノ [{}.{}s]", secs, remainder);
+                let _ = write!(stdout, "~(=^‥^)ノ [{}.{}s]", secs, remainder);
             }
         }
         let _ = write!(stdout, "{}", COLOR_RESET);

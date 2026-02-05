@@ -580,7 +580,6 @@ pub fn send_with_retry(
     mem_kb: usize,
 ) -> Result<StreamResponse, &'static str> {
     let mut backoff_ms: u64 = 500;
-    let mut dots: u8 = 1;
     let is_tui = tui_app::TUI_ACTIVE.load(core::sync::atomic::Ordering::SeqCst);
 
     let status_prefix = if is_continuation {
@@ -589,8 +588,8 @@ pub fn send_with_retry(
         "[MEOW] jacking in"
     };
     
-    // Update status pane (TUI mode)
-    tui_app::update_streaming_status(status_prefix, dots, None);
+    // Update status pane (TUI mode) - dots are managed by render loop
+    tui_app::update_streaming_status(status_prefix, 0, None);
     
     // Print inline only for non-TUI mode
     if !is_tui {
@@ -608,7 +607,7 @@ pub fn send_with_retry(
             if !is_tui {
                 libakuma::print(&format!(" retry {}", attempt));
             }
-            tui_app::update_streaming_status(&format!("{} retry {}", status_prefix, attempt), dots, None);
+            tui_app::update_streaming_status(&format!("{} retry {}", status_prefix, attempt), 0, None);
             poll_sleep(backoff_ms, current_tokens, token_limit, mem_kb);
             backoff_ms *= 2;
         }
@@ -621,10 +620,6 @@ pub fn send_with_retry(
             return Err("Request cancelled");
         }
 
-        // Cycle dots 1-5
-        dots = (dots % 5) + 1;
-        tui_app::update_streaming_status(status_prefix, dots, None);
-        
         if !is_tui {
             libakuma::print(".");
         }
@@ -641,8 +636,8 @@ pub fn send_with_retry(
             }
         };
 
-        // Update status to "waiting"
-        tui_app::update_streaming_status("[MEOW] waiting", dots, None);
+        // Update status to "waiting" - dots managed by render loop
+        tui_app::update_streaming_status("[MEOW] waiting", 0, None);
         if !is_tui { libakuma::print("."); }
 
         let (path, request_body) = build_chat_request(model, provider, history);
@@ -1068,18 +1063,14 @@ fn read_streaming_with_http_stream_tls(
     let mut pending_lines = String::new();
     let mut first_token_received = false;
     let mut stream_completed = false;
-    let mut waiting_dots: u8 = 1;
 
     const RESPONSE_WARNING_THRESHOLD: usize = 64 * 1024;
     let mut warned_large_response = false;
 
     loop {
-        // Cycle waiting dots 1-5
-        waiting_dots = (waiting_dots % 5) + 1;
-        tui_app::update_streaming_status("[MEOW] waiting", waiting_dots, None);
-        
         // Process background input during streaming FIRST
         // so that ESC/Ctrl+C can be caught in the same iteration
+        // (dots animation is handled by render loop every 10th repaint)
         tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
 
         if tui_app::tui_is_cancelled() {
@@ -1281,18 +1272,14 @@ fn read_streaming_response_with_progress(
     let mut first_token_received = false;
     let mut any_data_received = false;
     let mut stream_completed = false;
-    let mut waiting_dots: u8 = 1;
 
     const RESPONSE_WARNING_THRESHOLD: usize = 64 * 1024;
     let mut warned_large_response = false;
 
     loop {
-        // Cycle waiting dots 1-5
-        waiting_dots = (waiting_dots % 5) + 1;
-        tui_app::update_streaming_status("[MEOW] waiting", waiting_dots, None);
-        
         // Process background input during streaming FIRST
         // so that ESC/Ctrl+C can be caught in the same iteration
+        // (dots animation is handled by render loop every 10th repaint)
         tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
 
         if tui_app::tui_is_cancelled() {

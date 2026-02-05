@@ -338,3 +338,52 @@ Each phase should be testable independently.
 - ~500 lines of new/modified code
 - Can be done incrementally
 - Each phase adds functionality without breaking existing behavior
+
+---
+
+## Implementation Status (Feb 2026)
+
+### Completed Features
+
+**PaneLayout struct** (`tui_app.rs`):
+- Manages all three panes: output, status, footer
+- Fields: `term_width`, `term_height`, `output_top`, `output_bottom`, `output_row`, `output_col`, `status_row`, `status_text`, `status_dots`, `status_time_ms`, `footer_top`, `footer_height`, `prompt_scroll`, `cursor_idx`, `input_prefix_len`, `repaint_counter`
+
+**Status pane** (1 row above footer separator):
+- Shows connection/streaming status with animated dots
+- Dots cycle 1→5 every 10th repaint (~500ms at 50ms poll rate)
+- Status states:
+  - `[MEOW] awaiting user input.....` - idle, animated dots
+  - `[MEOW] jacking in.....` - connecting, animated dots
+  - `[MEOW] waiting.....` - request sent, animated dots  
+  - `[MEOW] streaming ~(=^‥^)ノ [1.2s]` - response time, no dots
+
+**Footer resizing**:
+- Dynamic height for multiline input (up to 10 lines)
+- During streaming: footer can grow but not shrink (prevents artifacts)
+- Buffer shifts up correctly when entering multiline mode
+- Clears transitional areas when resizing
+
+**Scroll region management**:
+- Output pane uses ANSI scroll region `\x1b[<top>;<bottom>r`
+- Explicit cursor positioning via `set_cursor_position(col, row)`
+- No reliance on `\x1b[s` / `\x1b[u` cursor save/restore (unreliable)
+
+**TUI/non-TUI mode**:
+- `is_tui` flag controls inline printing vs status bar updates
+- Non-TUI mode prints connection status inline as before
+- TUI mode shows status only in status bar (no duplicate output)
+
+### Key Implementation Details
+
+**Repaint frequency**: Main loop uses `poll_input_event(50, ...)` = ~50ms per frame (20 FPS)
+
+**Dots animation**: Managed centrally in `render_footer_internal()`, not in streaming functions
+
+**Status update logic** (`update_status`):
+- Only resets dots/counter when status text changes
+- Prevents flicker from repeated calls with same text
+
+**Files modified**:
+- `userspace/meow/src/tui_app.rs` - PaneLayout, rendering, input handling
+- `userspace/meow/src/main.rs` - streaming functions use `is_tui` flag
