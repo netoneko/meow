@@ -574,8 +574,13 @@ pub fn send_with_retry(
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
             print(&format!(" retry {}", attempt));
-            libakuma::sleep_ms(backoff_ms);
+            poll_sleep(backoff_ms, current_tokens, token_limit, mem_kb);
             backoff_ms *= 2;
+        }
+
+        if tui_app::tui_is_cancelled() {
+            print("\n[cancelled]");
+            return Err("Request cancelled");
         }
 
         print(".");
@@ -1012,7 +1017,7 @@ fn read_streaming_with_http_stream_tls(
     // Note: Dots are printed by the TLS transport layer while waiting for data
 
     loop {
-        if check_escape_pressed() {
+        if tui_app::tui_is_cancelled() {
             print("\n[cancelled]");
             return Err("Request cancelled");
         }
@@ -1207,7 +1212,7 @@ fn read_streaming_response_with_progress(
     let mut warned_large_response = false;
 
     loop {
-        if check_escape_pressed() {
+        if tui_app::tui_is_cancelled() {
             print("\n[cancelled]");
             return Err("Request cancelled");
         }
@@ -1572,22 +1577,16 @@ fn print_elapsed(ms: u64) {
     }
 }
 
-// ============================================================================
-// Input Handling
-// ============================================================================
-
-/// Check if escape key was pressed (non-blocking)
-/// Returns true if ESC (0x1B) was detected
-fn check_escape_pressed() -> bool {
-    let mut buf = [0u8; 8];
-    let n = read(fd::STDIN, &mut buf);
-    if n > 0 {
-        // Check for escape key (0x1B)
-        for i in 0..(n as usize) {
-            if buf[i] == 0x1B {
-                return true;
-            }
-        }
+/// Sleep while polling for TUI input to keep the interface responsive.
+fn poll_sleep(ms: u64, current_tokens: usize, token_limit: usize, mem_kb: usize) {
+    let start = libakuma::uptime();
+    let end = start + ms * 1000;
+    while libakuma::uptime() < end {
+        tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
+        libakuma::sleep_ms(10);
     }
-    false
 }
+
+// ============================================================================
+// Chat Message Types
+// ============================================================================

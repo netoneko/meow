@@ -20,6 +20,7 @@ pub const RESTORE_CURSOR: &str = "\x1b[u";
 const CLEAR_TO_EOL: &str = "\x1b[K";
 
 pub static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub static CANCELLED: AtomicBool = AtomicBool::new(false);
 pub static TERM_WIDTH: AtomicU16 = AtomicU16::new(100);
 pub static TERM_HEIGHT: AtomicU16 = AtomicU16::new(25);
 pub static CUR_COL: AtomicU16 = AtomicU16::new(0);
@@ -27,6 +28,9 @@ pub static INPUT_LEN: AtomicU16 = AtomicU16::new(0);
 
 static mut GLOBAL_INPUT: Option<String> = None;
 static mut MESSAGE_QUEUE: Option<VecDeque<String>> = None;
+static mut COMMAND_HISTORY: Option<Vec<String>> = None;
+static mut HISTORY_INDEX: usize = 0;
+static mut SAVED_INPUT: Option<String> = None;
 
 fn get_global_input() -> &'static mut String {
     unsafe {
@@ -131,6 +135,43 @@ pub fn tui_print(s: &str) {
     set_cursor_position(input_pos as u64, (h - 1) as u64);
 }
 
+/// Check if a cancellation request (ESC key) was received.
+pub fn get_command_history() -> &'static mut Vec<String> {
+    unsafe {
+        if COMMAND_HISTORY.is_none() {
+            COMMAND_HISTORY = Some(Vec::new());
+        }
+        COMMAND_HISTORY.as_mut().unwrap()
+    }
+}
+
+pub fn get_saved_input() -> &'static mut String {
+    unsafe {
+        if SAVED_INPUT.is_none() {
+            SAVED_INPUT = Some(String::new());
+        }
+        SAVED_INPUT.as_mut().unwrap()
+    }
+}
+
+pub fn add_to_history(cmd: &str) {
+    let history = get_command_history();
+    // Don't add if it's the same as the last entry
+    if history.is_empty() || history.last().unwrap() != cmd {
+        history.push(String::from(cmd));
+        if history.len() > 50 {
+            history.remove(0);
+        }
+    }
+    unsafe {
+        HISTORY_INDEX = history.len();
+    }
+}
+
+pub fn tui_is_cancelled() -> bool {
+    CANCELLED.swap(false, Ordering::SeqCst)
+}
+
 /// Non-blocking check for input and redraw of footer during AI streaming.
 pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize) {
     if !TUI_ACTIVE.load(Ordering::SeqCst) { return; }
@@ -142,10 +183,14 @@ pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize
         let key = event_buf[0];
         let input = get_global_input();
         match key {
+            0x1B => { // ESC
+                CANCELLED.store(true, Ordering::SeqCst);
+            }
             0x7F | 0x08 => { input.pop(); }
             b'\r' | b'\n' => {
                 if !input.is_empty() {
                     let msg = input.clone();
+                    add_to_history(&msg);
                     input.clear();
                     get_message_queue().push_back(msg);
                 }
@@ -309,12 +354,45 @@ pub fn run_tui(
             let key_code = event_buf[0];
             match key_code {
                 0x1B => { 
-                    if bytes_read > 1 { continue; }
-                    if config.exit_on_escape { break; }
+                    if bytes_read > 2 && event_buf[1] == 0x5B {
+                        let history = get_command_history();
+                        if history.is_empty() { continue; }
+                        
+                        match event_buf[2] {
+                            0x41 => { // Up Arrow
+                                unsafe {
+                                    if HISTORY_INDEX == history.len() {
+                                        *get_saved_input() = get_global_input().clone();
+                                    }
+                                    if HISTORY_INDEX > 0 {
+                                        HISTORY_INDEX -= 1;
+                                        *get_global_input() = history[HISTORY_INDEX].clone();
+                                    }
+                                }
+                            }
+                            0x42 => { // Down Arrow
+                                unsafe {
+                                    if HISTORY_INDEX < history.len() {
+                                        HISTORY_INDEX += 1;
+                                        if HISTORY_INDEX == history.len() {
+                                            *get_global_input() = get_saved_input().clone();
+                                        } else {
+                                            *get_global_input() = history[HISTORY_INDEX].clone();
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        if bytes_read > 1 { continue; }
+                        if config.exit_on_escape { break; }
+                    }
                 },
                 b'\r' | b'\n' => {
                     let user_input = get_global_input().clone();
                     if !user_input.is_empty() {
+                        add_to_history(&user_input);
                         get_global_input().clear();
                         get_message_queue().push_back(user_input);
                     }
