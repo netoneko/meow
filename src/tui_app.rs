@@ -723,13 +723,16 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     hide_cursor();
     let separator_row = h - total_footer_height as u64;
     
-    // Always clear a few lines above the separator to remove any leftover content
-    // from previous larger footers (e.g., old separator lines)
-    let gap = output_footer_gap();
-    let clear_from = separator_row.saturating_sub(gap as u64);
-    for row in clear_from..separator_row {
-        set_cursor_position(0, row);
-        let _ = write!(stdout, "{}", CLEAR_TO_EOL);
+    // Only clear lines that were part of the OLD footer but are now above the NEW footer
+    // This happens when footer shrinks (e.g., going from multiline to single line)
+    // We must NOT clear LLM output lines in the gap area
+    if old_footer_height > total_footer_height {
+        let old_separator_row = h as u64 - old_footer_height as u64;
+        // Clear from old separator position up to (but not including) new separator
+        for row in old_separator_row..separator_row {
+            set_cursor_position(0, row);
+            let _ = write!(stdout, "{}", CLEAR_TO_EOL);
+        }
     }
     
     set_cursor_position(0, separator_row);
