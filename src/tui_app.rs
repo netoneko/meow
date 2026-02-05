@@ -30,6 +30,8 @@ static mut MESSAGE_QUEUE: Option<VecDeque<String>> = None;
 static mut COMMAND_HISTORY: Option<Vec<String>> = None;
 static mut HISTORY_INDEX: usize = 0;
 static mut SAVED_INPUT: Option<String> = None;
+static mut MODEL_NAME: Option<String> = None;
+static mut PROVIDER_NAME: Option<String> = None;
 
 fn get_global_input() -> &'static mut String {
     unsafe {
@@ -180,6 +182,22 @@ pub fn get_saved_input() -> &'static mut String {
     }
 }
 
+pub fn set_model_and_provider(model: &str, provider: &str) {
+    unsafe {
+        MODEL_NAME = Some(String::from(model));
+        PROVIDER_NAME = Some(String::from(provider));
+    }
+}
+
+pub fn get_model_and_provider() -> (String, String) {
+    unsafe {
+        (
+            MODEL_NAME.as_ref().cloned().unwrap_or_else(|| String::from("unknown")),
+            PROVIDER_NAME.as_ref().cloned().unwrap_or_else(|| String::from("unknown")),
+        )
+    }
+}
+
 pub fn add_to_history(cmd: &str) {
     let history = get_command_history();
     // Don't add if it's the same as the last entry
@@ -292,14 +310,18 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     set_cursor_position(0, h - 3);
     let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, "━".repeat(w), COLOR_RESET);
 
-    // 2. Draw Status Bar (Row h-1) - now empty
+    // 2. Draw Status Bar (Row h-1) - Model and Provider info
     set_cursor_position(0, h - 2);
     let _ = write!(stdout, "{}", CLEAR_TO_EOL);
+    let (model, provider) = get_model_and_provider();
+    let status_info = format!(" {} [Provider: {}] [Model: {}] {}", 
+        COLOR_GRAY_DIM, provider, model, COLOR_RESET);
+    let _ = write!(stdout, "{}", status_info);
 
     // 3. Draw Prompt (at Row h)
     set_cursor_position(0, h - 1);
     let _ = write!(stdout, "{}", CLEAR_TO_EOL);
-    let _ = write!(stdout, "{}{}{}{}{}", COLOR_YELLOW, prompt_prefix, COLOR_RESET, COLOR_USER, input);
+    let _ = write!(stdout, "{}{}{}{}{}{}", COLOR_YELLOW, prompt_prefix, COLOR_RESET, COLOR_USER, input, COLOR_RESET);
 
     // 4. Position Cursor at end of input
     set_cursor_position((prompt_width + input.chars().count()) as u64, h - 1);
@@ -360,6 +382,8 @@ pub fn run_tui(
     app.terminal_width = w; app.terminal_height = h;
     TERM_WIDTH.store(w, Ordering::SeqCst);
     TERM_HEIGHT.store(h, Ordering::SeqCst);
+    
+    set_model_and_provider(model, &provider.name);
     
     clear_screen();
     // Scroll region ends at h-3 to leave room for 3-line footer

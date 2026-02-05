@@ -856,8 +856,15 @@ pub fn chat_once(
 
         // Extract intent phrases from all accumulated responses
         let intent_phrases = extract_intent_phrases(&all_responses);
+        let mismatch = !intent_phrases.is_empty() && total_tools_called == 0;
 
-        print(&format!("Intent phrases: {:?}, tools called: {:?}\n", intent_phrases.len(), total_tools_called));
+        if mismatch {
+            print(COLOR_PEARL);
+        } else {
+            print(COLOR_GREEN_LIGHT);
+        }
+        print(&format!("\n\n[*] Intent phrases: {}, tools called: {}\n", intent_phrases.len(), total_tools_called));
+        print(COLOR_RESET);
 
         // Check for mismatch: stated intentions but no tool calls
         if !intent_phrases.is_empty() && total_tools_called == 0 {
@@ -1046,6 +1053,7 @@ fn read_streaming_with_http_stream_tls(
                                     print_elapsed(elapsed_ms);
                                     print("\n");
                                 }
+                                print(COLOR_MEOW);
                                 print(&content);
 
                                 // Always accumulate full response
@@ -1082,10 +1090,12 @@ fn read_streaming_with_http_stream_tls(
                                 let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
                                 print(" ");
                                 print_elapsed(elapsed_ms);
-                                print("\n");
-                            }
-                            print(&content);
-                            full_response.push_str(&content);
+                                                                    print("\n");
+                                                                }
+                                                                print(COLOR_MEOW);
+                                                                print(&content);
+                                                                full_response.push_str(&content);
+                                
                         }
                         if done {
                             stream_completed = true;
@@ -1247,6 +1257,7 @@ fn read_streaming_response_with_progress(
                                             print("\n");
                                         }
                                     }
+                                    print(COLOR_MEOW);
                                     print(&content);
                                     full_response.push_str(&content);
                                 }
@@ -1326,6 +1337,7 @@ fn read_streaming_response_with_progress(
                                         print("\n");
                                     }
                                 }
+                                print(COLOR_MEOW);
                                 print(&content);
 
                                 // Always accumulate full response
