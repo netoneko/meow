@@ -1,6 +1,7 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use alloc::collections::VecDeque;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
@@ -25,6 +26,7 @@ pub static CUR_COL: AtomicU16 = AtomicU16::new(0);
 pub static INPUT_LEN: AtomicU16 = AtomicU16::new(0);
 
 static mut GLOBAL_INPUT: Option<String> = None;
+static mut MESSAGE_QUEUE: Option<VecDeque<String>> = None;
 
 fn get_global_input() -> &'static mut String {
     unsafe {
@@ -32,6 +34,15 @@ fn get_global_input() -> &'static mut String {
             GLOBAL_INPUT = Some(String::new());
         }
         GLOBAL_INPUT.as_mut().unwrap()
+    }
+}
+
+pub fn get_message_queue() -> &'static mut VecDeque<String> {
+    unsafe {
+        if MESSAGE_QUEUE.is_none() {
+            MESSAGE_QUEUE = Some(VecDeque::new());
+        }
+        MESSAGE_QUEUE.as_mut().unwrap()
     }
 }
 
@@ -132,6 +143,13 @@ pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize
         let input = get_global_input();
         match key {
             0x7F | 0x08 => { input.pop(); }
+            b'\r' | b'\n' => {
+                if !input.is_empty() {
+                    let msg = input.clone();
+                    input.clear();
+                    get_message_queue().push_back(msg);
+                }
+            }
             c if c >= 0x20 && c <= 0x7E => { input.push(c as char); }
             _ => {}
         }
@@ -182,8 +200,15 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     };
 
     // Construct prompt string
-    let prompt_prefix = format!("[{}/{}|{}] (=^･ω･^=) > ", 
-        token_display, limit_display, mem_display);
+    let queue_len = get_message_queue().len();
+    let queue_display = if queue_len > 0 {
+        format!(" [QUEUED: {}]", queue_len)
+    } else {
+        String::new()
+    };
+
+    let prompt_prefix = format!("[{}/{}|{}]{} (=^･ω･^=) > ", 
+        token_display, limit_display, mem_display, queue_display);
     
     // Update global input len for tui_print
     let prompt_width = prompt_prefix.chars().count();
@@ -276,8 +301,9 @@ pub fn run_tui(
 
         app.render_footer(current_tokens, context_window, mem_kb);
 
+        // Poll for input with a short timeout to allow for queue processing
         let mut event_buf = [0u8; 16];
-        let bytes_read = poll_input_event(u64::MAX, &mut event_buf);
+        let bytes_read = poll_input_event(100, &mut event_buf);
 
         if bytes_read > 0 {
             let key_code = event_buf[0];
@@ -290,44 +316,7 @@ pub fn run_tui(
                     let user_input = get_global_input().clone();
                     if !user_input.is_empty() {
                         get_global_input().clear();
-                        let mut stdout = Stdout;
-                        
-                        // Redraw footer IMMEDIATELY to clear input box while AI is thinking/streaming
-                        app.render_footer(current_tokens, context_window, mem_kb);
-                        
-                        // 1. Move to scroll area and print user message
-                        // We move to h-4 (bottom of scroll region)
-                        set_cursor_position(0, (app.terminal_height - 4) as u64);
-                        let _ = write!(stdout, "\n {}> {}{}{}\n", COLOR_USER, COLOR_BOLD, user_input, COLOR_RESET);
-                        CUR_COL.store(0, Ordering::SeqCst);
-                        
-                        if user_input.starts_with('/') {
-                            // 2. Handle Command
-                            let (res, output) = crate::handle_command(&user_input, model, provider, config, history, system_prompt);
-                            if let Some(out) = output {
-                                let _ = write!(stdout, "  {}{}{}\n\n", COLOR_GRAY_BRIGHT, out, COLOR_RESET);
-                                app.history.push(Message::new("system", &out));
-                            }
-                            if let CommandResult::Quit = res { break; }
-                        } else {
-                            // 3. Handle Chat
-                            app.history.push(Message::new("user", &user_input));
-                            history.clear();
-                            history.extend(app.history.iter().cloned());
-
-                            // 2 spaces prefix for [MEOW]
-                            let _ = write!(stdout, "  {}[MEOW] {}", COLOR_MEOW, COLOR_RESET);
-                            let _ = write!(stdout, "{}", COLOR_MEOW);
-                            CUR_COL.store(9, Ordering::SeqCst); // "  [MEOW] " is 9 chars
-                            let _ = write!(stdout, "{}", SAVE_CURSOR);
-                            
-                            // Note: chat_once will stream to current position (in scroll area)
-                            let _ = crate::chat_once(model, provider, &user_input, history, Some(context_window), system_prompt);
-                            
-                            let _ = write!(stdout, "{}\n", COLOR_RESET);
-                            app.history = history.clone();
-                            crate::compact_history(&mut app.history);
-                        }
+                        get_message_queue().push_back(user_input);
                     }
                 },
                 0x7F | 0x08 => {
@@ -346,6 +335,47 @@ pub fn run_tui(
                     get_global_input().push(c as char);
                 },
                 _ => {}
+            }
+        }
+
+        // Process one message from the queue if available
+        if let Some(user_input) = get_message_queue().pop_front() {
+            let mut stdout = Stdout;
+            
+            // Redraw footer IMMEDIATELY to clear input box/show updated queue
+            app.render_footer(current_tokens, context_window, mem_kb);
+            
+            // 1. Move to scroll area and print user message
+            set_cursor_position(0, (app.terminal_height - 4) as u64);
+            let _ = write!(stdout, "\n {}> {}{}{}\n", COLOR_USER, COLOR_BOLD, user_input, COLOR_RESET);
+            CUR_COL.store(0, Ordering::SeqCst);
+            
+            if user_input.starts_with('/') {
+                // 2. Handle Command
+                let (res, output) = crate::handle_command(&user_input, model, provider, config, history, system_prompt);
+                if let Some(out) = output {
+                    let _ = write!(stdout, "  {}{}{}\n\n", COLOR_GRAY_BRIGHT, out, COLOR_RESET);
+                    app.history.push(Message::new("system", &out));
+                }
+                if let CommandResult::Quit = res { break; }
+            } else {
+                // 3. Handle Chat
+                app.history.push(Message::new("user", &user_input));
+                history.clear();
+                history.extend(app.history.iter().cloned());
+
+                // 2 spaces prefix for [MEOW]
+                let _ = write!(stdout, "  {}[MEOW] {}", COLOR_MEOW, COLOR_RESET);
+                let _ = write!(stdout, "{}", COLOR_MEOW);
+                CUR_COL.store(9, Ordering::SeqCst); // "  [MEOW] " is 9 chars
+                let _ = write!(stdout, "{}", SAVE_CURSOR);
+                
+                // Note: chat_once will stream to current position (in scroll area)
+                let _ = crate::chat_once(model, provider, &user_input, history, Some(context_window), system_prompt);
+                
+                let _ = write!(stdout, "{}\n", COLOR_RESET);
+                app.history = history.clone();
+                crate::compact_history(&mut app.history);
             }
         }
     }

@@ -153,8 +153,6 @@ fn main() -> i32 {
                     print("meow: --provider requires a provider name\n");
                     return 1;
                 }
-            } else if arg_str == "--classic" {
-                use_tui = false;
             } else if arg_str == "--tui" {
                 use_tui = true;
             } else if arg_str == "-h" || arg_str == "--help" {
@@ -196,7 +194,7 @@ fn main() -> i32 {
     // Build system prompt once (includes chainlink if available)
     let system_prompt = build_system_prompt();
 
-    if use_tui {
+    if use_tui || one_shot_message.is_none() {
         // Initialize chat history with system prompt
         let mut history: Vec<Message> = Vec::new();
         history.push(Message::new("system", &system_prompt));
@@ -274,139 +272,6 @@ fn main() -> i32 {
         };
     }
 
-    // Interactive mode
-    print_banner();
-    print("  [Provider] ");
-    print(&current_provider.name);
-    print(" (");
-    print(&current_provider.base_url);
-    print(")\n  [Neural Link] Model: ");
-    print(&model);
-
-    // Query model info for context window size
-    print("\n  [Context] Querying model info...");
-    let context_window = match providers::query_model_info(&model, &current_provider) {
-        Some(ctx) => {
-            print(&format!(" {}k tokens max", ctx / 1000));
-            ctx
-        }
-        None => {
-            print(&format!(
-                " (using default: {}k)",
-                DEFAULT_CONTEXT_WINDOW / 1000
-            ));
-            DEFAULT_CONTEXT_WINDOW
-        }
-    };
-
-    print("\n  [Token Limit] Compact context suggested at ");
-    print(&format!("{}k tokens", TOKEN_LIMIT_FOR_COMPACTION / 1000));
-    if tools::chainlink_available() {
-        print("\n  [Chainlink] Issue tracker tools enabled");
-    }
-    print("\n  [Protocol] Type /help for commands, /quit to jack out\n\n");
-
-    // Initialize chat history with system prompt
-    let mut history: Vec<Message> = Vec::new();
-    history.push(Message::new("system", &system_prompt));
-    
-    // Add initial context with current working directory
-    let initial_cwd = tools::get_working_dir();
-    let sandbox_root = tools::get_sandbox_root();
-    let cwd_context = if sandbox_root == "/" {
-        format!(
-            "[System Context] Your current working directory is: {}\nNo sandbox restrictions - you can access any path.",
-            initial_cwd
-        )
-    } else {
-        format!(
-            "[System Context] Your current working directory is: {}\nSandbox root: {} (you cannot access paths outside this directory)\nUse relative paths like 'docs/' instead of absolute paths like '/docs/'.",
-            initial_cwd, sandbox_root
-        )
-    };
-    history.push(Message::new("user", &cwd_context));
-    history.push(Message::new("assistant", 
-        "Understood nya~! I'll use relative paths for file operations within the current directory. Ready to help! (=^・ω・^=)"
-    ));
-
-    // Mutable state for current session
-    let mut current_model = model;
-    let mut current_prov = current_provider;
-
-    loop {
-        // Calculate current token count
-        let current_tokens = calculate_history_tokens(&history);
-        let token_display = if current_tokens >= 1000 {
-            format!("{}k", current_tokens / 1000)
-        } else {
-            format!("{}", current_tokens)
-        };
-
-        // Get memory usage
-        let mem_kb = libakuma::memory_usage() / 1024;
-        let mem_display = if mem_kb >= 1024 {
-            format!("{}M", mem_kb / 1024)
-        } else {
-            format!("{}K", mem_kb)
-        };
-        
-        // Warn if memory is getting high (>2MB)
-        if mem_kb > 2048 {
-            print("[!] Memory high - consider /clear to reset\n");
-        }
-
-        // Print prompt with token count and memory
-        print(&format!(
-            "[{}/{}k|{}] (=^･ω･^=) > ",
-            token_display,
-            TOKEN_LIMIT_FOR_COMPACTION / 1000,
-            mem_display
-        ));
-
-        // Read user input
-        let input = match read_line() {
-            Some(line) => line,
-            None => {
-                print("\n～ Meow-chan is jacking out... Bye bye~! ฅ^•ﻌ•^ฅ ～\n");
-                break;
-            }
-        };
-
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Handle commands
-        if trimmed.starts_with('/') {
-            let (res, output) = handle_command(trimmed, &mut current_model, &mut current_prov, &mut app_config, &mut history, &system_prompt);
-            if let Some(out) = output {
-                print(&out);
-                print("\n\n");
-            }
-            match res {
-                CommandResult::Continue => continue,
-                CommandResult::Quit => break,
-            }
-        }
-
-        // Send message to provider
-        print("\n");
-        match chat_once(&current_model, &current_prov, trimmed, &mut history, Some(context_window), &system_prompt) {
-            Ok(_) => {
-                print("\n\n");
-            }
-            Err(e) => {
-                print("\n[!] Nyaa~! Error in the matrix: ");
-                print(e);
-                print(" (=ＴェＴ=)\n\n");
-            }
-        }
-        
-        // Compact strings to release excess memory
-        compact_history(&mut history);
-    }
-
     0
 }
 
@@ -420,7 +285,6 @@ fn print_usage() {
     print("  -m, --model <NAME>      Neural link override\n");
     print("  -p, --provider <NAME>   Use specific provider\n");
     print("  --tui                   Interactive TUI (default)\n");
-    print("  --classic               Old school neural link interface\n");
     print("  -h, --help              Display this transmission\n\n");
     print("Interactive Commands:\n");
     print("  /clear              Wipe memory banks nya~\n");
@@ -481,20 +345,6 @@ fn run_init(config: &mut Config) -> i32 {
     print("   api_key=your-key-here (optional)\n\n");
 
     0
-}
-
-fn print_banner() {
-    print("\n");
-    print("  /\\_/\\  ╔══════════════════════════════════════╗\n");
-    print(" ( o.o ) ║  M E O W - C H A N   v1.0            ║\n");
-    print("  > ^ <  ║  ～ Cyberpunk Neko AI Assistant ～   ║\n");
-    print(" /|   |\\ ╚══════════════════════════════════════╝\n");
-    print("(_|   |_)  ฅ^•ﻌ•^ฅ  Jacking into the Net...  \n");
-    print("\n");
-    print(" ┌─────────────────────────────────────────────┐\n");
-    print(" │ Welcome~! Meow-chan is online nya~! ♪(=^･ω･^)ﾉ │\n");
-    print(" │ Press ESC to cancel requests~               │\n");
-    print(" └─────────────────────────────────────────────┘\n\n");
 }
 
 // ============================================================================
@@ -1733,70 +1583,4 @@ fn check_escape_pressed() -> bool {
         }
     }
     false
-}
-
-/// Read a line from stdin (blocking with polling)
-/// Returns None on EOF (Ctrl+D on empty line)
-fn read_line() -> Option<String> {
-    let mut line = String::new();
-    let mut buf = [0u8; 1];
-    let mut consecutive_empty_reads = 0u32;
-
-    loop {
-        let n = read(fd::STDIN, &mut buf);
-        
-        if n <= 0 {
-            // No data available - poll with backoff
-            consecutive_empty_reads += 1;
-            
-            // After many empty reads, increase sleep time
-            let sleep_time = if consecutive_empty_reads < 10 {
-                10 // 10ms
-            } else if consecutive_empty_reads < 100 {
-                50 // 50ms
-            } else {
-                100 // 100ms
-            };
-            
-            libakuma::sleep_ms(sleep_time);
-            continue;
-        }
-        
-        // Got data - reset counter
-        consecutive_empty_reads = 0;
-
-        let c = buf[0];
-        if c == b'\n' || c == b'\r' {
-            // Echo newline
-            print("\n");
-            break;
-        }
-        if c == 4 {
-            // Ctrl+D
-            if line.is_empty() {
-                return None;
-            }
-            break;
-        }
-        // Handle backspace
-        if c == 8 || c == 127 {
-            if !line.is_empty() {
-                line.pop();
-                // Echo backspace: move back, space, move back
-                print("\x08 \x08");
-            }
-            continue;
-        }
-        // Regular character
-        if c >= 32 && c < 127 {
-            line.push(c as char);
-            // Echo the character
-            let echo = [c];
-            if let Ok(s) = core::str::from_utf8(&echo) {
-                print(s);
-            }
-        }
-    }
-
-    Some(line)
 }
