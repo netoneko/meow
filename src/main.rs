@@ -32,7 +32,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use config::{ApiType, Config, Provider, TOKEN_LIMIT_FOR_COMPACTION, DEFAULT_CONTEXT_WINDOW, SYSTEM_PROMPT_BASE};
+use config::{ApiType, Config, Provider, TOKEN_LIMIT_FOR_COMPACTION, DEFAULT_CONTEXT_WINDOW, SYSTEM_PROMPT_BASE, COLOR_PEARL, COLOR_GREEN_LIGHT, COLOR_GRAY_BRIGHT, COLOR_RESET};
 use libakuma::net::{resolve, TcpStream};
 use libakuma::{arg, argc, exit, fd, read};
 use libakuma_tls::{HttpHeaders, HttpStreamTls, StreamResult, TLS_RECORD_SIZE};
@@ -707,6 +707,9 @@ pub fn send_with_retry(
     provider: &Provider,
     history: &[Message],
     is_continuation: bool,
+    current_tokens: usize,
+    token_limit: usize,
+    mem_kb: usize,
 ) -> Result<StreamResponse, &'static str> {
     let mut backoff_ms: u64 = 500;
 
@@ -781,7 +784,7 @@ pub fn send_with_retry(
             
             print("] waiting");
             
-            match read_streaming_with_http_stream_tls(&mut http_stream, start_time, provider) {
+            match read_streaming_with_http_stream_tls(&mut http_stream, start_time, provider, current_tokens, token_limit, mem_kb) {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     if e == "Request cancelled" {
@@ -806,7 +809,7 @@ pub fn send_with_retry(
 
             print("] waiting");
 
-            match read_streaming_response_with_progress(&stream, start_time, provider) {
+            match read_streaming_response_with_progress(&stream, start_time, provider, current_tokens, token_limit, mem_kb) {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     if e == "Request cancelled" {
@@ -905,7 +908,12 @@ pub fn chat_once(
         let mut total_tools_called: usize = 0;
         let mut all_responses = String::new();
     
-        let stream_result = send_with_retry(model, provider, history, iteration > 0)?;
+        // Calculate metrics for background input handling
+        let current_tokens = calculate_history_tokens(history);
+        let mem_kb = libakuma::memory_usage() / 1024;
+        let token_limit = context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+
+        let stream_result = send_with_retry(model, provider, history, iteration > 0, current_tokens, token_limit, mem_kb)?;
         
         // Handle partial responses (stream interrupted before completion)
         let assistant_response = match stream_result {
@@ -929,14 +937,16 @@ pub fn chat_once(
 
         // First check for CompactContext tool (handled specially)
         if let Some(compact_result) = try_execute_compact_context(&assistant_response, history, system_prompt) {
-            print("\n\n[*] ");
             if compact_result.success {
-                print("Context compacted successfully nya~!\n");
-                print(&compact_result.output);
+                print(COLOR_GREEN_LIGHT);
+                print("\n\n[*] Context compacted successfully nya~!\n");
             } else {
-                print("Failed to compact context nya...\n");
-                print(&compact_result.output);
+                print(COLOR_PEARL);
+                print("\n\n[*] Failed to compact context nya...\n");
             }
+            print(COLOR_GRAY_BRIGHT);
+            print(&compact_result.output);
+            print(COLOR_RESET);
             print("\n\n");
             total_tools_called += 1;
             return Ok(());
@@ -951,13 +961,16 @@ pub fn chat_once(
                 history.push(Message::new("assistant", &text_before_tool));
             }
 
-            print("\n\n[*] ");
             if result.success {
-                print("Tool executed successfully nya~!\n");
+                print(COLOR_GREEN_LIGHT);
+                print("\n\n[*] Tool executed successfully nya~!\n");
             } else {
-                print("Tool failed nya...\n");
+                print(COLOR_PEARL);
+                print("\n\n[*] Tool failed nya...\n");
             }
+            print(COLOR_GRAY_BRIGHT);
             print(&result.output);
+            print(COLOR_RESET);
             print("\n\n");
 
             // Include current cwd in tool results so LLM always knows where it is
@@ -1127,6 +1140,9 @@ fn read_streaming_with_http_stream_tls(
     stream: &mut HttpStreamTls<'_>,
     start_time: u64,
     provider: &Provider,
+    current_tokens: usize,
+    token_limit: usize,
+    mem_kb: usize,
 ) -> Result<StreamResponse, &'static str> {
     let mut full_response = String::new();
     let mut pending_lines = String::new();
@@ -1143,6 +1159,9 @@ fn read_streaming_with_http_stream_tls(
             print("\n[cancelled]");
             return Err("Request cancelled");
         }
+
+        // Process background input during streaming
+        tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
 
         match stream.read_chunk() {
             StreamResult::Data(data) => {
@@ -1313,6 +1332,9 @@ fn read_streaming_response_with_progress(
     stream: &TcpStream,
     start_time: u64,
     provider: &Provider,
+    current_tokens: usize,
+    token_limit: usize,
+    mem_kb: usize,
 ) -> Result<StreamResponse, &'static str> {
     let mut buf = [0u8; 1024];
     let mut pending_data = Vec::new();
@@ -1332,6 +1354,9 @@ fn read_streaming_response_with_progress(
             print("\n[cancelled]");
             return Err("Request cancelled");
         }
+
+        // Process background input during streaming
+        tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
 
         match stream.read(&mut buf) {
             Ok(0) => {

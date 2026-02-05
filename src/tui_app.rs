@@ -24,6 +24,17 @@ pub static TERM_HEIGHT: AtomicU16 = AtomicU16::new(25);
 pub static CUR_COL: AtomicU16 = AtomicU16::new(0);
 pub static INPUT_LEN: AtomicU16 = AtomicU16::new(0);
 
+static mut GLOBAL_INPUT: Option<String> = None;
+
+fn get_global_input() -> &'static mut String {
+    unsafe {
+        if GLOBAL_INPUT.is_none() {
+            GLOBAL_INPUT = Some(String::new());
+        }
+        GLOBAL_INPUT.as_mut().unwrap()
+    }
+}
+
 const CAT_ASCII: &str = r#"
                       =#=      .-
                       +*#*:.:-**
@@ -109,8 +120,28 @@ pub fn tui_print(s: &str) {
     set_cursor_position(input_pos as u64, (h - 1) as u64);
 }
 
+/// Non-blocking check for input and redraw of footer during AI streaming.
+pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize) {
+    if !TUI_ACTIVE.load(Ordering::SeqCst) { return; }
+    
+    let mut event_buf = [0u8; 16];
+    let bytes_read = poll_input_event(0, &mut event_buf);
+    
+    if bytes_read > 0 {
+        let key = event_buf[0];
+        let input = get_global_input();
+        match key {
+            0x7F | 0x08 => { input.pop(); }
+            c if c >= 0x20 && c <= 0x7E => { input.push(c as char); }
+            _ => {}
+        }
+        
+        // Redraw footer with new input
+        render_footer_internal(input, current_tokens, token_limit, mem_kb);
+    }
+}
+
 pub struct App {
-    pub input: String,
     pub history: Vec<Message>,
     pub terminal_width: u16,
     pub terminal_height: u16,
@@ -119,7 +150,6 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         Self {
-            input: String::new(),
             history: Vec::new(),
             terminal_width: 100,
             terminal_height: 25,
@@ -128,52 +158,56 @@ impl App {
 
     /// Renders the fixed bottom footer (separator, status, prompt).
     pub fn render_footer(&self, current_tokens: usize, token_limit: usize, mem_kb: usize) {
-        let mut stdout = Stdout;
-        let h = self.terminal_height as u64;
-        let w = self.terminal_width as usize;
-
-        // Format metrics
-        let token_display = if current_tokens >= 1000 {
-            format!("{}k", current_tokens / 1000)
-        } else {
-            format!("{}", current_tokens)
-        };
-        let limit_display = format!("{}k", token_limit / 1000);
-        let mem_display = if mem_kb >= 1024 {
-            format!("{}M", mem_kb / 1024)
-        } else {
-            format!("{}K", mem_kb)
-        };
-
-        // Construct prompt string
-        let prompt_prefix = format!("[{}/{}|{}] (=^･ω･^=) > ", 
-            token_display, limit_display, mem_display);
-        
-        // Update global input len for tui_print
-        // We need the ACTUAL col position where the user is typing
-        let prompt_width = prompt_prefix.chars().count();
-        INPUT_LEN.store((prompt_width + self.input.chars().count()) as u16, Ordering::SeqCst);
-
-        // Hide cursor during footer render to prevent flickering
-        hide_cursor();
-
-        // 1. Draw Separator (at Row h-2) - use heavy line ━
-        set_cursor_position(0, h - 3);
-        let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, "━".repeat(w), COLOR_RESET);
-
-        // 2. Draw Status Bar (Row h-1) - now empty as info is in prompt
-        set_cursor_position(0, h - 2);
-        let _ = write!(stdout, "{}", CLEAR_TO_EOL);
-
-        // 3. Draw Prompt (at Row h)
-        set_cursor_position(0, h - 1);
-        let _ = write!(stdout, "{}", CLEAR_TO_EOL);
-        let _ = write!(stdout, "{}{}{}{}{}", COLOR_YELLOW, prompt_prefix, COLOR_RESET, COLOR_USER, self.input);
-
-        // 4. Position Cursor at end of input
-        set_cursor_position((prompt_width + self.input.chars().count()) as u64, h - 1);
-        show_cursor();
+        let input = get_global_input();
+        render_footer_internal(input, current_tokens, token_limit, mem_kb);
     }
+}
+
+fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize, mem_kb: usize) {
+    let mut stdout = Stdout;
+    let w = TERM_WIDTH.load(Ordering::SeqCst) as usize;
+    let h = TERM_HEIGHT.load(Ordering::SeqCst) as u64;
+
+    // Format metrics
+    let token_display = if current_tokens >= 1000 {
+        format!("{}k", current_tokens / 1000)
+    } else {
+        format!("{}", current_tokens)
+    };
+    let limit_display = format!("{}k", token_limit / 1000);
+    let mem_display = if mem_kb >= 1024 {
+        format!("{}M", mem_kb / 1024)
+    } else {
+        format!("{}K", mem_kb)
+    };
+
+    // Construct prompt string
+    let prompt_prefix = format!("[{}/{}|{}] (=^･ω･^=) > ", 
+        token_display, limit_display, mem_display);
+    
+    // Update global input len for tui_print
+    let prompt_width = prompt_prefix.chars().count();
+    INPUT_LEN.store((prompt_width + input.chars().count()) as u16, Ordering::SeqCst);
+
+    // Hide cursor during footer render to prevent flickering
+    hide_cursor();
+
+    // 1. Draw Separator (at Row h-2) - use heavy line ━
+    set_cursor_position(0, h - 3);
+    let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, "━".repeat(w), COLOR_RESET);
+
+    // 2. Draw Status Bar (Row h-1) - now empty
+    set_cursor_position(0, h - 2);
+    let _ = write!(stdout, "{}", CLEAR_TO_EOL);
+
+    // 3. Draw Prompt (at Row h)
+    set_cursor_position(0, h - 1);
+    let _ = write!(stdout, "{}", CLEAR_TO_EOL);
+    let _ = write!(stdout, "{}{}{}{}{}", COLOR_YELLOW, prompt_prefix, COLOR_RESET, COLOR_USER, input);
+
+    // 4. Position Cursor at end of input
+    set_cursor_position((prompt_width + input.chars().count()) as u64, h - 1);
+    show_cursor();
 }
 
 fn set_scroll_region(top: u16, bottom: u16) {
@@ -253,10 +287,10 @@ pub fn run_tui(
                     if config.exit_on_escape { break; }
                 },
                 b'\r' | b'\n' => {
-                    if !app.input.is_empty() {
+                    let user_input = get_global_input().clone();
+                    if !user_input.is_empty() {
+                        get_global_input().clear();
                         let mut stdout = Stdout;
-                        let user_input = app.input.clone();
-                        app.input.clear();
                         
                         // Redraw footer IMMEDIATELY to clear input box while AI is thinking/streaming
                         app.render_footer(current_tokens, context_window, mem_kb);
@@ -297,7 +331,7 @@ pub fn run_tui(
                     }
                 },
                 0x7F | 0x08 => {
-                    app.input.pop();
+                    get_global_input().pop();
                 },
                 12 => { // Ctrl-L: Re-probe
                     let (nw, nh) = probe_terminal_size();
@@ -309,7 +343,7 @@ pub fn run_tui(
                     set_scroll_region(1, nh - 3);
                 },
                 c if c >= 0x20 && c <= 0x7E => {
-                    app.input.push(c as char);
+                    get_global_input().push(c as char);
                 },
                 _ => {}
             }
