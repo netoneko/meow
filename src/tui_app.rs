@@ -25,6 +25,8 @@ pub static CUR_COL: AtomicU16 = AtomicU16::new(0);
 pub static CUR_ROW: AtomicU16 = AtomicU16::new(0);
 pub static INPUT_LEN: AtomicU16 = AtomicU16::new(0);
 pub static CURSOR_IDX: AtomicU16 = AtomicU16::new(0);
+pub static PROMPT_SCROLL_TOP: AtomicU16 = AtomicU16::new(0);
+pub static FOOTER_HEIGHT: AtomicU16 = AtomicU16::new(4);
 
 static mut GLOBAL_INPUT: Option<String> = None;
 static mut MESSAGE_QUEUE: Option<VecDeque<String>> = None;
@@ -33,6 +35,36 @@ static mut HISTORY_INDEX: usize = 0;
 static mut SAVED_INPUT: Option<String> = None;
 static mut MODEL_NAME: Option<String> = None;
 static mut PROVIDER_NAME: Option<String> = None;
+static mut RAW_INPUT_QUEUE: Option<VecDeque<u8>> = None;
+static mut LAST_INPUT_TIME: u64 = 0;
+
+fn get_raw_input_queue() -> &'static mut VecDeque<u8> {
+    unsafe {
+        if RAW_INPUT_QUEUE.is_none() {
+            RAW_INPUT_QUEUE = Some(VecDeque::with_capacity(64));
+        }
+        RAW_INPUT_QUEUE.as_mut().unwrap()
+    }
+}
+
+fn count_wrapped_lines(input: &str, prompt_width: usize, width: usize) -> usize {
+    if width == 0 { return 1; }
+    let mut lines = 1;
+    let mut current_col = prompt_width;
+    for c in input.chars() {
+        if c == '\n' {
+            lines += 1;
+            current_col = 0;
+        } else {
+            current_col += 1;
+            if current_col >= width {
+                lines += 1;
+                current_col = 0;
+            }
+        }
+    }
+    lines
+}
 
 fn get_global_input() -> &'static mut String {
     unsafe {
@@ -127,9 +159,9 @@ pub fn tui_print(s: &str) {
 
         if c == '\n' {
             row += 1;
-            // Limit to h-5 (Line 21 if h=25)
-            if row > h - 5 {
-                row = h - 5;
+            let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
+            if row > h - (f_h + 1) {
+                row = h - (f_h + 1);
                 akuma_write(fd::STDOUT, b"\n");
             } else {
                 set_cursor_position(0, row as u64);
@@ -144,8 +176,9 @@ pub fn tui_print(s: &str) {
         } else {
             if col >= w - 1 {
                 row += 1;
-                if row > h - 5 {
-                    row = h - 5;
+                let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
+                if row > h - (f_h + 1) {
+                    row = h - (f_h + 1);
                     akuma_write(fd::STDOUT, b"\n");
                 }
                 set_cursor_position(0, row as u64);
@@ -161,15 +194,21 @@ pub fn tui_print(s: &str) {
     CUR_COL.store(col, Ordering::SeqCst);
     CUR_ROW.store(row, Ordering::SeqCst);
 
-    // Return cursor to prompt (handles wrapping and multiline)
+    // Return cursor to prompt
     let input = get_global_input();
-    let prompt_width = INPUT_LEN.load(Ordering::SeqCst) as usize;
+    let prompt_prefix_len = INPUT_LEN.load(Ordering::SeqCst) as usize;
     let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
-    let (cx, cy_off) = calculate_input_cursor(input, idx, prompt_width, w as usize);
-    let cy = (h as u64 - 2) + cy_off;
+    let (cx, cy_off) = calculate_input_cursor(input, idx, prompt_prefix_len, w as usize);
     
-    // Clamp cy to h-1 to prevent scroll trigger
-    let clamped_cy = if cy >= h as u64 { h as u64 - 1 } else { cy };
+    let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
+    let scroll_top = PROMPT_SCROLL_TOP.load(Ordering::SeqCst) as u64;
+    
+    // Prompt area starts at Row h - f_h + 2
+    let prompt_start_row = h as u64 - f_h as u64 + 2;
+    let final_cy = prompt_start_row + (cy_off - scroll_top);
+    
+    // Clamp to prompt area bounds
+    let clamped_cy = if final_cy >= h as u64 { h as u64 - 1 } else { final_cy };
     set_cursor_position(cx, clamped_cy);
 }
 
@@ -211,6 +250,7 @@ pub fn get_model_and_provider() -> (String, String) {
 /// Calculate the (x, y) coordinates of the cursor within the input box,
 /// accounting for wrapping and explicit newlines.
 fn calculate_input_cursor(input: &str, idx: usize, prompt_width: usize, width: usize) -> (u64, u64) {
+    if width == 0 { return (0, 0); }
     let mut cx = prompt_width;
     let mut cy = 0;
     
@@ -280,66 +320,77 @@ fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
     
     match buf[0] {
         0x0D => {
-            // Check for CRLF (\r\n) - often sent for Shift+Enter or just Enter
             if buf.len() >= 2 && buf[1] == 0x0A {
                 return (InputEvent::ShiftEnter, 2);
             }
             (InputEvent::Enter, 1)
         }
-        0x0A => (InputEvent::ShiftEnter, 1), // LF alone is almost always Shift+Enter in raw mode
+        0x0A => (InputEvent::ShiftEnter, 1),
         0x1B => { // ESC
             if buf.len() == 1 {
-                return (InputEvent::Esc, 1);
-            }
-            
-            // CSI sequences: ESC [ ...
-            if buf.len() >= 3 && buf[1] == 0x5B {
-                match buf[2] {
-                    0x41 => return (InputEvent::Up, 3),
-                    0x42 => return (InputEvent::Down, 3),
-                    0x43 => return (InputEvent::Right, 3),
-                    0x44 => return (InputEvent::Left, 3),
-                    0x48 => return (InputEvent::Home, 3),
-                    0x46 => return (InputEvent::End, 3),
-                    b'3' if buf.len() >= 4 && buf[3] == b'~' => return (InputEvent::Delete, 4),
-                    b'1' if buf.len() >= 6 && &buf[2..6] == b"1;3D" => return (InputEvent::AltLeft, 6),
-                    b'1' if buf.len() >= 6 && &buf[2..6] == b"1;3C" => return (InputEvent::AltRight, 6),
-                    b'1' if buf.len() >= 7 && &buf[2..7] == b"13;2u" => return (InputEvent::ShiftEnter, 7),
-                    b'1' if buf.len() >= 7 && &buf[2..7] == b"13;5u" => return (InputEvent::ShiftEnter, 7), // Ctrl+Enter as ShiftEnter
-                    b'2' if buf.len() >= 9 && &buf[2..9] == b"7;2;13~" => return (InputEvent::ShiftEnter, 9), // \x1b[27;2;13~
-                    _ => {}
+                let now = libakuma::uptime();
+                unsafe {
+                    if now.saturating_sub(LAST_INPUT_TIME) > 50000 { // 50ms timeout
+                        return (InputEvent::Esc, 1);
+                    } else {
+                        return (InputEvent::Unknown, 0); // Wait for more data
+                    }
                 }
             }
             
-            // Alt+Enter / Alt+LF
-            if buf.len() >= 2 && (buf[1] == b'\r' || buf[1] == b'\n') {
-                return (InputEvent::ShiftEnter, 2);
-            }
-            
-            // ESC O ... sequences (SS3)
-            if buf.len() >= 3 && buf[1] == b'O' {
-                match buf[2] {
-                    b'A' => return (InputEvent::Up, 3),
-                    b'B' => return (InputEvent::Down, 3),
-                    b'C' => return (InputEvent::Right, 3),
-                    b'D' => return (InputEvent::Left, 3),
-                    b'H' => return (InputEvent::Home, 3),
-                    b'F' => return (InputEvent::End, 3),
-                    b'M' => return (InputEvent::Enter, 3), // Keypad Enter
-                    _ => {}
+            if buf[1] == 0x5B { // CSI ESC [
+                let mut i = 2;
+                while i < buf.len() {
+                    let c = buf[i];
+                    if (0x40..=0x7E).contains(&c) {
+                        let len = i + 1;
+                        let seq = &buf[2..len-1];
+                        match c {
+                            b'A' => return (InputEvent::Up, len),
+                            b'B' => return (InputEvent::Down, len),
+                            b'C' => return (InputEvent::Right, len),
+                            b'D' => return (InputEvent::Left, len),
+                            b'H' => return (InputEvent::Home, len),
+                            b'F' => return (InputEvent::End, len),
+                            b'~' => {
+                                if seq == b"3" { return (InputEvent::Delete, len); }
+                                return (InputEvent::Unknown, len);
+                            }
+                            b'u' => {
+                                if seq == b"13;2" || seq == b"13;5" { return (InputEvent::ShiftEnter, len); }
+                                return (InputEvent::Unknown, len);
+                            }
+                            _ => return (InputEvent::Unknown, len),
+                        }
+                    }
+                    i += 1;
                 }
+                if buf.len() >= 8 { return (InputEvent::Unknown, 1); }
+                return (InputEvent::Unknown, 0); 
             }
             
-            // Alt+b / Alt+f
-            if buf.len() >= 2 && buf[1] == b'b' { return (InputEvent::AltLeft, 2); }
-            if buf.len() >= 2 && buf[1] == b'f' { return (InputEvent::AltRight, 2); }
-            
-            // Unknown or incomplete sequence
-            if buf.len() > 1 && buf[1] != 0x5B && buf[1] != b'O' {
-                return (InputEvent::Esc, 1); // Treat as Esc and let next byte be processed
+            if buf[1] == 0x4F { // SS3 ESC O
+                if buf.len() >= 3 {
+                    let len = 3;
+                    match buf[2] {
+                        b'A' => return (InputEvent::Up, len),
+                        b'B' => return (InputEvent::Down, len),
+                        b'C' => return (InputEvent::Right, len),
+                        b'D' => return (InputEvent::Left, len),
+                        b'H' => return (InputEvent::Home, len),
+                        b'F' => return (InputEvent::End, len),
+                        b'M' => return (InputEvent::Enter, len),
+                        _ => return (InputEvent::Unknown, len),
+                    }
+                }
+                return (InputEvent::Unknown, 0);
             }
             
-            (InputEvent::Unknown, 1)
+            if buf[1] == b'\r' || buf[1] == b'\n' { return (InputEvent::ShiftEnter, 2); }
+            if buf[1] == b'b' { return (InputEvent::AltLeft, 2); }
+            if buf[1] == b'f' { return (InputEvent::AltRight, 2); }
+
+            return (InputEvent::Esc, 1);
         }
         0x01 => (InputEvent::CtrlA, 1),
         0x05 => (InputEvent::CtrlE, 1),
@@ -360,7 +411,10 @@ fn handle_input_event(
     quit: &mut bool, 
     exit_on_escape: bool,
 ) {
-    let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
+    let mut idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
+    let w = TERM_WIDTH.load(Ordering::SeqCst) as usize;
+    let prompt_prefix_len = INPUT_LEN.load(Ordering::SeqCst) as usize;
+
     match event {
         InputEvent::Char(c) => {
             input.insert(idx, c);
@@ -393,34 +447,77 @@ fn handle_input_event(
             }
         }
         InputEvent::Up => {
-            let history = get_command_history();
-            if !history.is_empty() {
-                unsafe {
-                    if HISTORY_INDEX == history.len() {
-                        *get_saved_input() = input.clone();
+            let (cx, cy) = calculate_input_cursor(input, idx, prompt_prefix_len, w);
+            if cy > 0 {
+                let mut new_idx = 0;
+                let mut cur_cx = prompt_prefix_len;
+                let mut cur_cy = 0;
+                for (i, c) in input.chars().enumerate() {
+                    if cur_cy == cy - 1 && cur_cx as u64 == cx {
+                        new_idx = i;
+                        break;
                     }
-                    if HISTORY_INDEX > 0 {
-                        HISTORY_INDEX -= 1;
-                        *input = history[HISTORY_INDEX].clone();
-                        CURSOR_IDX.store(input.chars().count() as u16, Ordering::SeqCst);
-                        *redraw = true;
+                    if c == '\n' {
+                        if cur_cy == cy - 1 { new_idx = i; }
+                        cur_cx = 0; cur_cy += 1;
+                    } else {
+                        cur_cx += 1;
+                        if cur_cx >= w {
+                            if cur_cy == cy - 1 { new_idx = i; }
+                            cur_cx = 0; cur_cy += 1;
+                        }
+                    }
+                    if cur_cy > cy - 1 { break; }
+                }
+                CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst);
+                *redraw = true;
+            } else {
+                let history = get_command_history();
+                if !history.is_empty() {
+                    unsafe {
+                        if HISTORY_INDEX == history.len() { *get_saved_input() = input.clone(); }
+                        if HISTORY_INDEX > 0 {
+                            HISTORY_INDEX -= 1;
+                            *input = history[HISTORY_INDEX].clone();
+                            CURSOR_IDX.store(input.chars().count() as u16, Ordering::SeqCst);
+                            *redraw = true;
+                        }
                     }
                 }
             }
         }
         InputEvent::Down => {
-            let history = get_command_history();
-            if !history.is_empty() {
-                unsafe {
-                    if HISTORY_INDEX < history.len() {
-                        HISTORY_INDEX += 1;
-                        if HISTORY_INDEX == history.len() {
-                            *input = get_saved_input().clone();
-                        } else {
-                            *input = history[HISTORY_INDEX].clone();
+            let (cx, cy) = calculate_input_cursor(input, idx, prompt_prefix_len, w);
+            let total_lines = count_wrapped_lines(input, prompt_prefix_len, w);
+            if cy < (total_lines as u64).saturating_sub(1) {
+                let mut new_idx = input.chars().count();
+                let mut cur_cx = prompt_prefix_len;
+                let mut cur_cy = 0;
+                for (i, c) in input.chars().enumerate() {
+                    if cur_cy == cy + 1 && cur_cx as u64 == cx {
+                        new_idx = i;
+                        break;
+                    }
+                    if c == '\n' {
+                        cur_cx = 0; cur_cy += 1;
+                    } else {
+                        cur_cx += 1;
+                        if cur_cx >= w { cur_cx = 0; cur_cy += 1; }
+                    }
+                }
+                CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst);
+                *redraw = true;
+            } else {
+                let history = get_command_history();
+                if !history.is_empty() {
+                    unsafe {
+                        if HISTORY_INDEX < history.len() {
+                            HISTORY_INDEX += 1;
+                            if HISTORY_INDEX == history.len() { *input = get_saved_input().clone(); }
+                            else { *input = history[HISTORY_INDEX].clone(); }
+                            CURSOR_IDX.store(input.chars().count() as u16, Ordering::SeqCst);
+                            *redraw = true;
                         }
-                        CURSOR_IDX.store(input.chars().count() as u16, Ordering::SeqCst);
-                        *redraw = true;
                     }
                 }
             }
@@ -444,6 +541,7 @@ fn handle_input_event(
                 add_to_history(&msg);
                 input.clear();
                 CURSOR_IDX.store(0, Ordering::SeqCst);
+                PROMPT_SCROLL_TOP.store(0, Ordering::SeqCst);
                 get_message_queue().push_back(msg);
                 *redraw = true;
             }
@@ -451,6 +549,7 @@ fn handle_input_event(
         InputEvent::CtrlU => {
             input.clear();
             CURSOR_IDX.store(0, Ordering::SeqCst);
+            PROMPT_SCROLL_TOP.store(0, Ordering::SeqCst);
             *redraw = true;
         }
         InputEvent::CtrlW => {
@@ -459,9 +558,7 @@ fn handle_input_event(
             while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b == b' ') { new_idx -= 1; }
             while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b != b' ') { new_idx -= 1; }
             for _ in 0..(old_idx - new_idx) {
-                if new_idx < input.len() {
-                    input.remove(new_idx);
-                }
+                if new_idx < input.len() { input.remove(new_idx); }
             }
             CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst);
             *redraw = true;
@@ -487,49 +584,45 @@ fn handle_input_event(
             TERM_HEIGHT.store(nh, Ordering::SeqCst);
             clear_screen();
             print_greeting();
-            set_scroll_region(1, nh - 4);
-            // We can't update App's width/height from here directly easily, 
-            // but the atomics will be used for future renders.
+            set_scroll_region(1, nh - FOOTER_HEIGHT.load(Ordering::SeqCst));
             *redraw = true;
         }
         InputEvent::Esc => {
-            if exit_on_escape {
-                *quit = true;
-            } else {
-                CANCELLED.store(true, Ordering::SeqCst);
-            }
+            if exit_on_escape { *quit = true; }
+            else { CANCELLED.store(true, Ordering::SeqCst); }
         }
         _ => {}
     }
 }
 
-/// Non-blocking check for input and redraw of footer during AI streaming.
 pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize) {
     if !TUI_ACTIVE.load(Ordering::SeqCst) { return; }
     
     let mut event_buf = [0u8; 16];
-    // Use a tiny timeout to allow multi-byte sequences to arrive
-    let bytes_read = poll_input_event(10, &mut event_buf);
+    let bytes_read = poll_input_event(0, &mut event_buf);
     
+    let queue = get_raw_input_queue();
     if bytes_read > 0 {
-        let mut consumed = 0usize;
-        let bytes_read = bytes_read as usize;
-        let input = get_global_input();
-        let mut redraw = false;
-        let mut quit = false;
-
-        while consumed < bytes_read {
-            let (event, n) = parse_input(&event_buf[consumed..bytes_read]);
-            if n == 0 { break; }
-            consumed += n;
-            
-            handle_input_event(event, input, &mut redraw, &mut quit, false);
-        }
-        
-        if redraw {
-            render_footer_internal(input, current_tokens, token_limit, mem_kb);
-        }
+        for i in 0..bytes_read as usize { queue.push_back(event_buf[i]); }
+        unsafe { LAST_INPUT_TIME = libakuma::uptime(); }
     }
+
+    let input = get_global_input();
+    let mut redraw = false;
+    let mut quit = false;
+
+    while !queue.is_empty() {
+        let mut temp_buf = [0u8; 16];
+        let n_copy = core::cmp::min(queue.len(), 16);
+        for i in 0..n_copy { temp_buf[i] = queue[i]; }
+        
+        let (event, n) = parse_input(&temp_buf[..n_copy]);
+        if n == 0 { break; }
+        for _ in 0..n { queue.pop_front(); }
+        handle_input_event(event, input, &mut redraw, &mut quit, false);
+    }
+    
+    if redraw { render_footer_internal(input, current_tokens, token_limit, mem_kb); }
 }
 
 pub struct App {
@@ -540,14 +633,8 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        Self {
-            history: Vec::new(),
-            terminal_width: 100,
-            terminal_height: 25,
-        }
+        Self { history: Vec::new(), terminal_width: 100, terminal_height: 25 }
     }
-
-    /// Renders the fixed bottom footer (separator, status, prompt).
     pub fn render_footer(&self, current_tokens: usize, token_limit: usize, mem_kb: usize) {
         let input = get_global_input();
         render_footer_internal(input, current_tokens, token_limit, mem_kb);
@@ -559,92 +646,74 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let w = TERM_WIDTH.load(Ordering::SeqCst) as usize;
     let h = TERM_HEIGHT.load(Ordering::SeqCst) as u64;
 
-    // Format metrics
-    let token_display = if current_tokens >= 1000 {
-        format!("{}k", current_tokens / 1000)
-    } else {
-        format!("{}", current_tokens)
-    };
+    let token_display = if current_tokens >= 1000 { format!("{}k", current_tokens / 1000) } else { format!("{}", current_tokens) };
     let limit_display = format!("{}k", token_limit / 1000);
-    let mem_display = if mem_kb >= 1024 {
-        format!("{}M", mem_kb / 1024)
-    } else {
-        format!("{}K", mem_kb)
-    };
+    let mem_display = if mem_kb >= 1024 { format!("{}M", mem_kb / 1024) } else { format!("{}K", mem_kb) };
 
-    // Construct prompt string
     let queue_len = get_message_queue().len();
-    let queue_display = if queue_len > 0 {
-        format!(" [QUEUED: {}]", queue_len)
-    } else {
-        String::new()
-    };
+    let queue_display = if queue_len > 0 { format!(" [QUEUED: {}]", queue_len) } else { String::new() };
 
-    let prompt_prefix = format!("  [{}/{}|{}]{} (=^･ω･^=) > ", 
-        token_display, limit_display, mem_display, queue_display);
-    
-    let prompt_width = prompt_prefix.chars().count();
-    INPUT_LEN.store(prompt_width as u16, Ordering::SeqCst);
+    let prompt_prefix = format!("  [{}/{}|{}]{} (=^･ω･^=) > ", token_display, limit_display, mem_display, queue_display);
+    let prompt_prefix_len = prompt_prefix.chars().count();
+    INPUT_LEN.store(prompt_prefix_len as u16, Ordering::SeqCst);
 
-    // Hide cursor during footer render to prevent flickering
+    let wrapped_lines = count_wrapped_lines(input, prompt_prefix_len, w);
+    let max_prompt_lines = core::cmp::min(10, (h / 3) as usize);
+    let display_prompt_lines = core::cmp::min(wrapped_lines, max_prompt_lines);
+    let total_footer_height = (display_prompt_lines + 2) as u16; 
+    let old_footer_height = FOOTER_HEIGHT.swap(total_footer_height, Ordering::SeqCst);
+    if total_footer_height != old_footer_height { set_scroll_region(1, (h as u16) - total_footer_height); }
+
+    let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
+    let (_cx_abs, cy_off_abs) = calculate_input_cursor(input, idx, prompt_prefix_len, w);
+    let mut scroll_top = PROMPT_SCROLL_TOP.load(Ordering::SeqCst);
+    if cy_off_abs < scroll_top as u64 { scroll_top = cy_off_abs as u16; } 
+    else if cy_off_abs >= (scroll_top as u64 + display_prompt_lines as u64) { scroll_top = (cy_off_abs - display_prompt_lines as u64 + 1) as u16; }
+    PROMPT_SCROLL_TOP.store(scroll_top, Ordering::SeqCst);
+
     hide_cursor();
-
-    // 1. Draw Separator (at Row h-4)
-    set_cursor_position(0, h - 4);
+    let separator_row = h - total_footer_height as u64;
+    set_cursor_position(0, separator_row);
     let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, "━".repeat(w), COLOR_RESET);
 
-    // 2. Draw Status Bar (Row h-3) - Model and Provider info
-    set_cursor_position(0, h - 3);
+    let status_row = separator_row + 1;
+    set_cursor_position(0, status_row);
     let _ = write!(stdout, "{}", CLEAR_TO_EOL);
     let (model, provider) = get_model_and_provider();
     let status_info = format!("  [Provider: {}] [Model: {}]", provider, model);
     let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, status_info, COLOR_RESET);
 
-    // 3. Draw Prompt (starting at Row h-2, can wrap to Row h-1)
-    set_cursor_position(0, h - 2);
-    let _ = write!(stdout, "{}", CLEAR_TO_EOL);
-    set_cursor_position(0, h - 1);
-    let _ = write!(stdout, "{}", CLEAR_TO_EOL);
-    
-    set_cursor_position(0, h - 2);
-    let _ = write!(stdout, "{}{}", COLOR_VIOLET, prompt_prefix);
-    let _ = write!(stdout, "{}{}", COLOR_RESET, COLOR_VIOLET);
-    
-    // Manually render input to handle wraps and newlines
-    let mut cur_cx = prompt_width;
-    let mut cur_cy = h - 2;
-    
+    for i in 0..display_prompt_lines {
+        set_cursor_position(0, status_row + 1 + i as u64);
+        let _ = write!(stdout, "{}", CLEAR_TO_EOL);
+    }
+
+    let mut current_line = 0;
+    let mut current_col = prompt_prefix_len;
+    if scroll_top == 0 {
+        set_cursor_position(0, status_row + 1);
+        let _ = write!(stdout, "{}{}{}{}", COLOR_VIOLET, COLOR_BOLD, prompt_prefix, COLOR_RESET);
+    }
+    let _ = write!(stdout, "{}", COLOR_VIOLET);
     for c in input.chars() {
         if c == '\n' {
-            cur_cx = 0;
-            cur_cy += 1;
-            if cur_cy < h {
-                set_cursor_position(cur_cx as u64, cur_cy);
-            }
+            current_line += 1; current_col = 0;
         } else {
-            let mut buf = [0u8; 4];
-            let _ = write!(stdout, "{}", c.encode_utf8(&mut buf));
-            cur_cx += 1;
-            if cur_cx >= w {
-                cur_cx = 0;
-                cur_cy += 1;
-                if cur_cy < h {
-                    set_cursor_position(cur_cx as u64, cur_cy);
-                }
+            if current_line >= scroll_top as usize && current_line < (scroll_top as usize + display_prompt_lines) {
+                let target_row = status_row + 1 + (current_line as u64 - scroll_top as u64);
+                set_cursor_position(current_col as u64, target_row);
+                let mut buf = [0u8; 4];
+                let _ = write!(stdout, "{}", c.encode_utf8(&mut buf));
             }
+            current_col += 1;
+            if current_col >= w { current_line += 1; current_col = 0; }
         }
-        if cur_cy >= h { break; } // Out of footer bounds
     }
     let _ = write!(stdout, "{}", COLOR_RESET);
 
-    // 4. Position Cursor (handles wrapping on Row h-2 and h-1)
-    let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
-    let (cx, cy_off) = calculate_input_cursor(input, idx, prompt_width, w);
-    let cy = (h - 2) + cy_off;
-    
-    // Clamp cy to h-1 to prevent scroll trigger
-    let clamped_cy = if cy >= h { h - 1 } else { cy };
-    set_cursor_position(cx, clamped_cy);
+    let (cx, cy_off) = calculate_input_cursor(input, idx, prompt_prefix_len, w);
+    let final_cy = status_row + 1 + (cy_off - scroll_top as u64);
+    set_cursor_position(cx, final_cy);
     show_cursor();
 }
 
@@ -664,7 +733,6 @@ fn probe_terminal_size() -> (u16, u16) {
     let mut stdout = Stdout;
     let _ = write!(stdout, "\x1b[999;999H\x1b[6n");
     let mut buf = [0u8; 32];
-    // Increased timeout to 500ms for better reliability
     let n = poll_input_event(500, &mut buf);
     if n > 0 {
         if let Ok(resp) = core::str::from_utf8(&buf[..n as usize]) {
@@ -703,111 +771,83 @@ pub fn run_tui(
     app.terminal_width = w; app.terminal_height = h;
     TERM_WIDTH.store(w, Ordering::SeqCst);
     TERM_HEIGHT.store(h, Ordering::SeqCst);
-    
     set_model_and_provider(model, &provider.name);
     
     let mut stdout = Stdout;
-    // Enable Kitty keyboard protocol (for Shift+Enter detection in supported terminals)
-    // Mode 1 = disambiguate escape codes, enables CSI u sequences for modified keys
     let _ = write!(stdout, "\x1b[>1u");
-    let _ = write!(stdout, "\x1b[?1049h"); // Enter alternate screen
+    let _ = write!(stdout, "\x1b[?1049h");
     clear_screen();
-    // Scroll region ends at h-4 to leave room for 4-line footer
-    set_scroll_region(1, h - 4);
+    let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
+    set_scroll_region(1, h - f_h);
     print_greeting();
-    
-    // Show initial hotkeys tip
-    let _ = write!(stdout, "  {}TIP:{} Type {}/hotkeys{} to see input shortcuts nya~! ♪(=^･ω･^)ﾉ\n\n", 
-        COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, COLOR_RESET);
+    let _ = write!(stdout, "  {}TIP:{} Type {}/hotkeys{} to see input shortcuts nya~! ♪(=^･ω･^)ﾉ\n\n", COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, COLOR_RESET);
 
-    // Start AI cursor at the bottom of the scroll region (Line h-4 is row h-5)
-    CUR_ROW.store(h - 5, Ordering::SeqCst);
+    CUR_ROW.store(h - (f_h + 1), Ordering::SeqCst);
     CUR_COL.store(0, Ordering::SeqCst);
 
     loop {
         let current_tokens = crate::calculate_history_tokens(&app.history);
         let mem_kb = libakuma::memory_usage() / 1024;
-
         app.render_footer(current_tokens, context_window, mem_kb);
 
-        // Poll for input with a short timeout to allow for queue processing
         let mut event_buf = [0u8; 16];
-        let bytes_read = poll_input_event(100, &mut event_buf);
-
+        let bytes_read = poll_input_event(50, &mut event_buf);
+        let queue = get_raw_input_queue();
         if bytes_read > 0 {
-            let mut consumed = 0usize;
-            let bytes_read = bytes_read as usize;
-            let input = get_global_input();
-            let mut quit_loop = false;
-            let mut redraw = false;
-
-            while consumed < bytes_read {
-                let (event, n) = parse_input(&event_buf[consumed..bytes_read]);
-                if n == 0 { break; }
-                consumed += n;
-                
-                handle_input_event(event, input, &mut redraw, &mut quit_loop, config.exit_on_escape);
-                if event == InputEvent::Enter { break; }
-            }
-            if quit_loop { break; }
+            for i in 0..bytes_read as usize { queue.push_back(event_buf[i]); }
+            unsafe { LAST_INPUT_TIME = libakuma::uptime(); }
         }
 
-        // Process one message from the queue if available
+        let input = get_global_input();
+        let mut quit_loop = false;
+        let mut redraw = false;
+
+        while !queue.is_empty() {
+            let mut temp_buf = [0u8; 16];
+            let n_copy = core::cmp::min(queue.len(), 16);
+            for i in 0..n_copy { temp_buf[i] = queue[i]; }
+            let (event, n) = parse_input(&temp_buf[..n_copy]);
+            if n == 0 { break; }
+            for _ in 0..n { queue.pop_front(); }
+            handle_input_event(event, input, &mut redraw, &mut quit_loop, config.exit_on_escape);
+            if event == InputEvent::Enter { break; }
+        }
+        if quit_loop { break; }
+
         if let Some(user_input) = get_message_queue().pop_front() {
-            let mut stdout = Stdout;
-            
-            // Redraw footer IMMEDIATELY to clear input box/show updated queue
             app.render_footer(current_tokens, context_window, mem_kb);
-            
-            // 1. Move to scroll area and print user message
-            let row = (app.terminal_height - 5) as u64; 
+            let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
+            let row = (app.terminal_height - (f_h + 1)) as u64; 
             set_cursor_position(0, row);
+            let mut stdout = Stdout;
             let _ = write!(stdout, "\n {}> {}{}{}\n", COLOR_VIOLET, COLOR_BOLD, user_input, COLOR_RESET);
-            
             if user_input.starts_with('/') {
-                // 2. Handle Command
                 let (res, output) = crate::handle_command(&user_input, model, provider, config, history, system_prompt);
                 if let Some(out) = output {
                     let _ = write!(stdout, "  \n{}{}{}\n\n", COLOR_GRAY_BRIGHT, out, COLOR_RESET);
-                    // Add to both history vectors
                     let msg = Message::new("system", &out);
-                    history.push(msg.clone());
-                    app.history.push(msg);
+                    history.push(msg.clone()); app.history.push(msg);
                 }
                 if let CommandResult::Quit = res { break; }
-                
-                // Ensure history is synced if command modified it (e.g. /clear)
                 app.history = history.clone();
-                
-                CUR_ROW.store(app.terminal_height - 5, Ordering::SeqCst);
+                CUR_ROW.store(app.terminal_height - (f_h + 1), Ordering::SeqCst);
                 CUR_COL.store(0, Ordering::SeqCst);
             } else {
-                // 3. Handle Chat
                 app.history.push(Message::new("user", &user_input));
-                history.clear();
-                history.extend(app.history.iter().cloned());
-
-                // 2 spaces prefix for [MEOW]
+                history.clear(); history.extend(app.history.iter().cloned());
                 let _ = write!(stdout, "  {}[MEOW] {}", COLOR_MEOW, COLOR_RESET);
                 let _ = write!(stdout, "{}", COLOR_MEOW);
-                
-                // Track AI position for streaming (bottom of scroll region)
-                CUR_ROW.store(app.terminal_height - 5, Ordering::SeqCst);
-                CUR_COL.store(9, Ordering::SeqCst); // "  [MEOW] " is 9 chars
-                
-                // Note: chat_once will stream to current position (in scroll area)
+                CUR_ROW.store(app.terminal_height - (f_h + 1), Ordering::SeqCst);
+                CUR_COL.store(9, Ordering::SeqCst);
                 let _ = crate::chat_once(model, provider, &user_input, history, Some(context_window), system_prompt);
-                
                 let _ = write!(stdout, "{}\n", COLOR_RESET);
-                app.history = history.clone();
-                crate::compact_history(&mut app.history);
+                app.history = history.clone(); crate::compact_history(&mut app.history);
             }
         }
     }
 
-    // Reset scroll region and attributes
     set_scroll_region(1, app.terminal_height);
-    // Disable Kitty keyboard protocol
+    let mut stdout = Stdout;
     let _ = write!(stdout, "\x1b[<u");
     set_terminal_attributes(fd::STDIN, 0, old_mode_flags);
     clear_screen();
