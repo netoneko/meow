@@ -51,12 +51,20 @@ pub struct PaneLayout {
 
 impl PaneLayout {
     /// Create a new pane layout for the given terminal dimensions.
+    /// Layout from top to bottom:
+    ///   - Output pane (rows 1 to output_bottom, scrollable)
+    ///   - Gap (buffer zone)
+    ///   - Status pane (1 row, just above footer separator)
+    ///   - Footer (separator + provider info + prompt)
     pub fn new(width: u16, height: u16) -> Self {
-        let footer_height = 4; // Initial: separator + status + 2 prompt lines
+        let footer_height = 4; // Initial: separator + provider + 2 prompt lines
         let gap = Self::calculate_gap(height);
-        let output_bottom = height.saturating_sub(footer_height + gap + 1);
-        let status_row = output_bottom + 1;
-        let footer_top = status_row + 1 + gap;
+        // Status row is 1 row above footer separator
+        let separator_row = height.saturating_sub(footer_height);
+        let status_row = separator_row.saturating_sub(1);
+        // Output bottom is above the gap
+        let output_bottom = status_row.saturating_sub(gap);
+        let footer_top = separator_row;
         
         Self {
             term_width: width,
@@ -77,7 +85,7 @@ impl PaneLayout {
         }
     }
     
-    /// Calculate the gap between output and footer based on terminal height.
+    /// Calculate the gap between output and status based on terminal height.
     fn calculate_gap(height: u16) -> u16 {
         if height >= 40 {
             5 // Large terminals get more buffer
@@ -97,9 +105,12 @@ impl PaneLayout {
     pub fn recalculate(&mut self, new_footer_height: u16) {
         let gap = self.gap();
         self.footer_height = new_footer_height;
-        self.output_bottom = self.term_height.saturating_sub(new_footer_height + gap + 1);
-        self.status_row = self.output_bottom + 1;
-        self.footer_top = self.status_row + 1 + gap;
+        // Status row is 1 row above footer separator
+        let separator_row = self.term_height.saturating_sub(new_footer_height);
+        self.status_row = separator_row.saturating_sub(1);
+        // Output bottom is above the gap
+        self.output_bottom = self.status_row.saturating_sub(gap);
+        self.footer_top = separator_row;
         
         // Clamp output cursor if needed
         if self.output_row > self.output_bottom {
@@ -108,13 +119,11 @@ impl PaneLayout {
     }
     
     /// Set scroll region to only include output pane.
-    /// Note: scroll region bottom should be output_bottom + 1 to match original behavior
     pub fn set_scroll_region(&self) {
         let mut stdout = Stdout;
-        // Original: set_scroll_region(1, h - f_h - gap) where max_row = h - f_h - gap - 1
-        // So scroll region bottom = output_bottom + 1
-        let scroll_bottom = self.output_bottom + 1;
-        let _ = write!(stdout, "\x1b[{};{}r", self.output_top, scroll_bottom);
+        // Scroll region covers from top to output_bottom (inclusive)
+        // Use output_bottom + 1 for the ANSI escape which is inclusive
+        let _ = write!(stdout, "\x1b[{};{}r", self.output_top, self.output_bottom + 1);
     }
     
     /// Reset scroll region to full terminal.
@@ -123,12 +132,10 @@ impl PaneLayout {
         let _ = write!(stdout, "\x1b[1;{}r", self.term_height);
     }
     
-    /// Render the status pane (saves/restores cursor position).
+    /// Render the status pane at status_row (just above separator).
+    /// Does NOT restore cursor position - caller should handle cursor placement.
     pub fn render_status(&self) {
         let mut stdout = Stdout;
-        
-        // Save cursor position
-        let _ = write!(stdout, "\x1b[s");
         
         // Move to status row and clear it
         set_cursor_position(0, self.status_row as u64);
@@ -157,24 +164,24 @@ impl PaneLayout {
             let _ = write!(stdout, "{}", COLOR_RESET);
         }
         
-        // Restore cursor position
-        let _ = write!(stdout, "\x1b[u");
+        // Note: Cursor is left at end of status line. Caller should reposition if needed.
     }
     
-    /// Update status text and re-render.
+    /// Update status text (does NOT render - rendering happens via tui_handle_input or render_footer).
     pub fn update_status(&mut self, text: &str, dots: u8, time_ms: Option<u64>) {
         self.status_text = String::from(text);
         self.status_dots = dots;
         self.status_time_ms = time_ms;
-        self.render_status();
+        // Don't render here - it interferes with cursor positioning
+        // Status will be rendered during next footer render or tui_handle_input
     }
     
-    /// Clear the status pane.
+    /// Clear the status pane (does NOT render).
     pub fn clear_status(&mut self) {
         self.status_text.clear();
         self.status_dots = 0;
         self.status_time_ms = None;
-        self.render_status();
+        // Don't render here - will be cleared during next footer render
     }
     
     /// Get max output row (alias for output_bottom).
@@ -857,7 +864,12 @@ pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize
         handle_input_event(event, input, &mut redraw, &mut quit, false);
     }
     
-    if redraw { render_footer_internal(input, current_tokens, token_limit, mem_kb); }
+    // Always render during streaming to show status updates
+    // Otherwise only render when input changed
+    let is_streaming = STREAMING.load(Ordering::SeqCst);
+    if redraw || is_streaming { 
+        render_footer_internal(input, current_tokens, token_limit, mem_kb); 
+    }
 }
 
 pub struct App {
@@ -960,6 +972,9 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     hide_cursor();
     let separator_row = h - effective_footer_height as u64;
     
+    // Streaming status row is just above the separator
+    let streaming_status_row = separator_row.saturating_sub(1);
+    
     // When footer shrinks, clear old footer lines that are now in the gap area.
     // Only clear from old separator position to new separator position.
     // This never touches the scroll region (LLM output area).
@@ -971,25 +986,48 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
         }
     }
     
+    // Draw streaming status above separator
+    set_cursor_position(0, streaming_status_row);
+    let _ = write!(stdout, "{}", CLEAR_TO_EOL);
+    if !layout.status_text.is_empty() {
+        let _ = write!(stdout, "  {}{}", COLOR_GRAY_DIM, layout.status_text);
+        for _ in 0..layout.status_dots {
+            let _ = write!(stdout, ".");
+        }
+        if let Some(ms) = layout.status_time_ms {
+            if ms < 1000 {
+                let _ = write!(stdout, " ~(=^‥^)ノ [{}ms]", ms);
+            } else {
+                let secs = ms / 1000;
+                let remainder = (ms % 1000) / 100;
+                let _ = write!(stdout, " ~(=^‥^)ノ [{}.{}s]", secs, remainder);
+            }
+        }
+        let _ = write!(stdout, "{}", COLOR_RESET);
+    }
+    
+    // Draw separator line
     set_cursor_position(0, separator_row);
     let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, "━".repeat(w), COLOR_RESET);
 
-    let status_row = separator_row + 1;
-    set_cursor_position(0, status_row);
+    // Provider/model info row (inside footer, after separator)
+    let provider_row = separator_row + 1;
+    set_cursor_position(0, provider_row);
     let _ = write!(stdout, "{}", CLEAR_TO_EOL);
     let (model, provider) = get_model_and_provider();
-    let status_info = format!("  [Provider: {}] [Model: {}]", provider, model);
-    let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, status_info, COLOR_RESET);
+    let provider_info = format!("  [Provider: {}] [Model: {}]", provider, model);
+    let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, provider_info, COLOR_RESET);
 
+    // Clear and draw prompt lines
     for i in 0..effective_prompt_lines {
-        set_cursor_position(0, status_row + 1 + i as u64);
+        set_cursor_position(0, provider_row + 1 + i as u64);
         let _ = write!(stdout, "{}", CLEAR_TO_EOL);
     }
 
     let mut current_line = 0;
     let mut current_col = prompt_prefix_len;
     if scroll_top == 0 {
-        set_cursor_position(0, status_row + 1);
+        set_cursor_position(0, provider_row + 1);
         let _ = write!(stdout, "{}{}{}{}", COLOR_VIOLET, COLOR_BOLD, prompt_prefix, COLOR_RESET);
     }
     let _ = write!(stdout, "{}", COLOR_VIOLET);
@@ -998,7 +1036,7 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
             current_line += 1; current_col = 0;
         } else {
             if current_line >= scroll_top as usize && current_line < (scroll_top as usize + effective_prompt_lines) {
-                let target_row = status_row + 1 + (current_line as u64 - scroll_top as u64);
+                let target_row = provider_row + 1 + (current_line as u64 - scroll_top as u64);
                 set_cursor_position(current_col as u64, target_row);
                 let mut buf = [0u8; 4];
                 let _ = write!(stdout, "{}", c.encode_utf8(&mut buf));
@@ -1010,7 +1048,7 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let _ = write!(stdout, "{}", COLOR_RESET);
 
     let (cx, cy_off) = calculate_input_cursor(input, idx, prompt_prefix_len, w);
-    let final_cy = status_row + 1 + (cy_off - scroll_top as u64);
+    let final_cy = provider_row + 1 + (cy_off - scroll_top as u64);
     layout.cursor_idx = idx as u16;
     set_cursor_position(cx, final_cy);
     show_cursor();
