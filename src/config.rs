@@ -196,7 +196,9 @@ CRITICAL: If you find yourself writing phrases like "the API returned..." or "ac
 
 // UI Colors (Cyber-Steel / Tokyo Night)
 pub const COLOR_VIOLET: &str = "\x1b[38;5;177m"; // User
-pub const COLOR_BLUE: &str = "\x1b[38;5;111m";   // Meow
+pub const COLOR_BLUE: &str = "\x1b[38;5;111m";   // Meow (Cyan/Blue)
+pub const COLOR_USER: &str = COLOR_VIOLET;
+pub const COLOR_MEOW: &str = COLOR_BLUE;
 pub const COLOR_GRAY_DIM: &str = "\x1b[38;5;240m"; // Outer Frame
 pub const COLOR_GRAY_BRIGHT: &str = "\x1b[38;5;250m"; // Headers
 pub const COLOR_GREEN: &str = "\x1b[38;5;120m";  // Online status

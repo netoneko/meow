@@ -1,50 +1,69 @@
-# Meow-chan TUI Mockup: Cyberpunk Edition
+# Meow-chan TUI: Final Extra Plan Mockup
 
-This mockup represents the enhanced, neon-soaked interactive terminal user interface for Meow-chan.
+This mockup establishes the layout for the "Natural Scrollback" interface. It uses a fixed scrolling region for chat history and a persistent, multi-line footer for metrics and input.
+
+## Startup Greeting
+```text
+[ GREETING AREA ]
+(src/akuma_40.txt rendered with \x1b[38;5;236m background)
+  
+  ███╗   ███╗███████╗ ██████╗ ██╗    ██╗
+  ████╗ ████║██╔════╝██╔═══██╗██║    ██║
+  ██╔████╔██║█████╗  ██║   ██║██║ █╗ ██║
+  ██║╚██╔╝██║██╔══╝  ██║   ██║██║███╗██║
+  ██║ ╚═╝ ██║███████╗╚██████╔╝╚███╔███╔╝
+  ╚═╝     ╚═╝╚══════╝ ╚═════╝  ╚══╝╚══╝ 
+```
+
+## Main Interface (Standard 25x100)
+Lines 1-21 are the "Scrollback Zone".
+Lines 22-25 are the "Footer Zone".
 
 ```text
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  [ MEOW-CHAN v1.0 // NEURAL LINK ACTIVE ] ══════════════════════ [ 🟢 ONLINE ]  ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║ > GRID: OLLAMA-V3 | LATENCY: 42ms | SIG: 📶 98% | CRYPTO: NEKO-CHA-20        ║
+║  [MEOW] *ears twitch* Sure thing nya~! I'll jack into the VFS and get        ║
+║         a listing for you. Just a sec...                                     ║
+║                                                                              ║
+║  [*] >> EXECUTING: FileList { path: "/" }                                    ║
+║  [*] << SUCCESS: bin/ etc/ public/ scripts/ tmp/ var/                        ║
+║                                                                              ║
+║  [MEOW] Here's the local grid layout choom! Anything else you need?          ║
+║                                                                              ║
 ╟──────────────────────────────────────────────────────────────────────────────╢
-║                                                                              ║
-║  [ 🟪 USER ] hello meow-chan! nya~                                           ║
-║                                                                              ║
-║  [ 🟦 MEOW ] ネットランナー! Nya~! (=^･ω･^)ﾉ How can I assist your hack today?   ║
-║              I've checked the local grid and everything seems preem.         ║
-║                                                                              ║
-║  [ 🟪 USER ] can you show me the file system?                                ║
-║                                                                              ║
-║  [ 🟦 MEOW ] *ears twitch* Sure thing nya~! I'll jack into the VFS and get   ║
-║              a listing for you. Just a sec...                                ║
-║                                                                              ║
-║  [ 🟩 SYS  ] >> EXECUTING: FileList { path: "/" }                           ║
-║  [ 🟩 SYS  ] << SUCCESS: bin/ etc/ public/ scripts/ tmp/ var/                ║
-║                                                                              ║
-║                                                                              ║
-║                                                                              ║
-║                                                                              ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║ [ 342 / 128k tokens ] [ 💾 1.2M RAM ] (=^･ω･^=) > _                          ║
+║ [ 342 / 128k tokens ] [ 💾 1.2M RAM ]                                        ║
+║ > type your message here_                                                    ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
 
-## Cyber-Neko Color Palette (ANSI)
+## Visual Rules & Logic
 
-To achieve the "Netrunner" look, the interface utilizes high-contrast neon highlights:
+### 1. Colors (Tokyo Night Theme)
+*   **User Input:** `\x1b[38;5;177m` (Violet)
+*   **Meow Output:** `\x1b[38;5;111m` (Sky Blue)
+*   **System/Tools:** `\x1b[38;5;120m` (Emerald Green)
+*   **Frames/Borders:** `\x1b[38;5;242m` (Dark Gray)
+*   **Metrics:** `\x1b[38;5;215m` (Soft Orange)
 
-*   **Frame & Headers:** `\x1b[1;35m` (Neon Purple/Magenta) - The user's primary connection color.
-*   **System Status:** `\x1b[1;33m` (Cyber Gold) - Critical metrics and grid info.
-*   **User Label `[ USER ]`:** `\x1b[1;35m` (Neon Purple) - Your identity in the matrix.
-*   **Meow-chan Label `[ MEOW ]`:** `\x1b[1;36m` (Neon Cyan/Blue) - The AI's cybernetic presence.
-*   **Tool/System `[ SYS  ]`:** `\x1b[1;32m` (Emerald Green) - Subroutine execution and I/O.
-*   **Prompt & Text:** `\x1b[1;37m` (Pure White) - For clarity amidst the neon.
-*   **Reset:** `\x1b[0m` - To collapse back into the void.
+### 2. The Scroll Region (`DECSTBM`)
+*   To avoid "overwriting" the prompt when the AI speaks, we set a terminal scroll region from line 1 to `Height - 4`.
+*   When text is printed, the terminal handles scrolling *only* within those lines.
+*   The Footer (Lines `Height-3` to `Height`) remains stationary and is never scrolled away.
 
-## Aesthetic Details
+### 3. Alignment & Wrapping
+*   **Indentation:** Assistant messages start with `[MEOW] ` (7 chars). Every subsequent line of that message *must* be indented by 7 spaces to match.
+*   **Prefixes:**
+    *   User: `> ` (Color: Violet)
+    *   Meow: `[MEOW] ` (Color: Blue)
+    *   System: `[*] ` (Color: Green)
 
-1.  **Japanese Infusion:** Incorporation of Katakana like `ネットランナー` (Netrunner) to evoke the Neo-Tokyo aesthetic.
-2.  **Dense Metrics:** The header bar simulates a real-time neural link with latency, signal strength, and encryption protocols.
-3.  **Command Glitch:** The tool execution labels `>>` and `<<` mimic a high-speed data bus.
-4.  **Emoji Symbols:** Using simple Unicode characters like 🟢, 📶, and 💾 to provide visual anchors without complex graphics.
+### 4. Concurrency Flow
+1.  User types in the footer area.
+2.  Cursor stays at the end of the user's current input line.
+3.  AI data arrives:
+    *   Save cursor position (`\x1b[s`).
+    *   Move to the bottom-most line of the *Scroll Region*.
+    *   Print chunk.
+    *   Restore cursor position (`\x1b[u`).
+4.  User sees their typing interrupted only by the millisecond-fast cursor jump, making it look like simultaneous action.
+
+### 5. Expanding Input
+*   As the `input.len()` exceeds `terminal_width - 4`, the footer border moves *up* one row, and the scroll region size is decreased by one.
