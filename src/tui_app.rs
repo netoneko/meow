@@ -337,7 +337,7 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     set_cursor_position(0, h - 3);
     let _ = write!(stdout, "{}", CLEAR_TO_EOL);
     let (model, provider) = get_model_and_provider();
-    let status_info = format!(" [Provider: {}] [Model: {}]", provider, model);
+    let status_info = format!("  [Provider: {}] [Model: {}]", provider, model);
     let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, status_info, COLOR_RESET);
 
     // 3. Draw Prompt (starting at Row h-2, can wrap to Row h-1)
