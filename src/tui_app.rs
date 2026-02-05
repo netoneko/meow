@@ -11,7 +11,7 @@ use libakuma::{
     clear_screen, poll_input_event, write as akuma_write, fd
 };
 
-use crate::config::{Provider, Config, COLOR_USER, COLOR_MEOW, COLOR_GRAY_DIM, COLOR_GRAY_BRIGHT, COLOR_YELLOW, COLOR_RESET, COLOR_BOLD};
+use crate::config::{Provider, Config, COLOR_USER, COLOR_MEOW, COLOR_GRAY_DIM, COLOR_GRAY_BRIGHT, COLOR_YELLOW, COLOR_RESET, COLOR_BOLD, COLOR_VIOLET};
 use crate::{Message, CommandResult};
 
 // ANSI escapes
@@ -126,8 +126,9 @@ pub fn tui_print(s: &str) {
 
         if c == '\n' {
             row += 1;
-            if row > h - 4 {
-                row = h - 4;
+            // Limit to h-5 (Line 21 if h=25)
+            if row > h - 5 {
+                row = h - 5;
                 akuma_write(fd::STDOUT, b"\n");
             } else {
                 set_cursor_position(0, row as u64);
@@ -142,8 +143,8 @@ pub fn tui_print(s: &str) {
         } else {
             if col >= w - 1 {
                 row += 1;
-                if row > h - 4 {
-                    row = h - 4;
+                if row > h - 5 {
+                    row = h - 5;
                     akuma_write(fd::STDOUT, b"\n");
                 }
                 set_cursor_position(0, row as u64);
@@ -159,9 +160,16 @@ pub fn tui_print(s: &str) {
     CUR_COL.store(col, Ordering::SeqCst);
     CUR_ROW.store(row, Ordering::SeqCst);
 
-    // Move to prompt window
-    let input_pos = INPUT_LEN.load(Ordering::SeqCst);
-    set_cursor_position(input_pos as u64, (h - 1) as u64);
+    // Return cursor to prompt (handles wrapping on Rows h-2 and h-1)
+    let input = get_global_input();
+    let prompt_width = INPUT_LEN.load(Ordering::SeqCst) as usize;
+    let total_len = prompt_width + input.chars().count();
+    let cx = (total_len % w as usize) as u64;
+    let cy = (h as u64 - 2) + (total_len / w as usize) as u64;
+    
+    // Clamp cy to h-1 to prevent scroll trigger
+    let clamped_cy = if cy >= h as u64 { h as u64 - 1 } else { cy };
+    set_cursor_position(cx, clamped_cy);
 }
 
 /// Check if a cancellation request (ESC key) was received.
@@ -229,7 +237,10 @@ pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize
         let input = get_global_input();
         match key {
             0x1B => { // ESC
-                CANCELLED.store(true, Ordering::SeqCst);
+                // Only cancel if it's a single ESC byte, not an arrow key sequence
+                if bytes_read == 1 {
+                    CANCELLED.store(true, Ordering::SeqCst);
+                }
             }
             0x7F | 0x08 => { input.pop(); }
             b'\r' | b'\n' => {
@@ -300,32 +311,41 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let prompt_prefix = format!("  [{}/{}|{}]{} (=^･ω･^=) > ", 
         token_display, limit_display, mem_display, queue_display);
     
-    // Update global input len for tui_print
     let prompt_width = prompt_prefix.chars().count();
-    INPUT_LEN.store((prompt_width + input.chars().count()) as u16, Ordering::SeqCst);
+    INPUT_LEN.store(prompt_width as u16, Ordering::SeqCst);
 
     // Hide cursor during footer render to prevent flickering
     hide_cursor();
 
-    // 1. Draw Separator (at Row h-2) - use heavy line ━
-    set_cursor_position(0, h - 3);
+    // 1. Draw Separator (at Row h-4)
+    set_cursor_position(0, h - 4);
     let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, "━".repeat(w), COLOR_RESET);
 
-    // 2. Draw Status Bar (Row h-1) - Model and Provider info
-    set_cursor_position(0, h - 2);
+    // 2. Draw Status Bar (Row h-3) - Model and Provider info
+    set_cursor_position(0, h - 3);
     let _ = write!(stdout, "{}", CLEAR_TO_EOL);
     let (model, provider) = get_model_and_provider();
-    let status_info = format!(" {} [Provider: {}] [Model: {}] {}", 
-        COLOR_GRAY_DIM, provider, model, COLOR_RESET);
-    let _ = write!(stdout, "{}", status_info);
+    let status_info = format!("   [Provider: {}] [Model: {}]", provider, model);
+    let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, status_info, COLOR_RESET);
 
-    // 3. Draw Prompt (at Row h)
+    // 3. Draw Prompt (starting at Row h-2, can wrap to Row h-1)
+    set_cursor_position(0, h - 2);
+    let _ = write!(stdout, "{}", CLEAR_TO_EOL);
     set_cursor_position(0, h - 1);
     let _ = write!(stdout, "{}", CLEAR_TO_EOL);
-    let _ = write!(stdout, "{}{}{}{}{}{}", COLOR_YELLOW, prompt_prefix, COLOR_RESET, COLOR_USER, input, COLOR_RESET);
+    
+    set_cursor_position(0, h - 2);
+    let full_prompt = format!("{}{}{}{}{}", COLOR_YELLOW, prompt_prefix, COLOR_RESET, COLOR_USER, input);
+    let _ = write!(stdout, "{}{}", full_prompt, COLOR_RESET);
 
-    // 4. Position Cursor at end of input
-    set_cursor_position((prompt_width + input.chars().count()) as u64, h - 1);
+    // 4. Position Cursor (handles wrapping on Row h-2 and h-1)
+    let total_len = prompt_width + input.chars().count();
+    let cx = (total_len % w) as u64;
+    let cy = (h - 2) + (total_len / w) as u64;
+    
+    // Clamp cy to h-1 to prevent scroll trigger
+    let clamped_cy = if cy >= h as u64 { h as u64 - 1 } else { cy };
+    set_cursor_position(cx, clamped_cy);
     show_cursor();
 }
 
@@ -345,7 +365,8 @@ fn probe_terminal_size() -> (u16, u16) {
     let mut stdout = Stdout;
     let _ = write!(stdout, "\x1b[999;999H\x1b[6n");
     let mut buf = [0u8; 32];
-    let n = poll_input_event(200, &mut buf);
+    // Increased timeout to 500ms for better reliability
+    let n = poll_input_event(500, &mut buf);
     if n > 0 {
         if let Ok(resp) = core::str::from_utf8(&buf[..n as usize]) {
             if let Some(start) = resp.find('[') {
@@ -387,12 +408,12 @@ pub fn run_tui(
     set_model_and_provider(model, &provider.name);
     
     clear_screen();
-    // Scroll region ends at h-3 to leave room for 3-line footer
-    set_scroll_region(1, h - 3);
+    // Scroll region ends at h-4 to leave room for 4-line footer
+    set_scroll_region(1, h - 4);
     print_greeting();
 
-    // Start AI cursor at the bottom of the scroll region
-    CUR_ROW.store(h - 4, Ordering::SeqCst);
+    // Start AI cursor at the bottom of the scroll region (Line h-4 is row h-5)
+    CUR_ROW.store(h - 5, Ordering::SeqCst);
     CUR_COL.store(0, Ordering::SeqCst);
 
     loop {
@@ -462,7 +483,7 @@ pub fn run_tui(
                     TERM_HEIGHT.store(nh, Ordering::SeqCst);
                     clear_screen();
                     print_greeting();
-                    set_scroll_region(1, nh - 3);
+                    set_scroll_region(1, nh - 4);
                 },
                 c if c >= 0x20 && c <= 0x7E => {
                     get_global_input().push(c as char);
@@ -479,9 +500,9 @@ pub fn run_tui(
             app.render_footer(current_tokens, context_window, mem_kb);
             
             // 1. Move to scroll area and print user message
-            let row = (app.terminal_height - 4) as u64;
+            let row = (app.terminal_height - 5) as u64; 
             set_cursor_position(0, row);
-            let _ = write!(stdout, "\n {}> {}{}{}\n", COLOR_USER, COLOR_BOLD, user_input, COLOR_RESET);
+            let _ = write!(stdout, "\n {}> {}{}{}\n", COLOR_VIOLET, COLOR_BOLD, user_input, COLOR_RESET);
             
             if user_input.starts_with('/') {
                 // 2. Handle Command
@@ -498,7 +519,7 @@ pub fn run_tui(
                 // Ensure history is synced if command modified it (e.g. /clear)
                 app.history = history.clone();
                 
-                CUR_ROW.store(app.terminal_height - 4, Ordering::SeqCst);
+                CUR_ROW.store(app.terminal_height - 5, Ordering::SeqCst);
                 CUR_COL.store(0, Ordering::SeqCst);
             } else {
                 // 3. Handle Chat
@@ -510,8 +531,8 @@ pub fn run_tui(
                 let _ = write!(stdout, "  {}[MEOW] {}", COLOR_MEOW, COLOR_RESET);
                 let _ = write!(stdout, "{}", COLOR_MEOW);
                 
-                // Track AI position for streaming
-                CUR_ROW.store(app.terminal_height - 4, Ordering::SeqCst);
+                // Track AI position for streaming (bottom of scroll region)
+                CUR_ROW.store(app.terminal_height - 5, Ordering::SeqCst);
                 CUR_COL.store(9, Ordering::SeqCst); // "  [MEOW] " is 9 chars
                 
                 // Note: chat_once will stream to current position (in scroll area)

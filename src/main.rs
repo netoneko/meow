@@ -761,10 +761,10 @@ pub fn chat_once(
     history.push(Message::new("user", user_message));
 
     // Track tool calls and stated intentions across all iterations
+    let mut total_tools_called: usize = 0;
+    let mut all_responses = String::new();
+
     for iteration in 0..MAX_TOOL_ITERATIONS {
-        let mut total_tools_called: usize = 0;
-        let mut all_responses = String::new();
-    
         // Calculate metrics for background input handling
         let current_tokens = calculate_history_tokens(history);
         let mem_kb = libakuma::memory_usage() / 1024;
@@ -1090,13 +1090,13 @@ fn read_streaming_with_http_stream_tls(
                                 let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
                                 print(" ");
                                 print_elapsed(elapsed_ms);
-                                                                    print("\n");
-                                                                }
-                                                                print(COLOR_MEOW);
-                                                                print(&content);
-                                                                full_response.push_str(&content);
-                                
-                        }
+                                                                                                                                            print("\n");
+                                                                                                                                        }
+                                                                                                                                        print(COLOR_MEOW);
+                                                                                                                                        print(&content);
+                                                                                                                                        full_response.push_str(&content);
+                                                                                                        
+                                                                                            }
                         if done {
                             stream_completed = true;
                         }
