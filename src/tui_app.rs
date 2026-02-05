@@ -568,7 +568,7 @@ pub fn add_to_history(cmd: &str) {
 }
 
 pub fn tui_is_cancelled() -> bool {
-    CANCELLED.swap(false, Ordering::SeqCst)
+    CANCELLED.load(Ordering::SeqCst)
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
