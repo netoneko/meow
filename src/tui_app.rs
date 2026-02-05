@@ -17,8 +17,22 @@ use crate::{Message, CommandResult};
 // ANSI escapes
 const CLEAR_TO_EOL: &str = "\x1b[K";
 
+/// Calculate gap between LLM output area and footer based on terminal size.
+/// Returns 3-5 lines depending on terminal height to prevent repaint interference.
+fn output_footer_gap() -> u16 {
+    let h = TERM_HEIGHT.load(Ordering::SeqCst);
+    if h >= 40 {
+        5 // Large terminals get more buffer
+    } else if h >= 30 {
+        4
+    } else {
+        3 // Minimum gap for smaller terminals
+    }
+}
+
 pub static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static CANCELLED: AtomicBool = AtomicBool::new(false);
+pub static STREAMING: AtomicBool = AtomicBool::new(false);
 pub static TERM_WIDTH: AtomicU16 = AtomicU16::new(100);
 pub static TERM_HEIGHT: AtomicU16 = AtomicU16::new(25);
 pub static CUR_COL: AtomicU16 = AtomicU16::new(0);
@@ -160,8 +174,10 @@ pub fn tui_print(s: &str) {
         if c == '\n' {
             row += 1;
             let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
-            if row > h - (f_h + 1) {
-                row = h - (f_h + 1);
+            let gap = output_footer_gap();
+            let max_row = h - (f_h + 1 + gap);
+            if row > max_row {
+                row = max_row;
                 akuma_write(fd::STDOUT, b"\n");
             } else {
                 set_cursor_position(0, row as u64);
@@ -177,8 +193,10 @@ pub fn tui_print(s: &str) {
             if col >= w - 1 {
                 row += 1;
                 let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
-                if row > h - (f_h + 1) {
-                    row = h - (f_h + 1);
+                let gap = output_footer_gap();
+                let max_row = h - (f_h + 1 + gap);
+                if row > max_row {
+                    row = max_row;
                     akuma_write(fd::STDOUT, b"\n");
                 }
                 set_cursor_position(0, row as u64);
@@ -592,12 +610,16 @@ fn handle_input_event(
             TERM_HEIGHT.store(nh, Ordering::SeqCst);
             clear_screen();
             print_greeting();
-            set_scroll_region(1, nh - FOOTER_HEIGHT.load(Ordering::SeqCst));
+            set_scroll_region(1, nh - FOOTER_HEIGHT.load(Ordering::SeqCst) - output_footer_gap());
             *redraw = true;
         }
         InputEvent::Esc | InputEvent::Interrupt => {
-            if exit_on_escape || event == InputEvent::Interrupt { *quit = true; }
-            else { CANCELLED.store(true, Ordering::SeqCst); }
+            // Always set CANCELLED to stop any ongoing LLM request
+            CANCELLED.store(true, Ordering::SeqCst);
+            // Quit the input loop if exit_on_escape is set OR if Ctrl+C was pressed
+            if exit_on_escape || event == InputEvent::Interrupt { 
+                *quit = true; 
+            }
         }
         _ => {}
     }
@@ -671,16 +693,23 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let total_footer_height = (display_prompt_lines + 2) as u16; 
     let old_footer_height = FOOTER_HEIGHT.swap(total_footer_height, Ordering::SeqCst);
     
-    if total_footer_height != old_footer_height {
-        set_scroll_region(1, (h as u16) - total_footer_height);
+    // Only adjust scroll region when NOT streaming to avoid disrupting LLM output
+    let is_streaming = STREAMING.load(Ordering::SeqCst);
+    if total_footer_height != old_footer_height && !is_streaming {
+        let gap = output_footer_gap();
+        set_scroll_region(1, (h as u16) - total_footer_height - gap);
         // If footer is growing, we might need to adjust CUR_ROW to avoid overwrite
-        let mut cur_row = CUR_ROW.load(Ordering::SeqCst);
-        if cur_row > h as u16 - (total_footer_height + 1) {
-            let diff = cur_row - (h as u16 - (total_footer_height + 1));
+        let cur_row = CUR_ROW.load(Ordering::SeqCst);
+        let max_row = h as u16 - (total_footer_height + 1 + gap);
+        if cur_row > max_row {
+            let diff = cur_row - max_row;
             // Print newlines to push content up
             for _ in 0..diff { let _ = write!(stdout, "\n"); }
-            CUR_ROW.store(h as u16 - (total_footer_height + 1), Ordering::SeqCst);
+            CUR_ROW.store(max_row, Ordering::SeqCst);
         }
+    } else if is_streaming && total_footer_height != old_footer_height {
+        // Revert footer height change during streaming
+        FOOTER_HEIGHT.store(old_footer_height, Ordering::SeqCst);
     }
 
     let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
@@ -797,11 +826,12 @@ pub fn run_tui(
     let _ = write!(stdout, "\x1b[?1049h");
     clear_screen();
     let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
-    set_scroll_region(1, h - f_h);
+    let gap = output_footer_gap();
+    set_scroll_region(1, h - f_h - gap);
     print_greeting();
     let _ = write!(stdout, "  {}TIP:{} Type {}/hotkeys{} to see input shortcuts nya~! ♪(=^･ω･^)ﾉ\n\n", COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, COLOR_RESET);
 
-    CUR_ROW.store(h - (f_h + 1), Ordering::SeqCst);
+    CUR_ROW.store(h - (f_h + 1 + gap), Ordering::SeqCst);
     CUR_COL.store(0, Ordering::SeqCst);
 
     loop {
@@ -836,7 +866,6 @@ pub fn run_tui(
         if let Some(user_input) = get_message_queue().pop_front() {
             app.render_footer(current_tokens, context_window, mem_kb);
             let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
-            let row = (app.terminal_height - (f_h + 1)) as u64; 
             let mut stdout = Stdout;
             let _ = write!(stdout, "\n {}> {}{}{}\n", COLOR_VIOLET, COLOR_BOLD, user_input, COLOR_RESET);
             if user_input.starts_with('/') {
@@ -848,16 +877,21 @@ pub fn run_tui(
                 }
                 if let CommandResult::Quit = res { break; }
                 app.history = history.clone();
-                CUR_ROW.store(app.terminal_height - (f_h + 1), Ordering::SeqCst);
+                let gap = output_footer_gap();
+                CUR_ROW.store(app.terminal_height - (f_h + 1 + gap), Ordering::SeqCst);
                 CUR_COL.store(0, Ordering::SeqCst);
             } else {
                 app.history.push(Message::new("user", &user_input));
                 history.clear(); history.extend(app.history.iter().cloned());
                 let _ = write!(stdout, "  {}[MEOW] {}", COLOR_MEOW, COLOR_RESET);
                 let _ = write!(stdout, "{}", COLOR_MEOW);
-                CUR_ROW.store(app.terminal_height - (f_h + 1), Ordering::SeqCst);
+                let gap = output_footer_gap();
+                CUR_ROW.store(app.terminal_height - (f_h + 1 + gap), Ordering::SeqCst);
                 CUR_COL.store(9, Ordering::SeqCst);
+                STREAMING.store(true, Ordering::SeqCst);
                 let _ = crate::chat_once(model, provider, &user_input, history, Some(context_window), system_prompt);
+                STREAMING.store(false, Ordering::SeqCst);
+                CANCELLED.store(false, Ordering::SeqCst); // Clear cancel flag after streaming ends
                 let _ = write!(stdout, "{}\n", COLOR_RESET);
                 app.history = history.clone(); crate::compact_history(&mut app.history);
             }
