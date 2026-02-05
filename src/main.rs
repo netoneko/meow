@@ -465,36 +465,36 @@ pub fn handle_command(
         }
         "/hotkeys" | "/shortcuts" => {
             let output = String::from("┌────────────────────────────────────────────────┐\n\
-                                       │  ～ Meow's Input Shortcuts ～                  │\n\
+                                       │             Meow's Input Shortcuts             │\n\
                                        ├────────────────────────────────────────────────┤\n\
-                                       │  Ctrl+A / Home  - Move to start of line        │\n\
-                                       │  Ctrl+E / End   - Move to end of line          │\n\
-                                       │  Ctrl+W         - Delete previous word         │\n\
-                                       │  Ctrl+U         - Clear entire input line      │\n\
-                                       │  Alt+B / Opt+←  - Move back one word           │\n\
-                                       │  Alt+F / Opt+→  - Move forward one word        │\n\
-                                       │  Arrows         - Navigate history and line    │\n\
-                                       │  ESC            - Cancel current AI request    │\n\
+                                       │ Ctrl+A / Home    - Move to start of line       │\n\
+                                       │ Ctrl+E / End     - Move to end of line         │\n\
+                                       │ Ctrl+W           - Delete previous word        │\n\
+                                       │ Ctrl+U           - Clear entire input line     │\n\
+                                       │ Alt+B / Opt+Left - Move back one word          │\n\
+                                       │ Alt+F / Opt+Right- Move forward one word       │\n\
+                                       │ Arrows           - Navigate history and line   │\n\
+                                       │ ESC              - Cancel current AI request   │\n\
                                        └────────────────────────────────────────────────┘\n");
             (CommandResult::Continue, Some(output))
         }
         "/help" | "/?" => {
             let output = String::from("┌────────────────────────────────────────────────┐\n\
-                                       │  ～ Meow's Command Protocol ～                 │\n\
+                                       │             Meow's Command Protocol            │\n\
                                        ├────────────────────────────────────────────────┤\n\
-                                       │  /clear        - Wipe memory banks nya~        │\n\
-                                       │  /model [NAME] - Check/switch neural link      │\n\
-                                       │  /model list   - List available models         │\n\
-                                       │  /provider     - Check/switch provider         │\n\
-                                       │  /provider list- List configured providers     │\n\
-                                       │  /tokens       - Show current token usage      │\n\
-                                       │  /hotkeys      - Show input shortcuts          │\n\
-                                       │  /quit         - Jack out of the matrix        │\n\
-                                       │  /help         - This help screen              │\n\
+                                       │ /clear        - Wipe memory banks nya~         │\n\
+                                       │ /model [NAME] - Check/switch neural link       │\n\
+                                       │ /model list   - List available models          │\n\
+                                       │ /provider     - Check/switch provider          │\n\
+                                       │ /provider list- List configured providers      │\n\
+                                       │ /tokens       - Show current token usage       │\n\
+                                       │ /hotkeys      - Show input shortcuts           │\n\
+                                       │ /quit         - Jack out of the matrix         │\n\
+                                       │ /help         - This help screen               │\n\
                                        ├────────────────────────────────────────────────┤\n\
-                                       │  Context compaction: When token count is       │\n\
-                                       │  high, ask Meow to compact the context         │\n\
-                                       │  to free up memory nya~!                       │\n\
+                                       │ Context compaction: When token count is high,  │\n\
+                                       │ ask Meow to compact the context to free up     │\n\
+                                       │ memory nya~!                                   │\n\
                                        └────────────────────────────────────────────────┘\n");
             (CommandResult::Continue, Some(output))
         }

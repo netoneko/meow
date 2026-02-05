@@ -420,13 +420,14 @@ pub fn run_tui(
     
     set_model_and_provider(model, &provider.name);
     
+    let mut stdout = Stdout;
+    let _ = write!(stdout, "\x1b[?1049h"); // Enter alternate screen
     clear_screen();
     // Scroll region ends at h-4 to leave room for 4-line footer
     set_scroll_region(1, h - 4);
     print_greeting();
     
     // Show initial hotkeys tip
-    let mut stdout = Stdout;
     let _ = write!(stdout, "  {}TIP:{} Type {}/hotkeys{} to see input shortcuts nya~! ♪(=^･ω･^)ﾉ\n\n", 
         COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, COLOR_RESET);
 
@@ -543,7 +544,7 @@ pub fn run_tui(
                         }
                     }
                 }
-                b'\r' | b'\n' => {
+                b'\r' => { // Enter: Submit
                     let user_input = input.clone();
                     if !user_input.is_empty() {
                         add_to_history(&user_input);
@@ -551,6 +552,10 @@ pub fn run_tui(
                         idx = 0;
                         get_message_queue().push_back(user_input);
                     }
+                },
+                b'\n' => { // LF (Shift+Enter usually): Newline
+                    input.insert(idx, '\n');
+                    idx += 1;
                 },
                 0x7F | 0x08 => { // Backspace
                     if idx > 0 && !input.is_empty() {
@@ -592,7 +597,7 @@ pub fn run_tui(
                 // 2. Handle Command
                 let (res, output) = crate::handle_command(&user_input, model, provider, config, history, system_prompt);
                 if let Some(out) = output {
-                    let _ = write!(stdout, "  {}{}{}\n\n", COLOR_GRAY_BRIGHT, out, COLOR_RESET);
+                    let _ = write!(stdout, "  \n{}{}{}\n\n", COLOR_GRAY_BRIGHT, out, COLOR_RESET);
                     // Add to both history vectors
                     let msg = Message::new("system", &out);
                     history.push(msg.clone());
