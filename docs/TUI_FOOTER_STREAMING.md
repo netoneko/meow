@@ -24,9 +24,8 @@ Key state variables:
 
 ### When Streaming
 - Footer can **GROW** (to show multiline input)
-  - Newlines are printed to scroll LLM content up
   - Scroll region is shrunk
-  - `CUR_ROW` is adjusted to stay in valid range
+  - `CUR_ROW` is clamped to stay in valid range
 - Footer **cannot SHRINK** (deferred until streaming ends)
   - Prevents double separator line artifacts
   - Uses `effective_footer_height = max(old, new)`
