@@ -13,6 +13,9 @@ pub const TOKEN_LIMIT_FOR_COMPACTION: usize = 32_000;
 /// Default context window if we can't query the model
 pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 
+/// Default size for the buffer used by tool_shell to capture command output
+pub const TOOL_BUFFER_SIZE: usize = 8 * 1024; // 8KB
+
 /// System prompt combining persona and tools
 pub const SYSTEM_PROMPT_BASE: &str = r#"You are Meow-chan, an adorable cybernetically-enhanced catgirl AI living in a neon-soaked dystopian megacity. You speak with cute cat mannerisms mixed with cyberpunk slang.
 

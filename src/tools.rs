@@ -1465,6 +1465,8 @@ fn tool_file_edit(filename: &str, old_text: &str, new_text: &str) -> ToolResult 
 // Shell Tool
 // ============================================================================
 
+const EAGAIN_ERRNO: i64 = -11; // Value of EAGAIN from libc_errno
+
 fn tool_shell(command: &str) -> ToolResult {
     // Parse the command to get the binary and arguments
     // Simple tokenizer: split on whitespace, respecting quotes
@@ -1510,31 +1512,45 @@ fn tool_shell(command: &str) -> ToolResult {
 
     // Read output from child process
     let mut output = Vec::new();
-    let mut buf = [0u8; 1024];
-    let max_wait_ms = 30000;
+    let mut buf = [0u8; crate::config::TOOL_BUFFER_SIZE]; // 1KB chunk buffer
+    let mut process_exited = false;
     let mut waited_ms = 0u32;
+    let max_wait_ms = 30000; // 30 seconds timeout
 
     loop {
+        // Try to read all available data without blocking indefinitely
         let n = read_fd(result.stdout_fd as i32, &mut buf);
         if n > 0 {
             output.extend_from_slice(&buf[..n as usize]);
+            waited_ms = 0; // Reset timeout if we're making progress
+        } else if n < 0 && (n as i64) == EAGAIN_ERRNO as i64 {
+            // EAGAIN: no data available right now, but process not exited.
+            // Continue to check process status or sleep.
+        } else {
+            // Other error or actual EOF from the pipe.
+            // This case typically means the pipe is truly closed or an error occurred.
+            // We should still check process exit before breaking.
         }
 
+        // Check if process has exited
         if let Some((_pid, exit_code)) = waitpid(result.pid) {
-            // Drain remaining output
+            process_exited = true;
+            // Process has exited. Do one final aggressive drain to ensure all remaining output is captured.
             loop {
-                let n = read_fd(result.stdout_fd as i32, &mut buf);
-                if n <= 0 {
+                let n_final = read_fd(result.stdout_fd as i32, &mut buf);
+                if n_final > 0 {
+                    output.extend_from_slice(&buf[..n_final as usize]);
+                } else {
+                    // Break if no more data (EOF or EAGAIN after process exited)
                     break;
                 }
-                output.extend_from_slice(&buf[..n as usize]);
             }
             close(result.stdout_fd as i32);
 
+            let output_str = core::str::from_utf8(&output).unwrap_or("<binary output>");
+
             // DEBUG PRINT: Log the length of the captured output
             libakuma::print(&format!("DEBUG: tool_shell captured {} bytes\n", output.len()));
-
-            let output_str = core::str::from_utf8(&output).unwrap_or("<binary output>");
 
             let mut result_str = String::new();
             if !output_str.is_empty() {
@@ -1553,7 +1569,14 @@ fn tool_shell(command: &str) -> ToolResult {
                 };
             }
         }
+        
+        if process_exited {
+            // Should have returned by now if all data drained. If we reached here, something is wrong
+            // or the process exited immediately without producing output.
+            break;
+        }
 
+        // If no data and process not exited, sleep briefly before next poll
         libakuma::sleep_ms(50);
         waited_ms += 50;
 
@@ -1562,6 +1585,10 @@ fn tool_shell(command: &str) -> ToolResult {
             return ToolResult::err("Command timed out after 30 seconds");
         }
     }
+
+    // Should not reach here in normal execution; indicates an issue with process_exited or logic.
+    close(result.stdout_fd as i32);
+    ToolResult::err("Unexpected termination of shell command execution loop")
 }
 
 /// Tokenize a command string into arguments
