@@ -220,7 +220,8 @@ fn list_openai_models(provider: &Provider) -> Result<Vec<ModelInfo>, ProviderErr
             libakuma_tls::Error::HttpError(msg) if msg.contains("401") => {
                 ProviderError::RequestFailed(String::from("Unauthorized - check API key"))
             }
-            _ => ProviderError::RequestFailed(format!("{:?}", e)),
+            _ => ProviderError::RequestFailed(String::from("TLS/HTTP request failed")),
+
         })?;
 
     let body = core::str::from_utf8(&response)

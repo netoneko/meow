@@ -413,6 +413,7 @@ pub fn handle_command(
                     *model = String::from(new_model);
                     config.current_model = String::from(new_model);
                     let _ = config.save();
+                    tui_app::set_model_and_provider(&model, &provider.name);
                     (CommandResult::Continue, Some(format!("～ *ears twitch* Neural link reconfigured to: {} nya~!", new_model)))
                 }
                 None => {
@@ -446,6 +447,7 @@ pub fn handle_command(
                         *provider = p.clone();
                         config.current_provider = String::from(prov_name);
                         let _ = config.save();
+                        tui_app::set_model_and_provider(&model, &provider.name);
                         (CommandResult::Continue, Some(format!("～ *ears twitch* Switched to provider: {} nya~!", prov_name)))
                     } else {
                         (CommandResult::Continue, Some(format!("～ Unknown provider: {} ...Run 'meow init' to add it nya~", prov_name)))
