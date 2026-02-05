@@ -1161,7 +1161,6 @@ fn read_streaming_with_http_stream_tls(
                                 if !first_token_received {
                                     first_token_received = true;
                                     let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
-                                    // Print timing on new line (dots were printed on same line)
                                     print(" ");
                                     print_elapsed(elapsed_ms);
                                     print("\n");
@@ -1349,11 +1348,17 @@ fn read_streaming_response_with_progress(
                                     if !first_token_received {
                                         first_token_received = true;
                                         let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
-                                        for _ in 0..(7 + dots_printed) {
-                                            print("\x08 \x08");
+                                        if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+                                            print(" ");
+                                            print_elapsed(elapsed_ms);
+                                            print("\n");
+                                        } else {
+                                            for _ in 0..(7 + dots_printed) {
+                                                print("\x08 \x08");
+                                            }
+                                            print_elapsed(elapsed_ms);
+                                            print("\n");
                                         }
-                                        print_elapsed(elapsed_ms);
-                                        print("\n");
                                     }
                                     print(&content);
                                     full_response.push_str(&content);
@@ -1422,11 +1427,17 @@ fn read_streaming_response_with_progress(
                                 if !first_token_received {
                                     first_token_received = true;
                                     let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
-                                    for _ in 0..(7 + dots_printed) {
-                                        print("\x08 \x08");
+                                    if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+                                        print(" ");
+                                        print_elapsed(elapsed_ms);
+                                        print("\n");
+                                    } else {
+                                        for _ in 0..(7 + dots_printed) {
+                                            print("\x08 \x08");
+                                        }
+                                        print_elapsed(elapsed_ms);
+                                        print("\n");
                                     }
-                                    print_elapsed(elapsed_ms);
-                                    print("\n");
                                 }
                                 print(&content);
 

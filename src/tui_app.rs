@@ -72,9 +72,7 @@ pub fn tui_print(s: &str) {
     let mut stdout = Stdout;
     
     let w = TERM_WIDTH.load(Ordering::SeqCst);
-    let h = TERM_HEIGHT.load(Ordering::SeqCst);
     let mut col = CUR_COL.load(Ordering::SeqCst);
-    let input_len = INPUT_LEN.load(Ordering::SeqCst);
 
     // AI is currently at some position in the scroll area.
     // Restore that position before printing.
@@ -84,6 +82,11 @@ pub fn tui_print(s: &str) {
         if c == '\n' {
             let _ = write!(stdout, "\n         "); // 9 spaces indent on wrap/newline
             col = 9;
+        } else if c == '\x08' { // Backspace
+            if col > 9 { // Don't backspace into indentation
+                col -= 1;
+                let _ = akuma_write(fd::STDOUT, b"\x08");
+            }
         } else {
             if col >= w - 1 {
                 let _ = write!(stdout, "\n         ");
@@ -100,8 +103,10 @@ pub fn tui_print(s: &str) {
     // Save current AI position (for next token)
     let _ = write!(stdout, "{}", SAVE_CURSOR);
     
-    // Move to prompt window (Row h, col 3 + input_len)
-    set_cursor_position((3 + input_len) as u64, (h - 1) as u64);
+    // Move to prompt window
+    let h = TERM_HEIGHT.load(Ordering::SeqCst);
+    let input_pos = INPUT_LEN.load(Ordering::SeqCst);
+    set_cursor_position(input_pos as u64, (h - 1) as u64);
 }
 
 pub struct App {
@@ -122,33 +127,51 @@ impl App {
     }
 
     /// Renders the fixed bottom footer (separator, status, prompt).
-    pub fn render_footer(&self, token_info: &str) {
+    pub fn render_footer(&self, current_tokens: usize, token_limit: usize, mem_kb: usize) {
         let mut stdout = Stdout;
         let h = self.terminal_height as u64;
         let w = self.terminal_width as usize;
 
+        // Format metrics
+        let token_display = if current_tokens >= 1000 {
+            format!("{}k", current_tokens / 1000)
+        } else {
+            format!("{}", current_tokens)
+        };
+        let limit_display = format!("{}k", token_limit / 1000);
+        let mem_display = if mem_kb >= 1024 {
+            format!("{}M", mem_kb / 1024)
+        } else {
+            format!("{}K", mem_kb)
+        };
+
+        // Construct prompt string
+        let prompt_prefix = format!("[{}/{}|{}] (=^･ω･^=) > ", 
+            token_display, limit_display, mem_display);
+        
         // Update global input len for tui_print
-        INPUT_LEN.store(self.input.chars().count() as u16, Ordering::SeqCst);
+        // We need the ACTUAL col position where the user is typing
+        let prompt_width = prompt_prefix.chars().count();
+        INPUT_LEN.store((prompt_width + self.input.chars().count()) as u16, Ordering::SeqCst);
 
         // Hide cursor during footer render to prevent flickering
         hide_cursor();
 
-        // 1. Draw Separator (at Row h-2)
+        // 1. Draw Separator (at Row h-2) - use heavy line ━
         set_cursor_position(0, h - 3);
-        let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, "─".repeat(w), COLOR_RESET);
+        let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, "━".repeat(w), COLOR_RESET);
 
-        // 2. Draw Status Bar (at Row h-1)
+        // 2. Draw Status Bar (Row h-1) - now empty as info is in prompt
         set_cursor_position(0, h - 2);
         let _ = write!(stdout, "{}", CLEAR_TO_EOL);
-        let _ = write!(stdout, " {}{}{}", COLOR_YELLOW, token_info, COLOR_RESET);
 
-        // 3. Draw Prompt (at Row h, matching mockup padding " > ")
+        // 3. Draw Prompt (at Row h)
         set_cursor_position(0, h - 1);
         let _ = write!(stdout, "{}", CLEAR_TO_EOL);
-        let _ = write!(stdout, " {}> {}{}{}", COLOR_BOLD, COLOR_USER, self.input, COLOR_RESET);
+        let _ = write!(stdout, "{}{}{}{}{}", COLOR_YELLOW, prompt_prefix, COLOR_RESET, COLOR_USER, self.input);
 
         // 4. Position Cursor at end of input
-        set_cursor_position((3 + self.input.chars().count()) as u64, h - 1);
+        set_cursor_position((prompt_width + self.input.chars().count()) as u64, h - 1);
         show_cursor();
     }
 }
@@ -216,10 +239,8 @@ pub fn run_tui(
     loop {
         let current_tokens = crate::calculate_history_tokens(&app.history);
         let mem_kb = libakuma::memory_usage() / 1024;
-        let token_info = format!("[ TOKENS: {} / {}k ] [ MEM: {}k ]", 
-            current_tokens, context_window / 1000, mem_kb);
 
-        app.render_footer(&token_info);
+        app.render_footer(current_tokens, context_window, mem_kb);
 
         let mut event_buf = [0u8; 16];
         let bytes_read = poll_input_event(u64::MAX, &mut event_buf);
@@ -238,7 +259,7 @@ pub fn run_tui(
                         app.input.clear();
                         
                         // Redraw footer IMMEDIATELY to clear input box while AI is thinking/streaming
-                        app.render_footer(&token_info);
+                        app.render_footer(current_tokens, context_window, mem_kb);
                         
                         // 1. Move to scroll area and print user message
                         // We move to h-4 (bottom of scroll region)
