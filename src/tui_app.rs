@@ -311,6 +311,7 @@ pub enum InputEvent {
     CtrlW,
     CtrlL,
     Esc,
+    Interrupt,
     Unknown,
 }
 
@@ -319,6 +320,7 @@ fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
     if buf.is_empty() { return (InputEvent::Unknown, 0); }
     
     match buf[0] {
+        0x03 => (InputEvent::Interrupt, 1), // Ctrl+C
         0x0D => {
             if buf.len() >= 2 && buf[1] == 0x0A {
                 return (InputEvent::ShiftEnter, 2);
@@ -330,10 +332,10 @@ fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
             if buf.len() == 1 {
                 let now = libakuma::uptime();
                 unsafe {
-                    if now.saturating_sub(LAST_INPUT_TIME) > 50000 { // 50ms timeout
+                    if now.saturating_sub(LAST_INPUT_TIME) > 50000 {
                         return (InputEvent::Esc, 1);
                     } else {
-                        return (InputEvent::Unknown, 0); // Wait for more data
+                        return (InputEvent::Unknown, 0); 
                     }
                 }
             }
@@ -348,8 +350,14 @@ fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
                         match c {
                             b'A' => return (InputEvent::Up, len),
                             b'B' => return (InputEvent::Down, len),
-                            b'C' => return (InputEvent::Right, len),
-                            b'D' => return (InputEvent::Left, len),
+                            b'C' => {
+                                if seq == b"1;3" { return (InputEvent::AltRight, len); }
+                                return (InputEvent::Right, len);
+                            }
+                            b'D' => {
+                                if seq == b"1;3" { return (InputEvent::AltLeft, len); }
+                                return (InputEvent::Left, len);
+                            }
                             b'H' => return (InputEvent::Home, len),
                             b'F' => return (InputEvent::End, len),
                             b'~' => {
@@ -587,8 +595,8 @@ fn handle_input_event(
             set_scroll_region(1, nh - FOOTER_HEIGHT.load(Ordering::SeqCst));
             *redraw = true;
         }
-        InputEvent::Esc => {
-            if exit_on_escape { *quit = true; }
+        InputEvent::Esc | InputEvent::Interrupt => {
+            if exit_on_escape || event == InputEvent::Interrupt { *quit = true; }
             else { CANCELLED.store(true, Ordering::SeqCst); }
         }
         _ => {}
@@ -662,7 +670,18 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let display_prompt_lines = core::cmp::min(wrapped_lines, max_prompt_lines);
     let total_footer_height = (display_prompt_lines + 2) as u16; 
     let old_footer_height = FOOTER_HEIGHT.swap(total_footer_height, Ordering::SeqCst);
-    if total_footer_height != old_footer_height { set_scroll_region(1, (h as u16) - total_footer_height); }
+    
+    if total_footer_height != old_footer_height {
+        set_scroll_region(1, (h as u16) - total_footer_height);
+        // If footer is growing, we might need to adjust CUR_ROW to avoid overwrite
+        let mut cur_row = CUR_ROW.load(Ordering::SeqCst);
+        if cur_row > h as u16 - (total_footer_height + 1) {
+            let diff = cur_row - (h as u16 - (total_footer_height + 1));
+            // Print newlines to push content up
+            for _ in 0..diff { let _ = write!(stdout, "\n"); }
+            CUR_ROW.store(h as u16 - (total_footer_height + 1), Ordering::SeqCst);
+        }
+    }
 
     let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
     let (_cx_abs, cy_off_abs) = calculate_input_cursor(input, idx, prompt_prefix_len, w);
@@ -818,7 +837,6 @@ pub fn run_tui(
             app.render_footer(current_tokens, context_window, mem_kb);
             let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
             let row = (app.terminal_height - (f_h + 1)) as u64; 
-            set_cursor_position(0, row);
             let mut stdout = Stdout;
             let _ = write!(stdout, "\n {}> {}{}{}\n", COLOR_VIOLET, COLOR_BOLD, user_input, COLOR_RESET);
             if user_input.starts_with('/') {
