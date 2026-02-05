@@ -2,7 +2,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use libakuma::{
     get_terminal_attributes, set_terminal_attributes, 
@@ -11,13 +11,32 @@ use libakuma::{
     open, close, read_fd, open_flags
 };
 
-use crate::config::{Provider, Config, COLOR_USER, COLOR_MEOW, COLOR_GRAY_DIM, COLOR_GRAY_BRIGHT, COLOR_GREEN, COLOR_YELLOW, COLOR_RESET, COLOR_BOLD};
+use crate::config::{Provider, Config, COLOR_USER, COLOR_MEOW, COLOR_GRAY_DIM, COLOR_GRAY_BRIGHT, COLOR_YELLOW, COLOR_RESET, COLOR_BOLD};
 use crate::{Message, CommandResult};
 
 // ANSI escapes
-const SAVE_CURSOR: &str = "\x1b[s";
-const RESTORE_CURSOR: &str = "\x1b[u";
+pub const SAVE_CURSOR: &str = "\x1b[s";
+pub const RESTORE_CURSOR: &str = "\x1b[u";
 const CLEAR_TO_EOL: &str = "\x1b[K";
+
+pub static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub static TERM_WIDTH: AtomicU16 = AtomicU16::new(100);
+pub static TERM_HEIGHT: AtomicU16 = AtomicU16::new(25);
+pub static CUR_COL: AtomicU16 = AtomicU16::new(0);
+pub static INPUT_LEN: AtomicU16 = AtomicU16::new(0);
+
+struct TuiGuard;
+impl TuiGuard {
+    fn new() -> Self {
+        TUI_ACTIVE.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+impl Drop for TuiGuard {
+    fn drop(&mut self) {
+        TUI_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
 
 pub mod mode_flags {
     pub const RAW_MODE_ENABLE: u64 = 0x01;
@@ -30,6 +49,44 @@ impl Write for Stdout {
         akuma_write(fd::STDOUT, s.as_bytes());
         Ok(())
     }
+}
+
+/// TUI-aware print function that handles wrapping, indentation, and cursor management.
+pub fn tui_print(s: &str) {
+    if s.is_empty() { return; }
+    let mut stdout = Stdout;
+    
+    let w = TERM_WIDTH.load(Ordering::SeqCst);
+    let h = TERM_HEIGHT.load(Ordering::SeqCst);
+    let mut col = CUR_COL.load(Ordering::SeqCst);
+    let input_len = INPUT_LEN.load(Ordering::SeqCst);
+
+    // AI is currently at some position in the scroll area.
+    // Restore that position before printing.
+    let _ = write!(stdout, "{}", RESTORE_CURSOR);
+    
+    for c in s.chars() {
+        if c == '\n' {
+            let _ = write!(stdout, "\n         "); // 9 spaces indent on wrap/newline
+            col = 9;
+        } else {
+            if col >= w - 1 {
+                let _ = write!(stdout, "\n         ");
+                col = 9;
+            }
+            let mut buf = [0u8; 4];
+            let s_char = c.encode_utf8(&mut buf);
+            let _ = akuma_write(fd::STDOUT, s_char.as_bytes());
+            col += 1;
+        }
+    }
+    CUR_COL.store(col, Ordering::SeqCst);
+
+    // Save current AI position (for next token)
+    let _ = write!(stdout, "{}", SAVE_CURSOR);
+    
+    // Move to prompt window (Row h, col 3 + input_len)
+    set_cursor_position((3 + input_len) as u64, (h - 1) as u64);
 }
 
 pub struct App {
@@ -55,22 +112,29 @@ impl App {
         let h = self.terminal_height as u64;
         let w = self.terminal_width as usize;
 
-        // 1. Draw Separator
+        // Update global input len for tui_print
+        INPUT_LEN.store(self.input.chars().count() as u16, Ordering::SeqCst);
+
+        // Hide cursor during footer render to prevent flickering
+        hide_cursor();
+
+        // 1. Draw Separator (at Row h-2)
         set_cursor_position(0, h - 3);
         let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, "─".repeat(w), COLOR_RESET);
 
-        // 2. Draw Status Bar
+        // 2. Draw Status Bar (at Row h-1)
         set_cursor_position(0, h - 2);
         let _ = write!(stdout, "{}", CLEAR_TO_EOL);
         let _ = write!(stdout, " {}{}{}", COLOR_YELLOW, token_info, COLOR_RESET);
 
-        // 3. Draw Prompt
+        // 3. Draw Prompt (at Row h, matching mockup padding " > ")
         set_cursor_position(0, h - 1);
         let _ = write!(stdout, "{}", CLEAR_TO_EOL);
-        let _ = write!(stdout, "{}> {}{}{}", COLOR_BOLD, COLOR_USER, self.input, COLOR_RESET);
+        let _ = write!(stdout, " {}> {}{}{}", COLOR_BOLD, COLOR_USER, self.input, COLOR_RESET);
 
         // 4. Position Cursor at end of input
-        set_cursor_position((2 + self.input.len()) as u64, h - 1);
+        set_cursor_position((3 + self.input.chars().count()) as u64, h - 1);
+        show_cursor();
     }
 }
 
@@ -127,6 +191,7 @@ pub fn run_tui(
     context_window: usize,
     system_prompt: &str
 ) -> Result<(), &'static str> {
+    let _guard = TuiGuard::new();
     let mut old_mode_flags: u64 = 0;
     get_terminal_attributes(fd::STDIN, &mut old_mode_flags as *mut u64 as u64);
     set_terminal_attributes(fd::STDIN, 0, mode_flags::RAW_MODE_ENABLE);
@@ -135,9 +200,12 @@ pub fn run_tui(
     app.history = history.clone();
     let (w, h) = probe_terminal_size();
     app.terminal_width = w; app.terminal_height = h;
+    TERM_WIDTH.store(w, Ordering::SeqCst);
+    TERM_HEIGHT.store(h, Ordering::SeqCst);
     
     clear_screen();
     print_greeting();
+    // Scroll region ends at h-3 to leave room for 3-line footer
     set_scroll_region(1, h - 3);
 
     loop {
@@ -164,15 +232,20 @@ pub fn run_tui(
                         let user_input = app.input.clone();
                         app.input.clear();
                         
+                        // Redraw footer IMMEDIATELY to clear input box while AI is thinking/streaming
+                        app.render_footer(&token_info);
+                        
                         // 1. Move to scroll area and print user message
+                        // We move to h-4 (bottom of scroll region)
                         set_cursor_position(0, (app.terminal_height - 4) as u64);
-                        let _ = write!(stdout, "\n{}> {}{}{}\n", COLOR_USER, COLOR_BOLD, user_input, COLOR_RESET);
+                        let _ = write!(stdout, "\n {}> {}{}{}\n", COLOR_USER, COLOR_BOLD, user_input, COLOR_RESET);
+                        CUR_COL.store(0, Ordering::SeqCst);
                         
                         if user_input.starts_with('/') {
                             // 2. Handle Command
                             let (res, output) = crate::handle_command(&user_input, model, provider, config, history, system_prompt);
                             if let Some(out) = output {
-                                let _ = write!(stdout, "{}{}{}\n\n", COLOR_GRAY_BRIGHT, out, COLOR_RESET);
+                                let _ = write!(stdout, "  {}{}{}\n\n", COLOR_GRAY_BRIGHT, out, COLOR_RESET);
                                 app.history.push(Message::new("system", &out));
                             }
                             if let CommandResult::Quit = res { break; }
@@ -182,8 +255,11 @@ pub fn run_tui(
                             history.clear();
                             history.extend(app.history.iter().cloned());
 
-                            let _ = write!(stdout, "{}[MEOW] {}", COLOR_MEOW, COLOR_RESET);
+                            // 2 spaces prefix for [MEOW]
+                            let _ = write!(stdout, "  {}[MEOW] {}", COLOR_MEOW, COLOR_RESET);
                             let _ = write!(stdout, "{}", COLOR_MEOW);
+                            CUR_COL.store(9, Ordering::SeqCst); // "  [MEOW] " is 9 chars
+                            let _ = write!(stdout, "{}", SAVE_CURSOR);
                             
                             // Note: chat_once will stream to current position (in scroll area)
                             let _ = crate::chat_once(model, provider, &user_input, history, Some(context_window), system_prompt);
@@ -200,6 +276,8 @@ pub fn run_tui(
                 12 => { // Ctrl-L: Re-probe
                     let (nw, nh) = probe_terminal_size();
                     app.terminal_width = nw; app.terminal_height = nh;
+                    TERM_WIDTH.store(nw, Ordering::SeqCst);
+                    TERM_HEIGHT.store(nh, Ordering::SeqCst);
                     clear_screen();
                     print_greeting();
                     set_scroll_region(1, nh - 3);

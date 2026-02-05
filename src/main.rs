@@ -34,8 +34,18 @@ use alloc::vec::Vec;
 
 use config::{ApiType, Config, Provider, TOKEN_LIMIT_FOR_COMPACTION, DEFAULT_CONTEXT_WINDOW, SYSTEM_PROMPT_BASE};
 use libakuma::net::{resolve, TcpStream};
-use libakuma::{arg, argc, exit, fd, print, read};
+use libakuma::{arg, argc, exit, fd, read};
 use libakuma_tls::{HttpHeaders, HttpStreamTls, StreamResult, TLS_RECORD_SIZE};
+use core::sync::atomic::Ordering;
+
+/// Print a string to stdout, with TUI-aware wrapping if active
+fn print(s: &str) {
+    if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+        tui_app::tui_print(s);
+    } else {
+        libakuma::print(s);
+    }
+}
 
 // Chainlink issue tracker tools section (appended when chainlink is available)
 const CHAINLINK_TOOLS_SECTION: &str = r#"
