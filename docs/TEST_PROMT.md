@@ -61,3 +61,11 @@ can you read this document https://raw.githubusercontent.com/netoneko/akuma/refs
 ```text
 can you add docs/ to git, commit and push
 ```
+
+## build mode promt
+
+checking against `ollama/command-r:35b`
+
+```text
+examine your codebase and create a proposal for separating planning mode and build mode, focus on refining the plan mode process and user expirience, document it in docs/PLANNING_MODE_PROPOSAL.md - inspect chainlink task tracker integration to manage some of the requirements of planning mode which needs to produce a list of task that might depend on one another to complete user's request, do not forget to read MEOW.md and docs/TOOLS.md to understand what we are building here. use tools.
+```

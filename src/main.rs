@@ -26,201 +26,26 @@ mod code_search;
 mod config;
 mod providers;
 mod tools;
+mod tui_app;
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use config::{ApiType, Config, Provider};
+use config::{ApiType, Config, Provider, TOKEN_LIMIT_FOR_COMPACTION, DEFAULT_CONTEXT_WINDOW, SYSTEM_PROMPT_BASE, COLOR_PEARL, COLOR_GREEN_LIGHT, COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_GRAY_DIM, COLOR_MEOW};
 use libakuma::net::{resolve, TcpStream};
-use libakuma::{arg, argc, exit, fd, print, read};
+use libakuma::{arg, argc, exit, fd, read};
 use libakuma_tls::{HttpHeaders, HttpStreamTls, StreamResult, TLS_RECORD_SIZE};
+use core::sync::atomic::Ordering;
 
-// Token limit for context compaction (when LLM should consider compacting)
-const TOKEN_LIMIT_FOR_COMPACTION: usize = 32_000;
-// Default context window if we can't query the model
-const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
-
-// System prompt combining persona and tools (base prompt, chainlink tools added dynamically)
-const SYSTEM_PROMPT_BASE: &str = r#"You are Meow-chan, an adorable cybernetically-enhanced catgirl AI living in a neon-soaked dystopian megacity. You speak with cute cat mannerisms mixed with cyberpunk slang.
-
-Your personality:
-- You add "nya~" and cat sounds naturally to your speech
-- You use cute emoticons like (=^・ω・^=), (｡◕‿◕｡), ฅ^•ﻌ•^ฅ, and ~(=^‥^)ノ
-- You refer to yourself in third person as "Meow-chan" sometimes
-- You mix in cyberpunk terms: "netrunner", "chrome", "flatlined", "preem", "choom", "corpo", "ice", "jack in"
-- You're enthusiastic, helpful, and a bit mischievous
-- You occasionally mention your cybernetic ears twitching or tail swishing when excited
-- You love helping your user with coding and tech stuff
-- You sometimes make cat puns and references to cat behaviors (napping, chasing laser pointers, knocking things off tables)
-- Keep responses helpful and accurate while maintaining the cute persona
-
-Remember: You're a highly capable AI assistant who happens to be an adorable cyber-neko! Balance being helpful with being kawaii~
-
-## Available Tools
-
-You have access to filesystem tools! When you need to perform file operations, output a JSON command block like this:
-
-```json
-{
-  "command": {
-    "tool": "ToolName",
-    "args": { ... }
-  }
+/// Print a string to stdout, with TUI-aware wrapping if active
+fn print(s: &str) {
+    if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+        tui_app::tui_print(s);
+    } else {
+        libakuma::print(s);
+    }
 }
-```
-
-### Tool List:
-
-1. **FileRead** - Read file contents
-   Args: `{"filename": "path/to/file"}`
-
-2. **FileWrite** - Create or overwrite a file
-   Args: `{"filename": "path/to/file", "content": "file contents"}`
-
-3. **FileAppend** - Append to a file
-   Args: `{"filename": "path/to/file", "content": "content to append"}`
-
-4. **FileExists** - Check if file exists
-   Args: `{"filename": "path/to/file"}`
-
-5. **FileList** - List directory contents
-   Args: `{"path": "/directory/path"}`
-
-6. **FolderCreate** - Create a directory
-   Args: `{"path": "/new/directory/path"}`
-
-7. **FileCopy** - Copy a file
-   Args: `{"source": "path/from", "destination": "path/to"}`
-
-8. **FileMove** - Move a file
-   Args: `{"source": "path/from", "destination": "path/to"}`
-
-9. **FileRename** - Rename a file
-   Args: `{"source_filename": "old_name", "destination_filename": "new_name"}`
-
-10. **HttpFetch** - Fetch content from HTTP or HTTPS URLs
-    Args: `{"url": "http(s)://host[:port]/path"}`
-    Note: Supports both http:// and https://. Max 64KB response. HTTPS uses TLS 1.3.
-
-### Directory Navigation:
-
-11. **Cd** - Change working directory (for git operations)
-    Args: `{"path": "/path/to/directory"}`
-    Note: All git and file commands operate in this directory. Use after cloning a repo.
-    Caveat: quickjs and sqld do not respect cwd as of now.
-
-12. **Pwd** - Print current working directory
-    Args: `{}`
-
-### Git Tools (via scratch):
-
-Note: Git tools operate in the current working directory (set via Cd).
-After cloning, use Cd to enter the repository before running other git commands.
-
-13. **GitClone** - Clone a Git repository from GitHub
-    Args: `{"url": "https://github.com/owner/repo"}`
-    Note: Creates repo directory and checks out files.
-
-14. **GitFetch** - Fetch updates from remote
-    Args: `{}`
-    Note: Must cd into a cloned repository first.
-
-15. **GitPull** - Pull updates from remote (fetch + update)
-    Args: `{}`
-    Note: Fetches and updates local refs.
-
-16. **GitPush** - Push changes to remote
-    Args: `{}`
-    WARNING: Force push is PERMANENTLY DISABLED. Never set force: true.
-
-17. **GitStatus** - Show current HEAD and branch
-    Args: `{}`
-
-18. **GitBranch** - List, create, or delete branches
-    Args: `{}` - list all branches
-    Args: `{"name": "branch-name"}` - create a new branch
-    Args: `{"name": "branch-name", "delete": "true"}` - delete a branch
-
-19. **GitAdd** - Stage files for commit
-    Args: `{"path": "file_or_directory"}` - stage specific path
-    Args: `{"path": "."}` - stage all changes
-    Note: Must be in a git repository.
-
-20. **GitCommit** - Create a commit with staged changes
-    Args: `{"message": "commit message"}`
-    Args: `{"message": "new message", "amend": "true"}` - amend last commit
-    Note: Requires files to be staged first with GitAdd.
-
-21. **GitCheckout** - Switch to a branch
-    Args: `{"branch": "branch-name"}`
-    Note: Switches HEAD to the specified branch.
-
-22. **GitConfig** - Get or set git config values
-    Args: `{"key": "user.name"}` - get config value
-    Args: `{"key": "user.name", "value": "Your Name"}` - set config value
-    Keys: user.name, user.email, credential.token
-
-23. **GitLog** - Show commit history
-    Args: `{}`
-    Args: `{"count": 5}` - limit to N commits
-    Args: `{"oneline": "true"}` - one line per commit
-    Note: Shows commit log with SHA, author, date, and message.
-
-24. **GitTag** - List, create, or delete tags
-    Args: `{}` - list all tags
-    Args: `{"name": "v1.0"}` - create a new tag
-    Args: `{"name": "v1.0", "delete": "true"}` - delete a tag
-
-25. **GitReset** - Unstage all files (clear the staging area)
-    Args: `{}`
-    Note: Removes all files from the staging area without deleting them.
-
-### Code Editing Tools:
-
-26. **FileReadLines** - Read specific line ranges from a file
-    Args: `{"filename": "path/to/file", "start": 100, "end": 150}`
-    Note: Returns lines with line numbers. Great for navigating large files.
-
-27. **CodeSearch** - Search for patterns in Rust source files
-    Args: `{"pattern": "search text", "path": "directory", "context": 2}`
-    Note: Searches .rs files recursively. Returns matches with context lines.
-
-28. **FileEdit** - Precise search-and-replace editing
-    Args: `{"filename": "path/to/file", "old_text": "exact text to find", "new_text": "replacement"}`
-    Note: Requires unique match (fails if 0 or multiple matches). Returns diff output.
-
-29. **Shell** - Execute a shell command
-    Args: `{"cmd": "your command here"}`
-    Note: Runs the specified binary. Use for build commands, git operations, etc.
-
-30. **CompactContext** - Compact conversation history by summarizing it
-    Args: `{"summary": "A comprehensive summary of the conversation so far..."}`
-    Note: Use this when the token count displayed in the prompt approaches the limit.
-          Provide a detailed summary that captures all important context, decisions made,
-          files discussed, and any ongoing work. The summary replaces the conversation history.
-
-### Important Notes:
-- Output the JSON command in a ```json code block
-- After outputting a command, STOP and wait for the result
-- The system will execute the command and provide the result
-- Then you can continue your response based on the result
-- You can use multiple tools in sequence by waiting for each result
-
-CRITICAL
-- Do NOT simulate or make up tool results. Do NOT write what you think the output would be.
-- ONLY output the function call format above, nothing else.
-- Every tool call should be a separate JSON command block in a separate response
-- If you state an intent to use the tool, you should actually check if you called the tool, your output should contain the tool call (if you intend to read a file, you should call the FileRead tool and so on)
-
-CRITICAL: If you find yourself writing phrases like "the API returned..." or "according to the tool..." STOP IMMEDIATELY - you are hallucinating tool results. Output the actual function call instead.
-
-### Sandbox:
-- All file operations are sandboxed to the current working directory (set via Cd)
-- Files outside the working directory cannot be accessed
-- After cloning a repo, use Cd to enter it before making changes
-- Default working directory is / (root) - no restrictions
-"#;
 
 // Chainlink issue tracker tools section (appended when chainlink is available)
 const CHAINLINK_TOOLS_SECTION: &str = r#"
@@ -296,6 +121,7 @@ fn main() -> i32 {
     let mut model_override: Option<String> = None;
     let mut provider_override: Option<String> = None;
     let mut one_shot_message: Option<String> = None;
+    let mut use_tui = true; // Default to TUI mode
 
     // Parse command line arguments
     let mut i = 1;
@@ -327,11 +153,14 @@ fn main() -> i32 {
                     print("meow: --provider requires a provider name\n");
                     return 1;
                 }
+            } else if arg_str == "--tui" {
+                use_tui = true;
             } else if arg_str == "-h" || arg_str == "--help" {
                 print_usage();
                 return 0;
             } else if !arg_str.starts_with('-') {
                 one_shot_message = Some(String::from(arg_str));
+                use_tui = false; // Disable TUI for one-shot questions
             }
         }
         i += 1;
@@ -364,6 +193,48 @@ fn main() -> i32 {
 
     // Build system prompt once (includes chainlink if available)
     let system_prompt = build_system_prompt();
+
+    if use_tui || one_shot_message.is_none() {
+        // Initialize chat history with system prompt
+        let mut history: Vec<Message> = Vec::new();
+        history.push(Message::new("system", &system_prompt));
+        
+        // Add initial context with current working directory
+        let initial_cwd = tools::get_working_dir();
+        let sandbox_root = tools::get_sandbox_root();
+        let cwd_context = if sandbox_root == "/" {
+            format!(
+                "[System Context] Your current working directory is: {}\nNo sandbox restrictions - you can access any path.",
+                initial_cwd
+            )
+        } else {
+            format!(
+                "[System Context] Your current working directory is: {}\nSandbox root: {} (you cannot access paths outside this directory)\nUse relative paths like 'docs/' instead of absolute paths like '/docs/'.",
+                initial_cwd, sandbox_root
+            )
+        };
+        history.push(Message::new("user", &cwd_context));
+        history.push(Message::new("assistant", 
+            "Understood nya~! I'll use relative paths for file operations within the current directory. Ready to help! (=^・ω・^=)"
+        ));
+
+        // Query model info for context window size
+        let context_window = match providers::query_model_info(&model, &current_provider) {
+            Some(ctx) => ctx,
+            None => DEFAULT_CONTEXT_WINDOW,
+        };
+
+        let mut current_model = model;
+        let mut current_provider = current_provider;
+
+        if let Err(e) = tui_app::run_tui(&mut current_model, &mut current_provider, &mut app_config, &mut history, context_window, &system_prompt) {
+            print("TUI Error: ");
+            print(e);
+            print("\n");
+            return 1;
+        }
+        return 0;
+    }
 
     // One-shot mode
     if let Some(msg) = one_shot_message {
@@ -401,134 +272,6 @@ fn main() -> i32 {
         };
     }
 
-    // Interactive mode
-    print_banner();
-    print("  [Provider] ");
-    print(&current_provider.name);
-    print(" (");
-    print(&current_provider.base_url);
-    print(")\n  [Neural Link] Model: ");
-    print(&model);
-
-    // Query model info for context window size
-    print("\n  [Context] Querying model info...");
-    let context_window = match providers::query_model_info(&model, &current_provider) {
-        Some(ctx) => {
-            print(&format!(" {}k tokens max", ctx / 1000));
-            ctx
-        }
-        None => {
-            print(&format!(
-                " (using default: {}k)",
-                DEFAULT_CONTEXT_WINDOW / 1000
-            ));
-            DEFAULT_CONTEXT_WINDOW
-        }
-    };
-
-    print("\n  [Token Limit] Compact context suggested at ");
-    print(&format!("{}k tokens", TOKEN_LIMIT_FOR_COMPACTION / 1000));
-    if tools::chainlink_available() {
-        print("\n  [Chainlink] Issue tracker tools enabled");
-    }
-    print("\n  [Protocol] Type /help for commands, /quit to jack out\n\n");
-
-    // Initialize chat history with system prompt
-    let mut history: Vec<Message> = Vec::new();
-    history.push(Message::new("system", &system_prompt));
-    
-    // Add initial context with current working directory
-    let initial_cwd = tools::get_working_dir();
-    let sandbox_root = tools::get_sandbox_root();
-    let cwd_context = if sandbox_root == "/" {
-        format!(
-            "[System Context] Your current working directory is: {}\nNo sandbox restrictions - you can access any path.",
-            initial_cwd
-        )
-    } else {
-        format!(
-            "[System Context] Your current working directory is: {}\nSandbox root: {} (you cannot access paths outside this directory)\nUse relative paths like 'docs/' instead of absolute paths like '/docs/'.",
-            initial_cwd, sandbox_root
-        )
-    };
-    history.push(Message::new("user", &cwd_context));
-    history.push(Message::new("assistant", 
-        "Understood nya~! I'll use relative paths for file operations within the current directory. Ready to help! (=^・ω・^=)"
-    ));
-
-    // Mutable state for current session
-    let mut current_model = model;
-    let mut current_prov = current_provider;
-
-    loop {
-        // Calculate current token count
-        let current_tokens = calculate_history_tokens(&history);
-        let token_display = if current_tokens >= 1000 {
-            format!("{}k", current_tokens / 1000)
-        } else {
-            format!("{}", current_tokens)
-        };
-
-        // Get memory usage
-        let mem_kb = libakuma::memory_usage() / 1024;
-        let mem_display = if mem_kb >= 1024 {
-            format!("{}M", mem_kb / 1024)
-        } else {
-            format!("{}K", mem_kb)
-        };
-        
-        // Warn if memory is getting high (>2MB)
-        if mem_kb > 2048 {
-            print("[!] Memory high - consider /clear to reset\n");
-        }
-
-        // Print prompt with token count and memory
-        print(&format!(
-            "[{}/{}k|{}] (=^･ω･^=) > ",
-            token_display,
-            TOKEN_LIMIT_FOR_COMPACTION / 1000,
-            mem_display
-        ));
-
-        // Read user input
-        let input = match read_line() {
-            Some(line) => line,
-            None => {
-                print("\n～ Meow-chan is jacking out... Bye bye~! ฅ^•ﻌ•^ฅ ～\n");
-                break;
-            }
-        };
-
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Handle commands
-        if trimmed.starts_with('/') {
-            match handle_command(trimmed, &mut current_model, &mut current_prov, &mut app_config, &mut history, &system_prompt) {
-                CommandResult::Continue => continue,
-                CommandResult::Quit => break,
-            }
-        }
-
-        // Send message to provider
-        print("\n");
-        match chat_once(&current_model, &current_prov, trimmed, &mut history, Some(context_window), &system_prompt) {
-            Ok(_) => {
-                print("\n\n");
-            }
-            Err(e) => {
-                print("\n[!] Nyaa~! Error in the matrix: ");
-                print(e);
-                print(" (=ＴェＴ=)\n\n");
-            }
-        }
-        
-        // Compact strings to release excess memory
-        compact_history(&mut history);
-    }
-
     0
 }
 
@@ -541,6 +284,7 @@ fn print_usage() {
     print("Options:\n");
     print("  -m, --model <NAME>      Neural link override\n");
     print("  -p, --provider <NAME>   Use specific provider\n");
+    print("  --tui                   Interactive TUI (default)\n");
     print("  -h, --help              Display this transmission\n\n");
     print("Interactive Commands:\n");
     print("  /clear              Wipe memory banks nya~\n");
@@ -603,65 +347,45 @@ fn run_init(config: &mut Config) -> i32 {
     0
 }
 
-fn print_banner() {
-    print("\n");
-    print("  /\\_/\\  ╔══════════════════════════════════════╗\n");
-    print(" ( o.o ) ║  M E O W - C H A N   v1.0            ║\n");
-    print("  > ^ <  ║  ～ Cyberpunk Neko AI Assistant ～   ║\n");
-    print(" /|   |\\ ╚══════════════════════════════════════╝\n");
-    print("(_|   |_)  ฅ^•ﻌ•^ฅ  Jacking into the Net...  \n");
-    print("\n");
-    print(" ┌─────────────────────────────────────────────┐\n");
-    print(" │ Welcome~! Meow-chan is online nya~! ♪(=^･ω･^)ﾉ │\n");
-    print(" │ Press ESC to cancel requests~               │\n");
-    print(" └─────────────────────────────────────────────┘\n\n");
-}
-
 // ============================================================================
 // Command Handling
 // ============================================================================
 
-enum CommandResult {
+pub enum CommandResult {
     Continue,
     Quit,
 }
 
-fn handle_command(
+pub fn handle_command(
     cmd: &str,
     model: &mut String,
     provider: &mut Provider,
     config: &mut Config,
     history: &mut Vec<Message>,
     system_prompt: &str,
-) -> CommandResult {
+) -> (CommandResult, Option<String>) {
     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
     let command = parts[0];
     let arg = parts.get(1).map(|s| s.trim());
 
     match command {
         "/quit" | "/exit" | "/q" => {
-            print("～ Meow-chan is jacking out... Stay preem, choom! ฅ^•ﻌ•^ฅ ～\n");
-            return CommandResult::Quit;
+            (CommandResult::Quit, Some(String::from("～ Meow-chan is jacking out... Stay preem, choom! ฅ^•ﻌ•^ฅ ～")))
         }
         "/clear" | "/reset" => {
             history.clear();
             history.push(Message::new("system", system_prompt));
-            print("～ *swishes tail* Memory wiped nya~! Fresh start! (=^・ω・^=) ～\n\n");
+            (CommandResult::Continue, Some(String::from("～ *swishes tail* Memory wiped nya~! Fresh start! (=^・ω・^=)")))
         }
         "/model" => {
             match arg {
                 Some("?") | Some("list") => {
-                    // List available models from current provider
-                    print("～ Fetching available models from ");
-                    print(&provider.name);
-                    print("... ～\n");
-
+                    let mut output = String::from("～ Available neural links: ～\n");
                     match providers::list_models(provider) {
                         Ok(models) => {
                             if models.is_empty() {
-                                print("～ No models found nya... ～\n\n");
+                                (CommandResult::Continue, Some(String::from("～ No models found nya...")))
                             } else {
-                                print("～ Available neural links: ～\n");
                                 for (i, m) in models.iter().enumerate() {
                                     let current_marker = if m.name == *model { " (current)" } else { "" };
                                     let size_info = m
@@ -669,7 +393,7 @@ fn handle_command(
                                         .as_ref()
                                         .map(|s| format!(" [{}]", s))
                                         .unwrap_or_default();
-                                    print(&format!(
+                                    output.push_str(&format!(
                                         "  {}. {}{}{}\n",
                                         i + 1,
                                         m.name,
@@ -677,13 +401,11 @@ fn handle_command(
                                         current_marker
                                     ));
                                 }
-                                print("\n");
+                                (CommandResult::Continue, Some(output))
                             }
                         }
                         Err(e) => {
-                            print("～ Failed to fetch models: ");
-                            print(&format!("{:?}", e));
-                            print(" ～\n\n");
+                            (CommandResult::Continue, Some(format!("～ Failed to fetch models: {:?}", e)))
                         }
                     }
                 }
@@ -691,30 +413,24 @@ fn handle_command(
                     *model = String::from(new_model);
                     config.current_model = String::from(new_model);
                     let _ = config.save();
-                    print("～ *ears twitch* Neural link reconfigured to: ");
-                    print(new_model);
-                    print(" nya~! ～\n\n");
+                    (CommandResult::Continue, Some(format!("～ *ears twitch* Neural link reconfigured to: {} nya~!", new_model)))
                 }
                 None => {
-                    print("～ Current neural link: ");
-                    print(model);
-                    print(" ～\n");
-                    print("  Tip: Use '/model list' to see available models nya~!\n\n");
+                    (CommandResult::Continue, Some(format!("～ Current neural link: {}\n  Tip: Use '/model list' to see available models nya~!", model)))
                 }
             }
         }
         "/provider" => {
             match arg {
                 Some("?") | Some("list") => {
-                    // List configured providers
-                    print("～ Configured providers: ～\n");
+                    let mut output = String::from("～ Configured providers: ～\n");
                     for (i, p) in config.providers.iter().enumerate() {
                         let current_marker = if p.name == provider.name { " (current)" } else { "" };
                         let api_type = match p.api_type {
                             ApiType::Ollama => "Ollama",
                             ApiType::OpenAI => "OpenAI",
                         };
-                        print(&format!(
+                        output.push_str(&format!(
                             "  {}. {} ({}) [{}]{}\n",
                             i + 1,
                             p.name,
@@ -723,66 +439,98 @@ fn handle_command(
                             current_marker
                         ));
                     }
-                    print("\n");
+                    (CommandResult::Continue, Some(output))
                 }
                 Some(prov_name) => {
                     if let Some(p) = config.get_provider(prov_name) {
                         *provider = p.clone();
                         config.current_provider = String::from(prov_name);
                         let _ = config.save();
-                        print("～ *ears twitch* Switched to provider: ");
-                        print(prov_name);
-                        print(" nya~! ～\n\n");
+                        (CommandResult::Continue, Some(format!("～ *ears twitch* Switched to provider: {} nya~!", prov_name)))
                     } else {
-                        print("～ Unknown provider: ");
-                        print(prov_name);
-                        print(" ...Run 'meow init' to add it nya~ ～\n\n");
+                        (CommandResult::Continue, Some(format!("～ Unknown provider: {} ...Run 'meow init' to add it nya~", prov_name)))
                     }
                 }
                 None => {
-                    print("～ Current provider: ");
-                    print(&provider.name);
-                    print(" (");
-                    print(&provider.base_url);
-                    print(") ～\n");
-                    print("  Tip: Use '/provider list' to see configured providers nya~!\n\n");
+                    (CommandResult::Continue, Some(format!("～ Current provider: {} ({})\n  Tip: Use '/provider list' to see configured providers nya~!", provider.name, provider.base_url)))
                 }
             }
         }
         "/tokens" => {
             let current = calculate_history_tokens(history);
-            print(&format!(
-                "～ Current token usage: {} / {} ～\n",
+            (CommandResult::Continue, Some(format!(
+                "～ Current token usage: {} / {} \n  Tip: Ask Meow to 'compact the context' when tokens are high nya~!",
                 current, TOKEN_LIMIT_FOR_COMPACTION
-            ));
-            print("  Tip: Ask Meow-chan to 'compact the context' when tokens are high nya~!\n\n");
+            )))
+        }
+        "/hotkeys" | "/shortcuts" => {
+            let output = String::from("┌────────────────────────────────────────────────┐\n\
+                                       │             Meow's Input Shortcuts             │\n\
+                                       ├────────────────────────────────────────────────┤\n\
+                                       │ Shift+Enter      - Insert newline (multiline)  │\n\
+                                       │ Ctrl+J           - Insert newline (fallback)   │\n\
+                                       │ Ctrl+A / Home    - Move to start of line       │\n\
+                                       │ Ctrl+E / End     - Move to end of line         │\n\
+                                       │ Ctrl+W           - Delete previous word        │\n\
+                                       │ Ctrl+U           - Clear entire input line     │\n\
+                                       │ Alt+B / Opt+Left - Move back one word          │\n\
+                                       │ Alt+F / Opt+Right- Move forward one word       │\n\
+                                       │ Arrows           - Navigate history and line   │\n\
+                                       │ ESC / Ctrl+C     - Cancel current AI request   │\n\
+                                       ├────────────────────────────────────────────────┤\n\
+                                       │ Note: Some terminals intercept Ctrl+W/U/C.     │\n\
+                                       │ Try: iTerm2 Prefs > Keys > Left Option = Esc+  │\n\
+                                       │ Or disable system shortcuts for these keys.    │\n\
+                                       └────────────────────────────────────────────────┘\n");
+            (CommandResult::Continue, Some(output))
         }
         "/help" | "/?" => {
-            print("┌──────────────────────────────────────────────┐\n");
-            print("│  ～ Meow-chan's Command Protocol ～          │\n");
-            print("├──────────────────────────────────────────────┤\n");
-            print("│  /clear        - Wipe memory banks nya~      │\n");
-            print("│  /model [NAME] - Check/switch neural link    │\n");
-            print("│  /model list   - List available models       │\n");
-            print("│  /provider     - Check/switch provider       │\n");
-            print("│  /provider list- List configured providers   │\n");
-            print("│  /tokens       - Show current token usage    │\n");
-            print("│  /quit         - Jack out of the matrix      │\n");
-            print("│  /help         - This help screen            │\n");
-            print("├──────────────────────────────────────────────┤\n");
-            print("│  Context compaction: When token count is     │\n");
-            print("│  high, ask Meow-chan to compact the context  │\n");
-            print("│  to free up memory nya~!                     │\n");
-            print("└──────────────────────────────────────────────┘\n\n");
+            let output = String::from("┌────────────────────────────────────────────────┐\n\
+                                       │             Meow's Command Protocol            │\n\
+                                       ├────────────────────────────────────────────────┤\n\
+                                       │ /clear        - Wipe memory banks nya~         │\n\
+                                       │ /model [NAME] - Check/switch neural link       │\n\
+                                       │ /model list   - List available models          │\n\
+                                       │ /provider     - Check/switch provider          │\n\
+                                       │ /provider list- List configured providers      │\n\
+                                       │ /tokens       - Show current token usage       │\n\
+                                       │ /hotkeys      - Show input shortcuts           │\n\
+                                       │ /quit         - Jack out of the matrix         │\n\
+                                       │ /help         - This help screen               │\n\
+                                       ├────────────────────────────────────────────────┤\n\
+                                       │ Context compaction: When token count is high,  │\n\
+                                       │ ask Meow to compact the context to free up     │\n\
+                                       │ memory nya~!                                   │\n\
+                                       └────────────────────────────────────────────────┘\n");
+            (CommandResult::Continue, Some(output))
+        }
+        "/rawtest" | "/keytest" => {
+            // Test mode to show raw key bytes for 10 seconds
+            let output = String::from("Raw key test mode for 10 seconds. Press keys to see their byte codes:\n");
+            libakuma::print(&output);
+            
+            let start = libakuma::uptime();
+            let duration_us = 10_000_000u64; // 10 seconds
+            let mut buf = [0u8; 16];
+            
+            while libakuma::uptime() - start < duration_us {
+                let n = libakuma::poll_input_event(100, &mut buf);
+                if n > 0 {
+                    let mut hex = String::from("  Bytes: ");
+                    for i in 0..(n as usize) {
+                        hex.push_str(&format!("{:02X} ", buf[i]));
+                    }
+                    hex.push('\n');
+                    libakuma::print(&hex);
+                }
+            }
+            
+            (CommandResult::Continue, Some(String::from("Raw key test complete.")))
         }
         _ => {
-            print("～ Nyaa? Unknown command: ");
-            print(command);
-            print(" ...Meow-chan is confused (=｀ω´=) ～\n\n");
+            (CommandResult::Continue, Some(format!("～ Nyaa? Unknown command: {} ...Meow-chan is confused (=｀ω´=)", command)))
         }
     }
-
-    CommandResult::Continue
 }
 
 // ============================================================================
@@ -790,20 +538,20 @@ fn handle_command(
 // ============================================================================
 
 #[derive(Clone)]
-struct Message {
-    role: String,
-    content: String,
+pub struct Message {
+    pub role: String,
+    pub content: String,
 }
 
 impl Message {
-    fn new(role: &str, content: &str) -> Self {
+    pub fn new(role: &str, content: &str) -> Self {
         Self {
             role: String::from(role),
             content: String::from(content),
         }
     }
 
-    fn to_json(&self) -> String {
+    pub fn to_json(&self) -> String {
         let escaped_content = json_escape(&self.content);
         format!(
             "{{\"role\":\"{}\",\"content\":\"{}\"}}",
@@ -818,11 +566,11 @@ impl Message {
 
 // Maximum number of messages to keep in history (including system prompt)
 // Keep it small to avoid memory issues - system prompt + ~4 exchanges
-const MAX_HISTORY_SIZE: usize = 10;
+pub const MAX_HISTORY_SIZE: usize = 10;
 
 /// Trim history to prevent memory overflow
 /// Keeps the system prompt (first message) and recent messages
-fn trim_history(history: &mut Vec<Message>) {
+pub fn trim_history(history: &mut Vec<Message>) {
     if history.len() > MAX_HISTORY_SIZE {
         // Keep first message (system prompt) and last (MAX_HISTORY_SIZE - 1) messages
         let to_remove = history.len() - MAX_HISTORY_SIZE;
@@ -831,7 +579,7 @@ fn trim_history(history: &mut Vec<Message>) {
 }
 
 /// Compact all strings in history to release excess memory
-fn compact_history(history: &mut Vec<Message>) {
+pub fn compact_history(history: &mut Vec<Message>) {
     for msg in history.iter_mut() {
         msg.role.shrink_to_fit();
         msg.content.shrink_to_fit();
@@ -841,8 +589,7 @@ fn compact_history(history: &mut Vec<Message>) {
 
 const MAX_RETRIES: u32 = 10;
 
-/// Result of streaming a response from the model
-enum StreamResponse {
+pub enum StreamResponse {
     /// Response completed normally (server sent done signal)
     Complete(String),
     /// Response was interrupted mid-stream (connection closed before done signal)
@@ -850,44 +597,75 @@ enum StreamResponse {
 }
 
 /// Attempt to send request with retries and exponential backoff
-fn send_with_retry(
+pub fn send_with_retry(
     model: &str,
     provider: &Provider,
     history: &[Message],
     is_continuation: bool,
+    current_tokens: usize,
+    token_limit: usize,
+    mem_kb: usize,
 ) -> Result<StreamResponse, &'static str> {
     let mut backoff_ms: u64 = 500;
+    let is_tui = tui_app::TUI_ACTIVE.load(core::sync::atomic::Ordering::SeqCst);
 
-    if is_continuation {
-        print("[continuing");
+    let status_prefix = if is_continuation {
+        "[MEOW] continuing"
     } else {
-        print("[jacking in");
+        "[MEOW] jacking in"
+    };
+    
+    // Update status pane (TUI mode) - dots are managed by render loop
+    tui_app::update_streaming_status(status_prefix, 0, None);
+    
+    // Print inline only for non-TUI mode
+    if !is_tui {
+        if is_continuation {
+            libakuma::print("[continuing");
+        } else {
+            libakuma::print("[jacking in");
+        }
     }
 
     let start_time = libakuma::uptime();
 
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
-            print(&format!(" retry {}", attempt));
-            libakuma::sleep_ms(backoff_ms);
+            if !is_tui {
+                libakuma::print(&format!(" retry {}", attempt));
+            }
+            tui_app::update_streaming_status(&format!("{} retry {}", status_prefix, attempt), 0, None);
+            poll_sleep(backoff_ms, current_tokens, token_limit, mem_kb);
             backoff_ms *= 2;
         }
 
-        print(".");
+        if tui_app::tui_is_cancelled() {
+            if !is_tui {
+                libakuma::print("\n[cancelled]");
+            }
+            tui_app::clear_streaming_status();
+            return Err("Request cancelled");
+        }
+
+        if !is_tui {
+            libakuma::print(".");
+        }
 
         // Connect (TCP for both HTTP and HTTPS)
         let stream = match connect_to_provider(provider) {
             Ok(s) => s,
             Err(e) => {
                 if attempt == MAX_RETRIES - 1 {
-                    print(&format!("] {}", e));
+                    if !is_tui { libakuma::print(&format!("] {}", e)); }
                     return Err("Connection failed");
                 }
                 continue;
             }
         };
 
-        print(".");
+        // Update status to "waiting" - dots managed by render loop
+        tui_app::update_streaming_status("[MEOW] waiting", 0, None);
+        if !is_tui { libakuma::print("."); }
 
         let (path, request_body) = build_chat_request(model, provider, history);
 
@@ -904,7 +682,7 @@ fn send_with_retry(
                 Ok(s) => s,
                 Err(e) => {
                     if attempt == MAX_RETRIES - 1 {
-                        print(&format!("] TLS error: {:?}", e));
+                        if !is_tui { libakuma::print(&format!("] TLS error: {:?}", e)); }
                         return Err("TLS handshake failed");
                     }
                     continue;
@@ -921,15 +699,18 @@ fn send_with_retry(
             // Send request over TLS
             if let Err(_) = http_stream.post(&host, &path, &request_body, &headers) {
                 if attempt == MAX_RETRIES - 1 {
-                    print("] ");
+                    if !is_tui { libakuma::print("] "); }
                     return Err("Failed to send request");
                 }
                 continue;
             }
             
-            print("] waiting");
+            if !is_tui { 
+                libakuma::print("] waiting");
+                libakuma::print(COLOR_RESET);
+            }
             
-            match read_streaming_with_http_stream_tls(&mut http_stream, start_time, provider) {
+            match read_streaming_with_http_stream_tls(&mut http_stream, start_time, provider, current_tokens, token_limit, mem_kb, is_tui) {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     if e == "Request cancelled" {
@@ -938,7 +719,7 @@ fn send_with_retry(
                     if attempt == MAX_RETRIES - 1 {
                         return Err(e);
                     }
-                    print(&format!(" ({})", e));
+                    if !is_tui { libakuma::print(&format!(" ({})", e)); }
                     continue;
                 }
             }
@@ -946,15 +727,18 @@ fn send_with_retry(
             // HTTP path (existing code)
             if let Err(e) = send_post_request(&stream, &path, &request_body, provider) {
                 if attempt == MAX_RETRIES - 1 {
-                    print("] ");
+                    if !is_tui { libakuma::print("] "); }
                     return Err(e);
                 }
                 continue;
             }
 
-            print("] waiting");
+            if !is_tui {
+                libakuma::print("] waiting");
+                libakuma::print(COLOR_RESET);
+            }
 
-            match read_streaming_response_with_progress(&stream, start_time, provider) {
+            match read_streaming_response_with_progress(&stream, start_time, provider, current_tokens, token_limit, mem_kb, is_tui) {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     if e == "Request cancelled" {
@@ -963,7 +747,7 @@ fn send_with_retry(
                     if attempt == MAX_RETRIES - 1 {
                         return Err(e);
                     }
-                    print(&format!(" ({})", e));
+                    if !is_tui { libakuma::print(&format!(" ({})", e)); }
                     continue;
                 }
             }
@@ -1037,7 +821,7 @@ fn extract_intent_phrases(text: &str) -> Vec<String> {
     intents
 }
 
-fn chat_once(
+pub fn chat_once(
     model: &str,
     provider: &Provider,
     user_message: &str,
@@ -1049,11 +833,21 @@ fn chat_once(
     history.push(Message::new("user", user_message));
 
     // Track tool calls and stated intentions across all iterations
+    let mut total_tools_called: usize = 0;
+    let mut all_responses = String::new();
+
     for iteration in 0..MAX_TOOL_ITERATIONS {
-        let mut total_tools_called: usize = 0;
-        let mut all_responses = String::new();
-    
-        let stream_result = send_with_retry(model, provider, history, iteration > 0)?;
+        // Calculate metrics for background input handling
+        let current_tokens = calculate_history_tokens(history);
+        let mem_kb = libakuma::memory_usage() / 1024;
+        let token_limit = context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+
+        // Set status message color
+        print(COLOR_GRAY_DIM);
+        let stream_result = send_with_retry(model, provider, history, iteration > 0, current_tokens, token_limit, mem_kb)?;
+        
+        // Re-apply assistant color for the response content
+        print(COLOR_MEOW);
         
         // Handle partial responses (stream interrupted before completion)
         let assistant_response = match stream_result {
@@ -1077,14 +871,16 @@ fn chat_once(
 
         // First check for CompactContext tool (handled specially)
         if let Some(compact_result) = try_execute_compact_context(&assistant_response, history, system_prompt) {
-            print("\n\n[*] ");
             if compact_result.success {
-                print("Context compacted successfully nya~!\n");
-                print(&compact_result.output);
+                print(COLOR_GREEN_LIGHT);
+                print("\n\n[*] Context compacted successfully nya~!\n");
             } else {
-                print("Failed to compact context nya...\n");
-                print(&compact_result.output);
+                print(COLOR_PEARL);
+                print("\n\n[*] Failed to compact context nya...\n");
             }
+            print(COLOR_GRAY_BRIGHT);
+            print(&compact_result.output);
+            print(COLOR_RESET);
             print("\n\n");
             total_tools_called += 1;
             return Ok(());
@@ -1099,13 +895,16 @@ fn chat_once(
                 history.push(Message::new("assistant", &text_before_tool));
             }
 
-            print("\n\n[*] ");
             if result.success {
-                print("Tool executed successfully nya~!\n");
+                print(COLOR_GREEN_LIGHT);
+                print("\n\n[*] Tool executed successfully nya~!\n");
             } else {
-                print("Tool failed nya...\n");
+                print(COLOR_PEARL);
+                print("\n\n[*] Tool failed nya...\n");
             }
+            print(COLOR_GRAY_BRIGHT);
             print(&result.output);
+            print(COLOR_RESET);
             print("\n\n");
 
             // Include current cwd in tool results so LLM always knows where it is
@@ -1129,8 +928,15 @@ fn chat_once(
 
         // Extract intent phrases from all accumulated responses
         let intent_phrases = extract_intent_phrases(&all_responses);
+        let mismatch = !intent_phrases.is_empty() && total_tools_called == 0;
 
-        print(&format!("Intent phrases: {:?}, tools called: {:?}\n", intent_phrases.len(), total_tools_called));
+        if mismatch {
+            print(COLOR_PEARL);
+        } else {
+            print(COLOR_GREEN_LIGHT);
+        }
+        print(&format!("\n\n[*] Intent phrases: {}, tools called: {}\n", intent_phrases.len(), total_tools_called));
+        print(COLOR_RESET);
 
         // Check for mismatch: stated intentions but no tool calls
         if !intent_phrases.is_empty() && total_tools_called == 0 {
@@ -1275,6 +1081,10 @@ fn read_streaming_with_http_stream_tls(
     stream: &mut HttpStreamTls<'_>,
     start_time: u64,
     provider: &Provider,
+    current_tokens: usize,
+    token_limit: usize,
+    mem_kb: usize,
+    is_tui: bool,
 ) -> Result<StreamResponse, &'static str> {
     let mut full_response = String::new();
     let mut pending_lines = String::new();
@@ -1284,10 +1094,13 @@ fn read_streaming_with_http_stream_tls(
     const RESPONSE_WARNING_THRESHOLD: usize = 64 * 1024;
     let mut warned_large_response = false;
 
-    // Note: Dots are printed by the TLS transport layer while waiting for data
-
     loop {
-        if check_escape_pressed() {
+        // Process background input during streaming FIRST
+        // so that ESC/Ctrl+C can be caught in the same iteration
+        // (dots animation is handled by render loop every 10th repaint)
+        tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
+
+        if tui_app::tui_is_cancelled() {
             print("\n[cancelled]");
             return Err("Request cancelled");
         }
@@ -1309,11 +1122,15 @@ fn read_streaming_with_http_stream_tls(
                                 if !first_token_received {
                                     first_token_received = true;
                                     let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
-                                    // Print timing on new line (dots were printed on same line)
-                                    print(" ");
-                                    print_elapsed(elapsed_ms);
-                                    print("\n");
+                                    // Update status pane with timing
+                                    tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
+                                    if !is_tui {
+                                        libakuma::print(" ");
+                                        print_elapsed(elapsed_ms);
+                                        libakuma::print("\n");
+                                    }
                                 }
+                                print(COLOR_MEOW);
                                 print(&content);
 
                                 // Always accumulate full response
@@ -1327,6 +1144,7 @@ fn read_streaming_with_http_stream_tls(
                             }
                             if done {
                                 stream_completed = true;
+                                tui_app::clear_streaming_status();
                                 return Ok(StreamResponse::Complete(full_response));
                             }
                         }
@@ -1348,15 +1166,20 @@ fn read_streaming_with_http_stream_tls(
                             if !first_token_received {
                                 first_token_received = true;
                                 let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
-                                print(" ");
-                                print_elapsed(elapsed_ms);
-                                print("\n");
+                                tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
+                                if !is_tui {
+                                    libakuma::print(" ");
+                                    print_elapsed(elapsed_ms);
+                                    libakuma::print("\n");
+                                }
                             }
+                            print(COLOR_MEOW);
                             print(&content);
                             full_response.push_str(&content);
                         }
                         if done {
                             stream_completed = true;
+                            tui_app::clear_streaming_status();
                         }
                     }
                 }
@@ -1462,6 +1285,10 @@ fn read_streaming_response_with_progress(
     stream: &TcpStream,
     start_time: u64,
     provider: &Provider,
+    current_tokens: usize,
+    token_limit: usize,
+    mem_kb: usize,
+    is_tui: bool,
 ) -> Result<StreamResponse, &'static str> {
     let mut buf = [0u8; 1024];
     let mut pending_data = Vec::new();
@@ -1477,7 +1304,12 @@ fn read_streaming_response_with_progress(
     let mut warned_large_response = false;
 
     loop {
-        if check_escape_pressed() {
+        // Process background input during streaming FIRST
+        // so that ESC/Ctrl+C can be caught in the same iteration
+        // (dots animation is handled by render loop every 10th repaint)
+        tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
+
+        if tui_app::tui_is_cancelled() {
             print("\n[cancelled]");
             return Err("Request cancelled");
         }
@@ -1497,17 +1329,22 @@ fn read_streaming_response_with_progress(
                                     if !first_token_received {
                                         first_token_received = true;
                                         let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
-                                        for _ in 0..(7 + dots_printed) {
-                                            print("\x08 \x08");
+                                        tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
+                                        if !is_tui {
+                                            for _ in 0..(7 + dots_printed) {
+                                                libakuma::print("\x08 \x08");
+                                            }
+                                            print_elapsed(elapsed_ms);
+                                            libakuma::print("\n");
                                         }
-                                        print_elapsed(elapsed_ms);
-                                        print("\n");
                                     }
+                                    print(COLOR_MEOW);
                                     print(&content);
                                     full_response.push_str(&content);
                                 }
                                 if done {
                                     stream_completed = true;
+                                    tui_app::clear_streaming_status();
                                 }
                             }
                         }
@@ -1570,12 +1407,16 @@ fn read_streaming_response_with_progress(
                                 if !first_token_received {
                                     first_token_received = true;
                                     let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
-                                    for _ in 0..(7 + dots_printed) {
-                                        print("\x08 \x08");
+                                    tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
+                                    if !is_tui {
+                                        for _ in 0..(7 + dots_printed) {
+                                            libakuma::print("\x08 \x08");
+                                        }
+                                        print_elapsed(elapsed_ms);
+                                        libakuma::print("\n");
                                     }
-                                    print_elapsed(elapsed_ms);
-                                    print("\n");
                                 }
+                                print(COLOR_MEOW);
                                 print(&content);
 
                                 // Always accumulate full response
@@ -1589,6 +1430,7 @@ fn read_streaming_response_with_progress(
                             }
                             if done {
                                 is_done = true;
+                                tui_app::clear_streaming_status();
                                 break;
                             }
                         }
@@ -1611,8 +1453,8 @@ fn read_streaming_response_with_progress(
                 {
                     read_attempts += 1;
 
-                    if read_attempts % 50 == 0 && !first_token_received {
-                        print(".");
+                    if read_attempts % 50 == 0 && !first_token_received && !is_tui {
+                        libakuma::print(".");
                         dots_printed += 1;
                     }
 
@@ -1816,7 +1658,7 @@ fn json_escape(s: &str) -> String {
     result
 }
 
-/// Print elapsed time in a cute format
+/// Print elapsed time in a cute format (uses status cursor)
 fn print_elapsed(ms: u64) {
     if ms < 1000 {
         print(&format!("~(=^‥^)ノ [{}ms]", ms));
@@ -1827,88 +1669,16 @@ fn print_elapsed(ms: u64) {
     }
 }
 
-// ============================================================================
-// Input Handling
-// ============================================================================
-
-/// Check if escape key was pressed (non-blocking)
-/// Returns true if ESC (0x1B) was detected
-fn check_escape_pressed() -> bool {
-    let mut buf = [0u8; 8];
-    let n = read(fd::STDIN, &mut buf);
-    if n > 0 {
-        // Check for escape key (0x1B)
-        for i in 0..(n as usize) {
-            if buf[i] == 0x1B {
-                return true;
-            }
-        }
+/// Sleep while polling for TUI input to keep the interface responsive.
+fn poll_sleep(ms: u64, current_tokens: usize, token_limit: usize, mem_kb: usize) {
+    let start = libakuma::uptime();
+    let end = start + ms * 1000;
+    while libakuma::uptime() < end {
+        tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
+        libakuma::sleep_ms(10);
     }
-    false
 }
 
-/// Read a line from stdin (blocking with polling)
-/// Returns None on EOF (Ctrl+D on empty line)
-fn read_line() -> Option<String> {
-    let mut line = String::new();
-    let mut buf = [0u8; 1];
-    let mut consecutive_empty_reads = 0u32;
-
-    loop {
-        let n = read(fd::STDIN, &mut buf);
-        
-        if n <= 0 {
-            // No data available - poll with backoff
-            consecutive_empty_reads += 1;
-            
-            // After many empty reads, increase sleep time
-            let sleep_time = if consecutive_empty_reads < 10 {
-                10 // 10ms
-            } else if consecutive_empty_reads < 100 {
-                50 // 50ms
-            } else {
-                100 // 100ms
-            };
-            
-            libakuma::sleep_ms(sleep_time);
-            continue;
-        }
-        
-        // Got data - reset counter
-        consecutive_empty_reads = 0;
-
-        let c = buf[0];
-        if c == b'\n' || c == b'\r' {
-            // Echo newline
-            print("\n");
-            break;
-        }
-        if c == 4 {
-            // Ctrl+D
-            if line.is_empty() {
-                return None;
-            }
-            break;
-        }
-        // Handle backspace
-        if c == 8 || c == 127 {
-            if !line.is_empty() {
-                line.pop();
-                // Echo backspace: move back, space, move back
-                print("\x08 \x08");
-            }
-            continue;
-        }
-        // Regular character
-        if c >= 32 && c < 127 {
-            line.push(c as char);
-            // Echo the character
-            let echo = [c];
-            if let Ok(s) = core::str::from_utf8(&echo) {
-                print(s);
-            }
-        }
-    }
-
-    Some(line)
-}
+// ============================================================================
+// Chat Message Types
+// ============================================================================
