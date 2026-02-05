@@ -3,7 +3,7 @@
 //! Implements file system, network, and shell tools that the LLM can invoke via JSON commands.
 //! Tools are executed using libakuma syscalls.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::format;
 
@@ -225,6 +225,10 @@ impl ToolResult {
     pub fn err(message: &str) -> Self {
         Self { success: false, output: String::from(message) }
     }
+}
+
+pub struct ToolCall {
+    pub json: String,
 }
 
 /// Parse and execute a tool command from JSON
@@ -449,79 +453,76 @@ pub fn execute_tool_command(json: &str) -> Option<ToolResult> {
     }
 }
 
-/// Try to find and execute a tool command in the LLM's response
-/// Returns (remaining_text, Some(result)) if a tool was found and executed
-/// Returns (original_text, None) if no tool command was found
-pub fn find_and_execute_tool(response: &str) -> (String, Option<ToolResult>) {
-    // Look for JSON code block with command (```json ... ```)
-    if let Some(result) = try_parse_code_block(response) {
-        return result;
-    }
-    
-    // Try inline JSON (without code blocks)
-    if let Some(result) = try_parse_inline_json(response) {
-        return result;
-    }
-    
-    (String::from(response), None)
-}
+/// Try to find all tool command JSON blocks in the LLM's response.
+/// Returns (remaining_text, Vec<ToolCall>) where remaining_text is the part
+/// of the response that is not a tool call, and Vec<ToolCall> contains all
+/// found and validated tool commands.
+pub fn find_tool_calls(response: &str) -> (String, Vec<ToolCall>) {
+    let mut tool_calls = Vec::new();
+    let mut current_response = String::from(response);
 
-/// Try to parse a ```json code block
-fn try_parse_code_block(response: &str) -> Option<(String, Option<ToolResult>)> {
-    let start = response.find("```json")?;
-    
-    // Find the closing ``` - try both ```\n and just ```
-    let after_start = &response[start + 7..];
-    let end_offset = after_start.find("\n```")
-        .map(|p| p + 1)  // Include the newline, point to ```
-        .or_else(|| after_start.find("```"))?;
-    
-    let json_block = after_start[..end_offset].trim();
-    
-    // Check if this looks like a command
-    if json_block.contains("\"command\"") && json_block.contains("\"tool\"") {
-        if let Some(result) = execute_tool_command(json_block) {
-            let before = response[..start].trim();
-            return Some((String::from(before), Some(result)));
+    loop {
+        let mut found_match = false;
+        
+        // Try code block first
+        if let Some((json_block, start_offset, end_offset)) = find_code_block(&current_response) {
+            if json_block.contains("\"command\"") && json_block.contains("\"tool\"") {
+                tool_calls.push(ToolCall { json: json_block.to_string() });
+                current_response.replace_range(start_offset..end_offset, "");
+                found_match = true;
+            }
         }
-    }
-    
-    None
-}
-
-/// Try to parse inline JSON (handles various whitespace patterns)
-fn try_parse_inline_json(response: &str) -> Option<(String, Option<ToolResult>)> {
-    // Find a { that's followed by "command" (with optional whitespace)
-    let mut search_start = 0;
-    
-    while search_start < response.len() {
-        // Find the next { character
-        let brace_pos = response[search_start..].find('{')?;
-        let abs_brace_pos = search_start + brace_pos;
         
-        // Check if "command" appears soon after (within ~20 chars, allowing for whitespace)
-        let after_brace = &response[abs_brace_pos + 1..];
-        let trimmed = after_brace.trim_start();
-        
-        if trimmed.starts_with("\"command\"") {
-            // Found a potential command JSON - find matching closing brace
-            if let Some(json_end) = find_matching_brace(&response[abs_brace_pos..]) {
-                let json_block = &response[abs_brace_pos..abs_brace_pos + json_end + 1];
-                
-                // Verify it has the required structure
-                if json_block.contains("\"tool\"") {
-                    if let Some(result) = execute_tool_command(json_block) {
-                        let before = response[..abs_brace_pos].trim();
-                        return Some((String::from(before), Some(result)));
-                    }
+        // If no code block, try inline JSON (only if no code block was found in this iteration)
+        if !found_match {
+            if let Some((json_block, start_offset, end_offset)) = find_inline_json(&current_response) {
+                if json_block.contains("\"command\"") && json_block.contains("\"tool\"") {
+                    tool_calls.push(ToolCall { json: json_block.to_string() });
+                    current_response.replace_range(start_offset..end_offset, "");
+                    found_match = true;
                 }
             }
         }
         
-        // Move past this { and continue searching
-        search_start = abs_brace_pos + 1;
+        if !found_match {
+            break; // No more tool calls found
+        }
     }
     
+    (current_response.trim().to_string(), tool_calls)
+}
+
+// Helper to find a ```json block and its boundaries
+fn find_code_block(text: &str) -> Option<(&str, usize, usize)> {
+    let start = text.find("```json")?;
+    let after_start = &text[start + 7..];
+    let end_offset_in_after_start = after_start.find("\n```")
+        .map(|p| p + 1)
+        .or_else(|| after_start.find("```"))?;
+    
+    let json_block = after_start[..end_offset_in_after_start].trim();
+    Some((json_block, start, start + 7 + end_offset_in_after_start + 3)) // +3 for ```
+}
+
+// Helper to find an inline JSON block and its boundaries
+fn find_inline_json(text: &str) -> Option<(&str, usize, usize)> {
+    let mut search_start = 0;
+    
+    while search_start < text.len() {
+        let brace_pos = text[search_start..].find('{')?;
+        let abs_brace_pos = search_start + brace_pos;
+        
+        let after_brace = &text[abs_brace_pos + 1..];
+        let trimmed = after_brace.trim_start();
+        
+        if trimmed.starts_with("\"command\"") {
+            if let Some(json_end) = find_matching_brace(&text[abs_brace_pos..]) {
+                let json_block = &text[abs_brace_pos..abs_brace_pos + json_end + 1];
+                return Some((json_block, abs_brace_pos, abs_brace_pos + json_end + 1));
+            }
+        }
+        search_start = abs_brace_pos + 1;
+    }
     None
 }
 
@@ -1529,6 +1530,9 @@ fn tool_shell(command: &str) -> ToolResult {
                 output.extend_from_slice(&buf[..n as usize]);
             }
             close(result.stdout_fd as i32);
+
+            // DEBUG PRINT: Log the length of the captured output
+            libakuma::print(&format!("DEBUG: tool_shell captured {} bytes\n", output.len()));
 
             let output_str = core::str::from_utf8(&output).unwrap_or("<binary output>");
 

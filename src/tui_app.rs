@@ -758,7 +758,7 @@ fn handle_input_event(
     quit: &mut bool, 
     exit_on_escape: bool,
 ) {
-    let mut idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
+    let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
     let w = TERM_WIDTH.load(Ordering::SeqCst) as usize;
     let prompt_prefix_len = INPUT_LEN.load(Ordering::SeqCst) as usize;
 

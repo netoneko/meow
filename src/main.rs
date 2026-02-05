@@ -34,7 +34,7 @@ use alloc::vec::Vec;
 
 use config::{ApiType, Config, Provider, TOKEN_LIMIT_FOR_COMPACTION, DEFAULT_CONTEXT_WINDOW, SYSTEM_PROMPT_BASE, COLOR_PEARL, COLOR_GREEN_LIGHT, COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_GRAY_DIM, COLOR_MEOW};
 use libakuma::net::{resolve, TcpStream};
-use libakuma::{arg, argc, exit, fd, read};
+use libakuma::{arg, argc, exit};
 use libakuma_tls::{HttpHeaders, HttpStreamTls, StreamResult, TLS_RECORD_SIZE};
 use core::sync::atomic::Ordering;
 
@@ -888,44 +888,54 @@ pub fn chat_once(
             return Ok(());
         }
 
-        let (text_before_tool, tool_result) = tools::find_and_execute_tool(&assistant_response);
+        let (mut current_llm_response_text, tool_calls) = tools::find_tool_calls(&assistant_response);
 
-        if let Some(result) = tool_result {
-            total_tools_called += 1;
-            
-            if !text_before_tool.is_empty() {
-                history.push(Message::new("assistant", &text_before_tool));
+        if !tool_calls.is_empty() {
+            for tool_call in tool_calls {
+                total_tools_called += 1;
+
+                if !current_llm_response_text.is_empty() {
+                    history.push(Message::new("assistant", &current_llm_response_text));
+                    current_llm_response_text.clear(); // Clear after adding to history
+                }
+
+                // Execute the tool
+                let tool_result = if let Some(result) = tools::execute_tool_command(&tool_call.json) {
+                    result
+                } else {
+                    tools::ToolResult::err("Failed to parse or execute tool command")
+                };
+                
+                if tool_result.success {
+                    print(COLOR_GREEN_LIGHT);
+                    print("\n\n[*] Tool executed successfully nya~!\n");
+                } else {
+                    print(COLOR_PEARL);
+                    print("\n\n[*] Tool failed nya...\n");
+                }
+                print(COLOR_GRAY_BRIGHT);
+                print(&tool_result.output);
+                print(COLOR_RESET);
+                print("\n\n");
+
+                // Include current cwd in tool results so LLM always knows where it is
+                let current_cwd = tools::get_working_dir();
+                let tool_result_msg = format!(
+                    "[Tool Result]\n{}\n[End Tool Result]\n[Current Directory: {}]\n\nPlease continue your response based on this result.",
+                    tool_result.output, current_cwd
+                );
+                history.push(Message::new("user", &tool_result_msg));
+                
+                // Compact after tool execution to release memory
+                compact_history(history);
             }
-
-            if result.success {
-                print(COLOR_GREEN_LIGHT);
-                print("\n\n[*] Tool executed successfully nya~!\n");
-            } else {
-                print(COLOR_PEARL);
-                print("\n\n[*] Tool failed nya...\n");
-            }
-            print(COLOR_GRAY_BRIGHT);
-            print(&result.output);
-            print(COLOR_RESET);
-            print("\n\n");
-
-            // Include current cwd in tool results so LLM always knows where it is
-            let current_cwd = tools::get_working_dir();
-            let tool_result_msg = format!(
-                "[Tool Result]\n{}\n[End Tool Result]\n[Current Directory: {}]\n\nPlease continue your response based on this result.",
-                result.output, current_cwd
-            );
-            history.push(Message::new("user", &tool_result_msg));
-                        
-            // Compact after tool execution to release memory
-            compact_history(history);
-
+            // Continue loop to give LLM a chance to respond after tool execution
             continue;
         }
 
         // No tool found - this is the final response
-        if !assistant_response.is_empty() {
-            history.push(Message::new("assistant", &assistant_response));
+        if !current_llm_response_text.is_empty() {
+            history.push(Message::new("assistant", &current_llm_response_text));
         }
 
         // Extract intent phrases from all accumulated responses
