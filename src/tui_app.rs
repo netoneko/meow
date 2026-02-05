@@ -707,6 +707,9 @@ pub fn run_tui(
     set_model_and_provider(model, &provider.name);
     
     let mut stdout = Stdout;
+    // Enable Kitty keyboard protocol (for Shift+Enter detection in supported terminals)
+    // Mode 1 = disambiguate escape codes, enables CSI u sequences for modified keys
+    let _ = write!(stdout, "\x1b[>1u");
     let _ = write!(stdout, "\x1b[?1049h"); // Enter alternate screen
     clear_screen();
     // Scroll region ends at h-4 to leave room for 4-line footer
@@ -804,6 +807,8 @@ pub fn run_tui(
 
     // Reset scroll region and attributes
     set_scroll_region(1, app.terminal_height);
+    // Disable Kitty keyboard protocol
+    let _ = write!(stdout, "\x1b[<u");
     set_terminal_attributes(fd::STDIN, 0, old_mode_flags);
     clear_screen();
     set_cursor_position(0, 0);

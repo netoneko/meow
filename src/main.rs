@@ -467,6 +467,8 @@ pub fn handle_command(
             let output = String::from("┌────────────────────────────────────────────────┐\n\
                                        │             Meow's Input Shortcuts             │\n\
                                        ├────────────────────────────────────────────────┤\n\
+                                       │ Shift+Enter      - Insert newline (multiline)  │\n\
+                                       │ Ctrl+J           - Insert newline (fallback)   │\n\
                                        │ Ctrl+A / Home    - Move to start of line       │\n\
                                        │ Ctrl+E / End     - Move to end of line         │\n\
                                        │ Ctrl+W           - Delete previous word        │\n\
