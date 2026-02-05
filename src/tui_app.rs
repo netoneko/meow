@@ -690,45 +690,76 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let wrapped_lines = count_wrapped_lines(input, prompt_prefix_len, w);
     let max_prompt_lines = core::cmp::min(10, (h / 3) as usize);
     let display_prompt_lines = core::cmp::min(wrapped_lines, max_prompt_lines);
-    let total_footer_height = (display_prompt_lines + 2) as u16; 
-    let old_footer_height = FOOTER_HEIGHT.swap(total_footer_height, Ordering::SeqCst);
-    
-    // Only adjust scroll region when NOT streaming to avoid disrupting LLM output
+    let new_footer_height = (display_prompt_lines + 2) as u16; 
+    let old_footer_height = FOOTER_HEIGHT.load(Ordering::SeqCst);
     let is_streaming = STREAMING.load(Ordering::SeqCst);
-    if total_footer_height != old_footer_height && !is_streaming {
-        let gap = output_footer_gap();
-        set_scroll_region(1, (h as u16) - total_footer_height - gap);
+    let gap = output_footer_gap();
+    
+    // During streaming: allow footer to GROW but not SHRINK
+    // (shrinking would leave old separator lines that we can't safely clear during streaming)
+    let effective_footer_height = if is_streaming && new_footer_height < old_footer_height {
+        old_footer_height
+    } else {
+        new_footer_height
+    };
+    let effective_prompt_lines = (effective_footer_height as usize).saturating_sub(2);
+    
+    // Handle footer height changes
+    if effective_footer_height != old_footer_height {
+        FOOTER_HEIGHT.store(effective_footer_height, Ordering::SeqCst);
         
-        // If footer is growing, we might need to adjust CUR_ROW to avoid overwrite
-        let cur_row = CUR_ROW.load(Ordering::SeqCst);
-        let max_row = h as u16 - (total_footer_height + 1 + gap);
-        if cur_row > max_row {
-            let diff = cur_row - max_row;
-            // Print newlines to push content up
-            for _ in 0..diff { let _ = write!(stdout, "\n"); }
-            CUR_ROW.store(max_row, Ordering::SeqCst);
+        if effective_footer_height > old_footer_height && is_streaming {
+            // Footer is GROWING during streaming:
+            // Print newlines to scroll LLM content up, then update scroll region
+            let cur_row = CUR_ROW.load(Ordering::SeqCst);
+            let cur_col = CUR_COL.load(Ordering::SeqCst);
+            let height_diff = effective_footer_height - old_footer_height;
+            
+            // Position at the bottom of the scroll region and print newlines
+            let old_scroll_bottom = (h as u16).saturating_sub(old_footer_height + gap);
+            set_cursor_position(0, old_scroll_bottom as u64);
+            for _ in 0..height_diff {
+                let _ = write!(stdout, "\n");
+            }
+            
+            // Update scroll region to new smaller size
+            set_scroll_region(1, (h as u16) - effective_footer_height - gap);
+            
+            // Adjust CUR_ROW to account for the scroll
+            let max_row = h as u16 - (effective_footer_height + 1 + gap);
+            let new_cur_row = cur_row.saturating_sub(height_diff).min(max_row);
+            CUR_ROW.store(new_cur_row, Ordering::SeqCst);
+            CUR_COL.store(cur_col, Ordering::SeqCst);
+        } else {
+            // Not streaming, or footer is shrinking (which only happens when not streaming)
+            set_scroll_region(1, (h as u16) - effective_footer_height - gap);
+            
+            // If footer is growing (not streaming), adjust CUR_ROW
+            if effective_footer_height > old_footer_height {
+                let cur_row = CUR_ROW.load(Ordering::SeqCst);
+                let max_row = h as u16 - (effective_footer_height + 1 + gap);
+                if cur_row > max_row {
+                    CUR_ROW.store(max_row, Ordering::SeqCst);
+                }
+            }
         }
-    } else if is_streaming && total_footer_height != old_footer_height {
-        // Revert footer height change during streaming
-        FOOTER_HEIGHT.store(old_footer_height, Ordering::SeqCst);
     }
 
     let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
     let (_cx_abs, cy_off_abs) = calculate_input_cursor(input, idx, prompt_prefix_len, w);
     let mut scroll_top = PROMPT_SCROLL_TOP.load(Ordering::SeqCst);
     if cy_off_abs < scroll_top as u64 { scroll_top = cy_off_abs as u16; } 
-    else if cy_off_abs >= (scroll_top as u64 + display_prompt_lines as u64) { scroll_top = (cy_off_abs - display_prompt_lines as u64 + 1) as u16; }
+    else if cy_off_abs >= (scroll_top as u64 + effective_prompt_lines as u64) { scroll_top = (cy_off_abs - effective_prompt_lines as u64 + 1) as u64 as u16; }
     PROMPT_SCROLL_TOP.store(scroll_top, Ordering::SeqCst);
 
     hide_cursor();
-    let separator_row = h - total_footer_height as u64;
+    let separator_row = h - effective_footer_height as u64;
     
-    // Only clear lines that were part of the OLD footer but are now above the NEW footer
-    // This happens when footer shrinks (e.g., going from multiline to single line)
-    // We must NOT clear LLM output lines in the gap area
-    if old_footer_height > total_footer_height {
-        let old_separator_row = h as u64 - old_footer_height as u64;
-        // Clear from old separator position up to (but not including) new separator
+    // When footer shrinks, clear old footer lines that are now in the gap area.
+    // Only clear from old separator position to new separator position.
+    // This never touches the scroll region (LLM output area).
+    if effective_footer_height < old_footer_height {
+        let old_separator_row = h - old_footer_height as u64;
         for row in old_separator_row..separator_row {
             set_cursor_position(0, row);
             let _ = write!(stdout, "{}", CLEAR_TO_EOL);
@@ -745,7 +776,7 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let status_info = format!("  [Provider: {}] [Model: {}]", provider, model);
     let _ = write!(stdout, "{}{}{}", COLOR_GRAY_DIM, status_info, COLOR_RESET);
 
-    for i in 0..display_prompt_lines {
+    for i in 0..effective_prompt_lines {
         set_cursor_position(0, status_row + 1 + i as u64);
         let _ = write!(stdout, "{}", CLEAR_TO_EOL);
     }
@@ -761,7 +792,7 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
         if c == '\n' {
             current_line += 1; current_col = 0;
         } else {
-            if current_line >= scroll_top as usize && current_line < (scroll_top as usize + display_prompt_lines) {
+            if current_line >= scroll_top as usize && current_line < (scroll_top as usize + effective_prompt_lines) {
                 let target_row = status_row + 1 + (current_line as u64 - scroll_top as u64);
                 set_cursor_position(current_col as u64, target_row);
                 let mut buf = [0u8; 4];
@@ -880,7 +911,13 @@ pub fn run_tui(
         if let Some(user_input) = get_message_queue().pop_front() {
             app.render_footer(current_tokens, context_window, mem_kb);
             let f_h = FOOTER_HEIGHT.load(Ordering::SeqCst);
+            let gap = output_footer_gap();
             let mut stdout = Stdout;
+            
+            // Position cursor in the output area before printing
+            let cur_row = CUR_ROW.load(Ordering::SeqCst);
+            set_cursor_position(0, cur_row as u64);
+            
             let _ = write!(stdout, "\n {}> {}{}{}\n", COLOR_VIOLET, COLOR_BOLD, user_input, COLOR_RESET);
             if user_input.starts_with('/') {
                 let (res, output) = crate::handle_command(&user_input, model, provider, config, history, system_prompt);
@@ -891,7 +928,6 @@ pub fn run_tui(
                 }
                 if let CommandResult::Quit = res { break; }
                 app.history = history.clone();
-                let gap = output_footer_gap();
                 CUR_ROW.store(app.terminal_height - (f_h + 1 + gap), Ordering::SeqCst);
                 CUR_COL.store(0, Ordering::SeqCst);
             } else {
@@ -899,7 +935,6 @@ pub fn run_tui(
                 history.clear(); history.extend(app.history.iter().cloned());
                 let _ = write!(stdout, "  {}[MEOW] {}", COLOR_MEOW, COLOR_RESET);
                 let _ = write!(stdout, "{}", COLOR_MEOW);
-                let gap = output_footer_gap();
                 CUR_ROW.store(app.terminal_height - (f_h + 1 + gap), Ordering::SeqCst);
                 CUR_COL.store(9, Ordering::SeqCst);
                 STREAMING.store(true, Ordering::SeqCst);
