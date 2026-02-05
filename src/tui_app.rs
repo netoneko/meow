@@ -708,40 +708,18 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     if effective_footer_height != old_footer_height {
         FOOTER_HEIGHT.store(effective_footer_height, Ordering::SeqCst);
         
-        if effective_footer_height > old_footer_height && is_streaming {
-            // Footer is GROWING during streaming:
-            // Print newlines to scroll LLM content up, then update scroll region
+        if effective_footer_height > old_footer_height {
+            // Footer is GROWING - update scroll region and clamp CUR_ROW
+            set_scroll_region(1, (h as u16) - effective_footer_height - gap);
+            
             let cur_row = CUR_ROW.load(Ordering::SeqCst);
-            let cur_col = CUR_COL.load(Ordering::SeqCst);
-            let height_diff = effective_footer_height - old_footer_height;
-            
-            // Position at the bottom of the scroll region and print newlines
-            let old_scroll_bottom = (h as u16).saturating_sub(old_footer_height + gap);
-            set_cursor_position(0, old_scroll_bottom as u64);
-            for _ in 0..height_diff {
-                let _ = write!(stdout, "\n");
-            }
-            
-            // Update scroll region to new smaller size
-            set_scroll_region(1, (h as u16) - effective_footer_height - gap);
-            
-            // Adjust CUR_ROW to account for the scroll
             let max_row = h as u16 - (effective_footer_height + 1 + gap);
-            let new_cur_row = cur_row.saturating_sub(height_diff).min(max_row);
-            CUR_ROW.store(new_cur_row, Ordering::SeqCst);
-            CUR_COL.store(cur_col, Ordering::SeqCst);
-        } else {
-            // Not streaming, or footer is shrinking (which only happens when not streaming)
-            set_scroll_region(1, (h as u16) - effective_footer_height - gap);
-            
-            // If footer is growing (not streaming), adjust CUR_ROW
-            if effective_footer_height > old_footer_height {
-                let cur_row = CUR_ROW.load(Ordering::SeqCst);
-                let max_row = h as u16 - (effective_footer_height + 1 + gap);
-                if cur_row > max_row {
-                    CUR_ROW.store(max_row, Ordering::SeqCst);
-                }
+            if cur_row > max_row {
+                CUR_ROW.store(max_row, Ordering::SeqCst);
             }
+        } else {
+            // Footer is SHRINKING (only happens when not streaming)
+            set_scroll_region(1, (h as u16) - effective_footer_height - gap);
         }
     }
 
