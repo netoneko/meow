@@ -709,14 +709,26 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
         FOOTER_HEIGHT.store(effective_footer_height, Ordering::SeqCst);
         
         if effective_footer_height > old_footer_height {
-            // Footer is GROWING - update scroll region and clamp CUR_ROW
+            // Footer is GROWING - need to scroll content up BEFORE changing scroll region
+            let growth = effective_footer_height - old_footer_height;
+            let old_scroll_bottom = (h as u16) - old_footer_height - gap;
+            
+            // Position cursor at the bottom of the OLD scroll region and print newlines
+            // to scroll the LLM output up, making room for the larger footer
+            set_cursor_position(0, old_scroll_bottom as u64);
+            for _ in 0..growth {
+                akuma_write(fd::STDOUT, b"\n");
+            }
+            
+            // Now update scroll region to the new smaller size
             set_scroll_region(1, (h as u16) - effective_footer_height - gap);
             
-            let cur_row = CUR_ROW.load(Ordering::SeqCst);
             let max_row = h as u16 - (effective_footer_height + 1 + gap);
-            if cur_row > max_row {
-                CUR_ROW.store(max_row, Ordering::SeqCst);
-            }
+            
+            // Adjust CUR_ROW to account for the scroll (subtract the growth)
+            let cur_row = CUR_ROW.load(Ordering::SeqCst);
+            let new_row = cur_row.saturating_sub(growth);
+            CUR_ROW.store(core::cmp::min(new_row, max_row), Ordering::SeqCst);
         } else {
             // Footer is SHRINKING (only happens when not streaming)
             set_scroll_region(1, (h as u16) - effective_footer_height - gap);
@@ -911,11 +923,18 @@ pub fn run_tui(
             } else {
                 app.history.push(Message::new("user", &user_input));
                 history.clear(); history.extend(app.history.iter().cloned());
-                let _ = write!(stdout, "  {}[MEOW] {}", COLOR_MEOW, COLOR_RESET);
-                let _ = write!(stdout, "{}", COLOR_MEOW);
-                CUR_ROW.store(app.terminal_height - (f_h + 1 + gap), Ordering::SeqCst);
-                CUR_COL.store(9, Ordering::SeqCst);
+                
+                // Single stream approach: print [MEOW] once, then everything flows after it
+                // No dynamic status updates - eliminates cursor sync issues
+                let output_row = app.terminal_height - (f_h + 1 + gap);
+                CUR_ROW.store(output_row, Ordering::SeqCst);
+                CUR_COL.store(0, Ordering::SeqCst);
+                
                 STREAMING.store(true, Ordering::SeqCst);
+                
+                // Print [MEOW] - status and LLM output will flow after this in sequence
+                tui_print(&format!("\n\n  {}[MEOW] {}", COLOR_MEOW, COLOR_RESET));
+                
                 let _ = crate::chat_once(model, provider, &user_input, history, Some(context_window), system_prompt);
                 STREAMING.store(false, Ordering::SeqCst);
                 CANCELLED.store(false, Ordering::SeqCst); // Clear cancel flag after streaming ends

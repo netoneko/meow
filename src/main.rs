@@ -1042,13 +1042,14 @@ fn read_streaming_with_http_stream_tls(
     // Note: Dots are printed by the TLS transport layer while waiting for data
 
     loop {
+        // Process background input during streaming FIRST
+        // so that ESC/Ctrl+C can be caught in the same iteration
+        tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
+
         if tui_app::tui_is_cancelled() {
             print("\n[cancelled]");
             return Err("Request cancelled");
         }
-
-        // Process background input during streaming
-        tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
 
         match stream.read_chunk() {
             StreamResult::Data(data) => {
@@ -1108,13 +1109,12 @@ fn read_streaming_with_http_stream_tls(
                                 let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
                                 print(" ");
                                 print_elapsed(elapsed_ms);
-                                                                                                                                            print("\n");
-                                                                                                                                        }
-                                                                                                                                        print(COLOR_MEOW);
-                                                                                                                                        print(&content);
-                                                                                                                                        full_response.push_str(&content);
-                                                                                                        
-                                                                                            }
+                                print("\n");
+                            }
+                            print(COLOR_MEOW);
+                            print(&content);
+                            full_response.push_str(&content);
+                        }
                         if done {
                             stream_completed = true;
                         }
@@ -1240,13 +1240,14 @@ fn read_streaming_response_with_progress(
     let mut warned_large_response = false;
 
     loop {
+        // Process background input during streaming FIRST
+        // so that ESC/Ctrl+C can be caught in the same iteration
+        tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
+
         if tui_app::tui_is_cancelled() {
             print("\n[cancelled]");
             return Err("Request cancelled");
         }
-
-        // Process background input during streaming
-        tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
 
         match stream.read(&mut buf) {
             Ok(0) => {
@@ -1269,10 +1270,10 @@ fn read_streaming_response_with_progress(
                                             print("\n");
                                         } else {
                                             for _ in 0..(7 + dots_printed) {
-                                                print("\x08 \x08");
+                                                libakuma::print("\x08 \x08");
                                             }
                                             print_elapsed(elapsed_ms);
-                                            print("\n");
+                                            libakuma::print("\n");
                                         }
                                     }
                                     print(COLOR_MEOW);
@@ -1349,10 +1350,10 @@ fn read_streaming_response_with_progress(
                                         print("\n");
                                     } else {
                                         for _ in 0..(7 + dots_printed) {
-                                            print("\x08 \x08");
+                                            libakuma::print("\x08 \x08");
                                         }
                                         print_elapsed(elapsed_ms);
-                                        print("\n");
+                                        libakuma::print("\n");
                                     }
                                 }
                                 print(COLOR_MEOW);
@@ -1596,7 +1597,7 @@ fn json_escape(s: &str) -> String {
     result
 }
 
-/// Print elapsed time in a cute format
+/// Print elapsed time in a cute format (uses status cursor)
 fn print_elapsed(ms: u64) {
     if ms < 1000 {
         print(&format!("~(=^‥^)ノ [{}ms]", ms));
