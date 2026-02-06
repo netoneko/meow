@@ -32,7 +32,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use config::{ApiType, Config, Provider, TOKEN_LIMIT_FOR_COMPACTION, DEFAULT_CONTEXT_WINDOW, SYSTEM_PROMPT_BASE, COLOR_PEARL, COLOR_GREEN_LIGHT, COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_GRAY_DIM, COLOR_MEOW};
+use config::{ApiType, Config, Provider, TOKEN_LIMIT_FOR_COMPACTION, DEFAULT_CONTEXT_WINDOW, SYSTEM_PROMPT_BASE, COLOR_PEARL, COLOR_GREEN_LIGHT, COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_GRAY_DIM, COLOR_MEOW, COLOR_YELLOW};
 use libakuma::net::{resolve, TcpStream};
 use libakuma::{arg, argc, exit};
 use libakuma_tls::{HttpHeaders, HttpStreamTls, StreamResult, TLS_RECORD_SIZE};
@@ -621,17 +621,57 @@ fn format_duration(us: u64) -> String {
     }
 }
 
-/// Format current timestamp (HH:MM:SS)
-fn format_timestamp() -> String {
+/// Format current timestamp as ISO 8601 UTC
+fn format_iso8601_utc() -> String {
     let ts_us = libakuma::time();
     let total_secs = ts_us / 1_000_000;
-    let s = total_secs % 60;
-    let m = (total_secs / 60) % 60;
-    let h = (total_secs / 3600) % 24;
-    format!("{:02}:{:02}:{:02}", h, m, s)
+    
+    // Simple math for UTC date/time (ignoring leap seconds)
+    let s = (total_secs % 60) as u32;
+    let m = ((total_secs / 60) % 60) as u32;
+    let h = ((total_secs / 3600) % 24) as u32;
+    
+    let days_since_epoch = (total_secs / 86400) as i32;
+    
+    // Basic year/month/day calculation
+    let mut year = 1970;
+    let mut days_remaining = days_since_epoch;
+    
+    loop {
+        let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let days_in_year = if is_leap { 366 } else { 365 };
+        if days_remaining < days_in_year {
+            break;
+        }
+        days_remaining -= days_in_year;
+        year += 1;
+    }
+    
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let month_days = if is_leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    
+    let mut month = 1;
+    let mut day = 1;
+    for (i, &days) in month_days.iter().enumerate() {
+        if days_remaining < days {
+            month = i + 1;
+            day = days_remaining + 1;
+            break;
+        }
+        days_remaining -= days;
+    }
+    
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        year, month, day, h, m, s
+    )
 }
 
-/// Print streaming statistics in light gray
+/// Print streaming statistics in orange
 fn print_stats(stats: &StreamStats) {
     let tps = if stats.stream_us > 0 {
         let tokens = estimate_tokens_from_bytes(stats.total_bytes);
@@ -644,10 +684,11 @@ fn print_stats(stats: &StreamStats) {
     let stream_ms = stats.stream_us / 1000;
     let kb = stats.total_bytes as f64 / 1024.0;
 
-    print(COLOR_GRAY_DIM);
+    print("\n"); // Newline between model output and stats
+    print(COLOR_YELLOW);
     print(&format!(
-        "\n  [{}] TTFT: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}\n",
-        format_timestamp(),
+        "[{:^} | First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}]\n",
+        format_iso8601_utc(),
         ttft_ms,
         stream_ms,
         kb,
