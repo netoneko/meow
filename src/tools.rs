@@ -211,6 +211,12 @@ fn resolve_path_or_err(path: &str) -> Result<String, ToolResult> {
     }
 }
 
+use crate::config::MAX_TOOL_OUTPUT_SIZE;
+
+// ============================================================================
+// Tool Result and Overflow Helpers
+// ============================================================================
+
 /// Result of a tool execution
 pub struct ToolResult {
     pub success: bool,
@@ -219,11 +225,68 @@ pub struct ToolResult {
 
 impl ToolResult {
     pub fn ok(output: String) -> Self {
+        // Check for overflow
+        if output.len() > MAX_TOOL_OUTPUT_SIZE {
+            return handle_output_overflow(output);
+        }
         Self { success: true, output }
     }
     
     pub fn err(message: &str) -> Self {
         Self { success: false, output: String::from(message) }
+    }
+}
+
+/// Handle tool output that exceeds memory limits by writing it to a temp file.
+fn handle_output_overflow(full_output: String) -> ToolResult {
+    // Ensure /tmp exists in the sandbox
+    let sandbox = get_sandbox_root();
+    let tmp_dir = if sandbox == "/" {
+        String::from("/tmp")
+    } else {
+        format!("{}/tmp", sandbox)
+    };
+    
+    // Attempt to create /tmp (ignore error if it already exists)
+    let _ = mkdir(&tmp_dir);
+    
+    // Generate a unique filename using uptime as a seed
+    let timestamp = libakuma::uptime();
+    let filename = format!("{}/meow_tool_{}.txt", tmp_dir, timestamp);
+    
+    // Write full output to file
+    let fd = open(&filename, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+    if fd >= 0 {
+        let _ = write_fd(fd, full_output.as_bytes());
+        close(fd);
+        
+        let mut truncated = String::from("[!] Output truncated due to memory limits nya~!\n");
+        truncated.push_str(&format!("Full output saved to: {}\n\n", filename));
+        truncated.push_str("Preview:\n---\n");
+        
+        // Include first 4KB of output as preview
+        let preview_len = core::cmp::min(full_output.len(), 4096);
+        truncated.push_str(&full_output[..preview_len]);
+        if full_output.len() > preview_len {
+            truncated.push_str("\n...");
+        }
+        truncated.push_str("\n---\n\nNote: You can use `FileReadLines` to read specific parts of the saved output or `CodeSearch` for targeted investigation nya~!");
+        
+        ToolResult {
+            success: true,
+            output: truncated,
+        }
+    } else {
+        // If file write fails, we have no choice but to return a strictly truncated result
+        let mut truncated = String::from("[!] Output truncated (failed to write to temp file)\n\n");
+        let preview_len = core::cmp::min(full_output.len(), MAX_TOOL_OUTPUT_SIZE - 256);
+        truncated.push_str(&full_output[..preview_len]);
+        truncated.push_str("\n...");
+        
+        ToolResult {
+            success: true,
+            output: truncated,
+        }
     }
 }
 
@@ -1516,11 +1579,17 @@ fn tool_shell(command: &str) -> ToolResult {
     let mut process_exited = false;
     let mut waited_ms = 0u32;
     let max_wait_ms = 30000; // 30 seconds timeout
+    let max_shell_output = 1024 * 1024; // 1MB absolute max for shell output to avoid OOM
 
     loop {
         // Try to read all available data without blocking indefinitely
         let n = read_fd(result.stdout_fd as i32, &mut buf);
         if n > 0 {
+            if output.len() + n as usize > max_shell_output {
+                let _ = libakuma::kill(result.pid); // Kill runaway process
+                close(result.stdout_fd as i32);
+                return ToolResult::err("Command produced too much output (exceeded 1MB limit)");
+            }
             output.extend_from_slice(&buf[..n as usize]);
             waited_ms = 0; // Reset timeout if we're making progress
         } else if n < 0 && (n as i64) == EAGAIN_ERRNO as i64 {

@@ -927,6 +927,7 @@ pub fn chat_once(
                 history.push(Message::new("user", &tool_result_msg));
                 
                 // Compact after tool execution to release memory
+                trim_history(history);
                 compact_history(history);
             }
             // Continue loop to give LLM a chance to respond after tool execution
@@ -937,6 +938,10 @@ pub fn chat_once(
         if !current_llm_response_text.is_empty() {
             history.push(Message::new("assistant", &current_llm_response_text));
         }
+        
+        // Final trim and compact for this turn
+        trim_history(history);
+        compact_history(history);
 
         // Extract intent phrases from all accumulated responses
         let intent_phrases = extract_intent_phrases(&all_responses);
@@ -1163,7 +1168,7 @@ fn read_streaming_with_http_stream_tls(
                     }
                     
                     // Remove processed line
-                    pending_lines = String::from(&pending_lines[newline_pos + 1..]);
+                    pending_lines.drain(..newline_pos + 1);
                 }
             }
             StreamResult::WouldBlock => {

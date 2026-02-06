@@ -235,6 +235,7 @@ static mut MODEL_NAME: Option<String> = None;
 static mut PROVIDER_NAME: Option<String> = None;
 static mut RAW_INPUT_QUEUE: Option<VecDeque<u8>> = None;
 static mut LAST_INPUT_TIME: u64 = 0;
+static mut LAST_HISTORY_KB: usize = 0;
 
 fn get_raw_input_queue() -> &'static mut VecDeque<u8> {
     unsafe {
@@ -1009,8 +1010,23 @@ impl App {
     }
     pub fn render_footer(&self, current_tokens: usize, token_limit: usize, mem_kb: usize) {
         let input = get_global_input();
+        let _ = calculate_history_bytes(&self.history);
         render_footer_internal(input, current_tokens, token_limit, mem_kb);
     }
+}
+
+/// Calculate the total byte size of message history
+pub fn calculate_history_bytes(history: &[Message]) -> usize {
+    let bytes = history
+        .iter()
+        .map(|msg| msg.role.len() + msg.content.len() + 32) // +32 for metadata/structure overhead
+        .sum();
+    
+    // Update the static for UI persistence
+    unsafe {
+        LAST_HISTORY_KB = bytes / 1024;
+    }
+    bytes
 }
 
 fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize, mem_kb: usize) {
@@ -1036,11 +1052,23 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let token_display = if current_tokens >= 1000 { format!("{}k", current_tokens / 1000) } else { format!("{}", current_tokens) };
     let limit_display = format!("{}k", token_limit / 1000);
     let mem_display = if mem_kb >= 1024 { format!("{}M", mem_kb / 1024) } else { format!("{}K", mem_kb) };
-
+    
+    // History size with color coding (using persisted static)
+    let history_kb = unsafe { LAST_HISTORY_KB };
+    let color = if history_kb > 256 {
+        "\x1b[38;5;196m" // Red
+    } else if history_kb > 128 {
+        "\x1b[38;5;226m" // Yellow
+    } else {
+        COLOR_YELLOW
+    };
+    let hist_display = format!("|{}Hist: {}K{}", color, history_kb, COLOR_RESET);
+    
     let queue_len = get_message_queue().len();
     let queue_display = if queue_len > 0 { format!(" [QUEUED: {}]", queue_len) } else { String::new() };
 
-    let prompt_prefix = format!("  [{}/{}|{}]{} (=^･ω･^=) > ", token_display, limit_display, mem_display, queue_display);
+    let prompt_prefix = format!("  [{}/{}|{}{}] {}(=^･ω･^=) > ", 
+        token_display, limit_display, mem_display, hist_display, queue_display);
     let prompt_prefix_len = prompt_prefix.chars().count();
     INPUT_LEN.store(prompt_prefix_len as u16, Ordering::SeqCst);
     layout.input_prefix_len = prompt_prefix_len as u16;
