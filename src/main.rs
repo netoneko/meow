@@ -14,6 +14,7 @@ mod config;
 mod tools;
 mod tui_app;
 mod ui;
+mod util;
 
 use alloc::format;
 use alloc::string::String;

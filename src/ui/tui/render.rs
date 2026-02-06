@@ -1,7 +1,7 @@
-use alloc::string::String;
-use alloc::format;
 use core::sync::atomic::Ordering;
 use libakuma::{set_cursor_position, hide_cursor, show_cursor, write as akuma_write, fd};
+use crate::util::StackBuffer;
+use core::fmt::Write;
 
 use crate::config::{COLOR_YELLOW, COLOR_RESET, COLOR_VIOLET, COLOR_BOLD, COLOR_GRAY_DIM};
 use crate::app::state::{self, STREAMING};
@@ -138,6 +138,7 @@ pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&
 }
 
 pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
+    let mut stdout = Stdout;
     let layout = get_pane_layout();
     let (w, h) = (layout.term_width as usize, layout.term_height as u64);
     layout.repaint_counter = layout.repaint_counter.wrapping_add(1) % 10000;
@@ -145,16 +146,36 @@ pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
     if layout.repaint_counter % 10 == 0 { layout.status_dots = (layout.status_dots % 5) + 1; }
     if !is_streaming && layout.status_text.is_empty() { layout.update_status("[MEOW] awaiting user input", 0, None); }
 
-    let t_disp = if current_tokens >= 1000 { format!("{}k", current_tokens / 1000) } else { format!("{}", current_tokens) };
-    let l_disp = format!("{}k", token_limit / 1000);
-    let m_disp = if mem_kb >= 1024 { format!("{}M", mem_kb / 1024) } else { format!("{}K", mem_kb) };
+    let mut t_disp_buf_data = [0u8; 16];
+    let mut t_disp_buf = StackBuffer::new(&mut t_disp_buf_data);
+    let t_disp = if current_tokens >= 1000 { let _ = write!(t_disp_buf, "{}k", current_tokens / 1000); t_disp_buf.as_str() } else { let _ = write!(t_disp_buf, "{}", current_tokens); t_disp_buf.as_str() };
+    
+    let mut l_disp_buf_data = [0u8; 16];
+    let mut l_disp_buf = StackBuffer::new(&mut l_disp_buf_data);
+    let _ = write!(l_disp_buf, "{}k", token_limit / 1000);
+    let l_disp = l_disp_buf.as_str();
+
+    let mut m_disp_buf_data = [0u8; 16];
+    let mut m_disp_buf = StackBuffer::new(&mut m_disp_buf_data);
+    let m_disp = if mem_kb >= 1024 { let _ = write!(m_disp_buf, "{}M", mem_kb / 1024); m_disp_buf.as_str() } else { let _ = write!(m_disp_buf, "{}K", mem_kb); m_disp_buf.as_str() };
     let h_kb = state::get_last_history_kb();
     let color = if h_kb > 256 { "\x1b[38;5;196m" } else if h_kb > 128 { "\x1b[38;5;226m" } else { COLOR_YELLOW };
-    let hist_disp = format!("|{}Hist: {}K{}", color, h_kb, COLOR_RESET);
+    let mut hist_disp_buf_data = [0u8; 64];
+    let mut hist_disp_buf = StackBuffer::new(&mut hist_disp_buf_data);
+    let _ = write!(hist_disp_buf, "|{}Hist: {}K{}", color, h_kb, COLOR_RESET);
+    let hist_disp = hist_disp_buf.as_str();
     let q_len = state::message_queue_len();
-    let q_disp = if q_len > 0 { format!(" [QUEUED: {}]", q_len) } else { String::new() };
+    let mut q_disp_buf_data = [0u8; 32];
+    let mut q_disp_buf = StackBuffer::new(&mut q_disp_buf_data);
+    if q_len > 0 {
+        let _ = write!(q_disp_buf, " [QUEUED: {}]", q_len);
+    }
+    let q_disp = q_disp_buf.as_str();
 
-    let prompt_prefix = format!("  {}[{}/{}|{}{}{}] {}(=^･ω･^=) > ", COLOR_YELLOW, t_disp, l_disp, m_disp, hist_disp, COLOR_YELLOW, q_disp);
+    let mut prompt_prefix_buf_data = [0u8; 128]; // Choose a size that's large enough
+    let mut prompt_prefix_buf = StackBuffer::new(&mut prompt_prefix_buf_data);
+    let _ = write!(prompt_prefix_buf, "  {}[{}/{}|{}{}{}] {}(=^･ω･^=) > ", COLOR_YELLOW, t_disp, l_disp, m_disp, hist_disp, COLOR_YELLOW, q_disp);
+    let prompt_prefix = prompt_prefix_buf.as_str();
     let p_len = visual_length(&prompt_prefix);
     INPUT_LEN.store(p_len as u16, Ordering::SeqCst);
     layout.input_prefix_len = p_len as u16;
@@ -198,12 +219,12 @@ pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
         
         set_cursor_position(0, s_r.saturating_sub(1)); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes());
         if !layout.status_text.is_empty() {
-            let _ = akuma_write(fd::STDOUT, format!("  {}{}", layout.status_color, layout.status_text).as_bytes());
-            for _ in 0..layout.status_dots { let _ = akuma_write(fd::STDOUT, b"."); }
-            for _ in layout.status_dots..5 { let _ = akuma_write(fd::STDOUT, b" "); }
+            let _ = write!(stdout, "  {}{}", layout.status_color, layout.status_text);
+            for _ in 0..layout.status_dots { let _ = write!(stdout, "."); }
+            for _ in layout.status_dots..5 { let _ = write!(stdout, " "); }
             let ms = if let Some(ms) = layout.status_time_ms { Some(ms) } else if layout.status_start_us > 0 && !layout.status_text.contains("awaiting") { Some((libakuma::uptime() - layout.status_start_us) / 1000) } else { None };
-            if let Some(ms) = ms { if ms < 1000 { let _ = akuma_write(fd::STDOUT, format!("~(=^‥^)ノ [{}ms]", ms).as_bytes()); } else { let _ = akuma_write(fd::STDOUT, format!("~(=^‥^)ノ [{}.{}s]", ms / 1000, (ms % 1000) / 100).as_bytes()); } }
-            let _ = akuma_write(fd::STDOUT, COLOR_RESET.as_bytes());
+            if let Some(ms) = ms { if ms < 1000 { let _ = write!(stdout, "~(=^‥^)ノ [{}ms]", ms); } else { let _ = write!(stdout, "~(=^‥^)ノ [{}.{}s]", ms / 1000, (ms % 1000) / 100); } }
+            let _ = write!(stdout, "{}", COLOR_RESET);
         }
         
         set_cursor_position(0, s_r);
@@ -214,12 +235,12 @@ pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
         let p_r = s_r + 1; set_cursor_position(0, p_r); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes());
         
         state::with_model_and_provider(|mod_n, prov_n| {
-            let info = format!("  {}{}[Provider: {}] [Model: {}]{}", COLOR_GRAY_DIM, COLOR_RESET, prov_n, mod_n, COLOR_RESET);
-            let _ = akuma_write(fd::STDOUT, info.as_bytes());
+            let mut stdout = Stdout;
+            let _ = write!(stdout, "  {}{}[Provider: {}] [Model: {}]{}", COLOR_GRAY_DIM, COLOR_RESET, prov_n, mod_n, COLOR_RESET);
         });
 
         for i in 0..eff_p_l { set_cursor_position(0, p_r + 1 + i as u64); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes()); }
-        if s_t == 0 { set_cursor_position(0, p_r + 1); let _ = akuma_write(fd::STDOUT, format!("{}{}{}{}", COLOR_VIOLET, COLOR_BOLD, prompt_prefix, COLOR_RESET).as_bytes()); }
+        if s_t == 0 { set_cursor_position(0, p_r + 1); let _ = write!(stdout, "{}{}{}{}", COLOR_VIOLET, COLOR_BOLD, prompt_prefix, COLOR_RESET); }
         let _ = akuma_write(fd::STDOUT, COLOR_VIOLET.as_bytes());
         let (mut c_l, mut c_c) = (0, p_len);
         for c in input_str.chars() {

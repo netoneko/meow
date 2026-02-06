@@ -1,5 +1,4 @@
 use alloc::string::String;
-use alloc::format;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -204,7 +203,10 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
     clear_screen();
     layout.set_scroll_region();
     render::print_greeting();
-    akuma_write(fd::STDOUT, format!("  {}TIP:{} Type {}/hotkeys{} to see input shortcuts nya~! ♪(=^･ω･^)ﾉ\n\n", COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, COLOR_RESET).as_bytes());
+    use crate::ui::tui::layout::Stdout;
+    use core::fmt::Write;
+    let mut stdout = Stdout;
+    let _ = write!(stdout, "  {}TIP:{} Type {}/hotkeys{} to see input shortcuts nya~! ♪(=^･ω･^)ﾉ\n\n", COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, COLOR_RESET);
 
     let o_r = h.saturating_sub(layout.footer_height + 1 + layout.gap());
     CUR_ROW.store(o_r, Ordering::SeqCst); CUR_COL.store(0, Ordering::SeqCst);
@@ -241,7 +243,10 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
             render::render_footer(c_t, context_window, m_kb);
             set_cursor_position(0, CUR_ROW.load(Ordering::SeqCst) as u64);
             tui_print_with_indent("\n\n", "", 0, None);
-            tui_print_with_indent(" >  ", "", 0, Some(&format!("{}{}", COLOR_VIOLET, COLOR_BOLD)));
+        let mut color_buf_data = [0u8; 32];
+        let mut color_buf = crate::util::StackBuffer::new(&mut color_buf_data);
+        let _ = write!(color_buf, "{}{}", COLOR_VIOLET, COLOR_BOLD);
+        tui_print_with_indent(" >  ", "", 0, Some(color_buf.as_str()));
             tui_render_markdown_with_indent(&u_i, 4);
             tui_print("\n");
 
@@ -261,7 +266,7 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
                 let _ = app::chat::chat_once(model, provider, &u_i, history, Some(context_window), system_prompt);
                 state::STREAMING.store(false, Ordering::SeqCst); state::CANCELLED.store(false, Ordering::SeqCst);
                 layout.clear_status();
-                akuma_write(fd::STDOUT, format!("{}\n", COLOR_RESET).as_bytes());
+                let _ = write!(stdout, "{}\n", COLOR_RESET);
                 compact_history(history);
             }
         }

@@ -5,6 +5,9 @@ use core::sync::atomic::Ordering;
 
 use libakuma::net::{resolve, TcpStream};
 use libakuma_tls::{HttpHeaders, HttpStreamTls, StreamResult, TLS_RECORD_SIZE};
+use crate::util::StackBuffer;
+use core::fmt::Write;
+use crate::ui::tui::layout::Stdout;
 
 use crate::config::{Provider, ApiType};
 use crate::tui_app;
@@ -47,9 +50,13 @@ pub fn send_with_retry(
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
             if !is_tui {
-                libakuma::print(&format!(" retry {}", attempt));
+                let mut stdout = Stdout;
+                let _ = write!(stdout, " retry {}", attempt);
             }
-            tui_app::update_streaming_status(&format!("{} retry {}", status_prefix, attempt), 0, None);
+            let mut status_buf_data = [0u8; 64];
+            let mut status_buf = StackBuffer::new(&mut status_buf_data);
+            let _ = write!(status_buf, "{} retry {}", status_prefix, attempt);
+            tui_app::update_streaming_status(status_buf.as_str(), 0, None);
             poll_sleep(backoff_ms, current_tokens, token_limit, mem_kb);
             backoff_ms *= 2;
         }
@@ -70,7 +77,10 @@ pub fn send_with_retry(
             Ok(s) => s,
             Err(e) => {
                 if attempt == MAX_RETRIES - 1 {
-                    if !is_tui { libakuma::print(&format!("] {}", e)); }
+                    if !is_tui { 
+                        let mut stdout = Stdout;
+                        let _ = write!(stdout, "] {}", e); 
+                    }
                     return Err("Connection failed");
                 }
                 continue;
@@ -91,9 +101,11 @@ pub fn send_with_retry(
             let mut http_stream = match HttpStreamTls::connect(stream, &host, &mut read_buf, &mut write_buf) {
                 Ok(s) => s,
                 Err(e) => {
-                    if attempt == MAX_RETRIES - 1 {
-                        if !is_tui { libakuma::print(&format!("] TLS error: {:?}", e)); }
-                        return Err("TLS handshake failed");
+                                    if attempt == MAX_RETRIES - 1 {
+                                        if !is_tui { 
+                                            let mut stdout = Stdout;
+                                            let _ = write!(stdout, "] TLS error: {:?}", e); 
+                                        }                        return Err("TLS handshake failed");
                     }
                     continue;
                 }
@@ -122,7 +134,10 @@ pub fn send_with_retry(
                 Err(e) => {
                     if e == "Request cancelled" { return Err(e); }
                     if attempt == MAX_RETRIES - 1 { return Err(e); }
-                    if !is_tui { libakuma::print(&format!(" ({})", e)); }
+                    if !is_tui { 
+                        let mut stdout = Stdout;
+                        let _ = write!(stdout, " ({})", e); 
+                    }
                     continue;
                 }
             }
@@ -144,7 +159,10 @@ pub fn send_with_retry(
                 Err(e) => {
                     if e == "Request cancelled" { return Err(e); }
                     if attempt == MAX_RETRIES - 1 { return Err(e); }
-                    if !is_tui { libakuma::print(&format!(" ({})", e)); }
+                    if !is_tui { 
+                        let mut stdout = Stdout;
+                        let _ = write!(stdout, " ({})", e); 
+                    }
                     continue;
                 }
             }
@@ -548,8 +566,16 @@ fn find_header_end(data: &[u8]) -> Option<usize> {
 }
 
 fn print_elapsed(ms: u64) {
-    if ms < 1000 { libakuma::print(&format!("~(=^‥^)ノ [{}ms]", ms)); }
-    else { libakuma::print(&format!("~(=^‥^)ノ [{}.{}s]", ms / 1000, (ms % 1000) / 100)); }
+    let mut buf_data = [0u8; 32];
+    let mut buf = StackBuffer::new(&mut buf_data);
+    let mut stdout = Stdout;
+    if ms < 1000 { 
+        let _ = write!(buf, "~(=^‥^)ノ [{}ms]", ms); 
+        let _ = write!(stdout, "{}", buf.as_str());
+    } else { 
+        let _ = write!(buf, "~(=^‥^)ノ [{}.{}s]", ms / 1000, (ms % 1000) / 100); 
+        let _ = write!(stdout, "{}", buf.as_str());
+    }
 }
 
 fn poll_sleep(ms: u64, current_tokens: usize, token_limit: usize, mem_kb: usize) {
