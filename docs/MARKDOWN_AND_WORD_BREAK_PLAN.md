@@ -69,7 +69,7 @@ To make LLM responses more readable, we will integrate `pulldown-cmark` to rende
 - **Streaming**: Markdown parsing is tricky during streaming because tags might be incomplete.
     - *Option A*: Continue printing raw text during streaming, then clear and re-render the full message as Markdown once finished.
     - *Option B*: Implement a "lookahead" or buffer-based streaming parser that can handle common tags (like bold) as they appear.
-- **Initial Phase**: We will start with **Option A** for simplicity and reliability.
+- **Initial Phase**: We will start with **Option B** for better UX
 
 ## 3. Integration Plan
 
