@@ -246,6 +246,8 @@ fn get_raw_input_queue() -> &'static mut VecDeque<u8> {
     }
 }
 
+const PROMPT_MULTILINE_INDENT: usize = 4;
+
 fn count_wrapped_lines(input: &str, prompt_width: usize, width: usize) -> usize {
     if width == 0 { return 1; }
     let mut lines = 1;
@@ -253,12 +255,12 @@ fn count_wrapped_lines(input: &str, prompt_width: usize, width: usize) -> usize 
     for c in input.chars() {
         if c == '\n' {
             lines += 1;
-            current_col = 0;
+            current_col = PROMPT_MULTILINE_INDENT;
         } else {
             current_col += 1;
             if current_col >= width {
                 lines += 1;
-                current_col = 0;
+                current_col = PROMPT_MULTILINE_INDENT;
             }
         }
     }
@@ -540,12 +542,12 @@ fn calculate_input_cursor(input: &str, idx: usize, prompt_width: usize, width: u
         if i >= idx { break; }
         
         if c == '\n' {
-            cx = 0;
+            cx = PROMPT_MULTILINE_INDENT;
             cy += 1;
         } else {
             cx += 1;
             if cx >= width {
-                cx = 0;
+                cx = PROMPT_MULTILINE_INDENT;
                 cy += 1;
             }
         }
@@ -1029,6 +1031,26 @@ pub fn calculate_history_bytes(history: &[Message]) -> usize {
     bytes
 }
 
+/// Calculate the visual length of a string, excluding ANSI escape sequences
+fn visual_length(s: &str) -> usize {
+    let mut len = 0;
+    let mut in_esc = false;
+    for c in s.chars() {
+        if in_esc {
+            if c != '[' && c >= '@' && c <= '~' {
+                in_esc = false;
+            }
+            continue;
+        }
+        if c == '\x1b' {
+            in_esc = true;
+            continue;
+        }
+        len += 1;
+    }
+    len
+}
+
 fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize, mem_kb: usize) {
     let mut stdout = Stdout;
     let layout = get_pane_layout();
@@ -1069,7 +1091,7 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
 
     let prompt_prefix = format!("  [{}/{}|{}{}] {}(=^･ω･^=) > ", 
         token_display, limit_display, mem_display, hist_display, queue_display);
-    let prompt_prefix_len = prompt_prefix.chars().count();
+    let prompt_prefix_len = visual_length(&prompt_prefix);
     INPUT_LEN.store(prompt_prefix_len as u16, Ordering::SeqCst);
     layout.input_prefix_len = prompt_prefix_len as u16;
 
@@ -1220,7 +1242,8 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let _ = write!(stdout, "{}", COLOR_VIOLET);
     for c in input.chars() {
         if c == '\n' {
-            current_line += 1; current_col = 0;
+            current_line += 1;
+            current_col = PROMPT_MULTILINE_INDENT;
         } else {
             if current_line >= scroll_top as usize && current_line < (scroll_top as usize + effective_prompt_lines) {
                 let target_row = provider_row + 1 + (current_line as u64 - scroll_top as u64);
@@ -1229,7 +1252,10 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
                 let _ = write!(stdout, "{}", c.encode_utf8(&mut buf));
             }
             current_col += 1;
-            if current_col >= w { current_line += 1; current_col = 0; }
+            if current_col >= w {
+                current_line += 1;
+                current_col = PROMPT_MULTILINE_INDENT;
+            }
         }
     }
     let _ = write!(stdout, "{}", COLOR_RESET);
