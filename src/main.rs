@@ -620,6 +620,7 @@ pub struct StreamStats {
     pub ttft_us: u64,
     pub stream_us: u64,
     pub total_bytes: usize,
+    pub fakes: usize,
 }
 
 pub enum StreamResponse {
@@ -725,11 +726,12 @@ fn print_stats(stats: &StreamStats, full_response: &str) {
     }
 
     let stats_content = format!(
-        "First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}",
+        "First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1} | Fakes: {}",
         ttft_ms,
         stream_ms,
         kb,
-        tps
+        tps,
+        stats.fakes
     );
     
     print_notification(COLOR_YELLOW, &stats_content, stats.ttft_us + stats.stream_us);
@@ -977,6 +979,7 @@ pub fn chat_once(
 
     // Track tool calls and stated intentions across all iterations
     let mut total_tools_called: usize = 0;
+    let mut total_fakes_detected: usize = 0;
     let mut all_responses = String::new();
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
@@ -993,7 +996,7 @@ pub fn chat_once(
         print(COLOR_MEOW);
         
         // Handle response and stats
-        let (assistant_response, stats) = match stream_result {
+        let (assistant_response, mut stats) = match stream_result {
             StreamResponse::Complete(response, stats) => (response, stats),
             StreamResponse::Partial(partial, stats) => {
                 // Print stats for partial response
@@ -1011,12 +1014,44 @@ pub fn chat_once(
             }
         };
 
-        // Accumulate all responses for intent counting
-        all_responses.push_str(&assistant_response);
-        all_responses.push('\n');
+        // Tools Guardrail - detect fake tool results
+        let is_fake = assistant_response.contains("[Tool Result]");
+        if is_fake {
+            stats.fakes = 1;
+            total_fakes_detected += 1;
+        }
 
         // Print stats for the assistant response
         print_stats(&stats, &assistant_response);
+
+        if is_fake {
+            let intent_phrases = extract_intent_phrases(&assistant_response);
+            
+            let mut self_check_msg = String::from("[System Notice] You outputted a fake '[Tool Result]'. You must NOT hallucinate tool results. \n\
+                If you want to perform an action, you MUST use the precise tool for it.\n");
+            
+            if !intent_phrases.is_empty() {
+                self_check_msg.push_str("\nBased on your stated intent: ");
+                for (i, intent) in intent_phrases.iter().enumerate() {
+                    if i > 0 { self_check_msg.push_str(", "); }
+                    self_check_msg.push_str(&format!("\"{}\"", intent));
+                }
+                self_check_msg.push_str("\nPlease call the appropriate tool.\n");
+            }
+            
+            self_check_msg.push_str("\nAvailable tools:\n\
+                (Refer to the tool list provided in your system prompt)");
+            
+            history.push(Message::new("user", &self_check_msg));
+            print_notification(COLOR_PEARL, "Fake Tool Result detected", 0);
+            
+            // Do not add fake results to all_responses to avoid counting them as valid intents
+            continue;
+        }
+
+        // Accumulate all responses for intent counting
+        all_responses.push_str(&assistant_response);
+        all_responses.push('\n');
 
         // First check for CompactContext tool (handled specially)
         if let Some(compact_result) = try_execute_compact_context(&assistant_response, history, system_prompt) {
@@ -1114,9 +1149,16 @@ pub fn chat_once(
         // Extract intent phrases from all accumulated responses
         let intent_phrases = extract_intent_phrases(&all_responses);
         let mismatch = !intent_phrases.is_empty() && total_tools_called == 0;
+        let has_fakes = total_fakes_detected > 0;
 
-        let intent_content = format!("Intent phrases: {} | Tools called: {}", intent_phrases.len(), total_tools_called);
-        if mismatch {
+        let intent_content = format!(
+            "Intent phrases: {} | Tools called: {} | Fakes: {}", 
+            intent_phrases.len(), 
+            total_tools_called,
+            total_fakes_detected
+        );
+        
+        if mismatch || has_fakes {
             print_notification(COLOR_PEARL, &intent_content, 0);
         } else {
             print_notification(COLOR_GREEN_LIGHT, &intent_content, 0);
@@ -1334,7 +1376,7 @@ fn read_streaming_with_http_stream_tls(
                                 tui_app::clear_streaming_status();
                                 let total_bytes = full_response.len();
                                 let stream_us = if first_token_received { libakuma::uptime() - stream_start_us } else { 0 };
-                                return Ok(StreamResponse::Complete(full_response, StreamStats { ttft_us, stream_us, total_bytes }));
+                                return Ok(StreamResponse::Complete(full_response, StreamStats { ttft_us, stream_us, total_bytes, fakes: 0 }));
                             }
                         }
                     }
@@ -1386,7 +1428,7 @@ fn read_streaming_with_http_stream_tls(
 
     let total_bytes = full_response.len();
     let stream_us = if first_token_received { libakuma::uptime() - stream_start_us } else { 0 };
-    let stats = StreamStats { ttft_us, stream_us, total_bytes };
+    let stats = StreamStats { ttft_us, stream_us, total_bytes, fakes: 0 };
 
     // Check if stream completed properly
     if !stream_completed && !full_response.is_empty() {
@@ -1649,7 +1691,7 @@ fn read_streaming_response_with_progress(
                         stream_completed = true;
                         let total_bytes = full_response.len();
                         let stream_us = if first_token_received { libakuma::uptime() - stream_start_us } else { 0 };
-                        return Ok(StreamResponse::Complete(full_response, StreamStats { ttft_us, stream_us, total_bytes }));
+                        return Ok(StreamResponse::Complete(full_response, StreamStats { ttft_us, stream_us, total_bytes, fakes: 0 }));
                     }
                 }
             }
@@ -1683,7 +1725,7 @@ fn read_streaming_response_with_progress(
 
     let total_bytes = full_response.len();
     let stream_us = if first_token_received { libakuma::uptime() - stream_start_us } else { 0 };
-    let stats = StreamStats { ttft_us, stream_us, total_bytes };
+    let stats = StreamStats { ttft_us, stream_us, total_bytes, fakes: 0 };
 
     // Check if stream completed properly
     if !stream_completed && !full_response.is_empty() {
