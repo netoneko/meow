@@ -4,7 +4,7 @@ pub mod client;
 pub use types::*;
 pub use client::send_with_retry;
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
 use libakuma::net::{TcpStream, resolve};

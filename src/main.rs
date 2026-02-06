@@ -90,7 +90,7 @@ fn main() -> i32 {
     let model = app_config.current_model.clone();
     let mut system_prompt = String::from(SYSTEM_PROMPT_BASE);
     if tools::chainlink_available() {
-        system_prompt.push_str(CHAINLINK_TOOLS_SECTION);
+        system_prompt.push_str(tools::chainlink::CHAINLINK_TOOLS_SECTION);
     }
 
     if use_tui || one_shot_message.is_none() {
@@ -162,34 +162,3 @@ fn run_init(config: &mut Config) -> i32 {
     libakuma::print(&format!("\n  Current model: {}\n  Config file: /etc/meow/config\n\n～ To add a provider, edit /etc/meow/config manually ～\n   Format:\n   [provider:name]\n   base_url=http://host:port\n   api_type=ollama|openai\n   api_key=your-key-here (optional)\n\n", config.current_model));
     0
 }
-
-const CHAINLINK_TOOLS_SECTION: &str = r#"
-### Issue Tracker Tools (Chainlink):
-
-31. **ChainlinkInit** - Initialize the issue tracker database
-    Args: `{}`
-    Note: Creates .chainlink/issues.db in current directory.
-
-32. **ChainlinkCreate** - Create a new issue
-    Args: `{"title": "Issue title", "description": "optional desc", "priority": "low|medium|high"}`
-    Note: Priority defaults to "medium" if not specified.
-
-33. **ChainlinkList** - List issues
-    Args: `{"status": "open|closed|all"}`
-    Note: Defaults to "open" if status not specified.
-
-34. **ChainlinkShow** - Show issue details with comments and labels
-    Args: `{"id": 1}`
-
-35. **ChainlinkClose** - Close an issue
-    Args: `{"id": 1}`
-
-36. **ChainlinkReopen** - Reopen a closed issue
-    Args: `{"id": 1}`
-
-37. **ChainlinkComment** - Add a comment to an issue
-    Args: `{"id": 1, "text": "Comment text"}`
-
-38. **ChainlinkLabel** - Add a label to an issue
-    Args: `{"id": 1, "label": "bug"}`
-"#;

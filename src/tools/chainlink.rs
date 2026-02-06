@@ -57,3 +57,34 @@ pub fn tool_chainlink_comment(id: usize, text: &str) -> ToolResult {
 pub fn tool_chainlink_label(id: usize, label: &str) -> ToolResult {
     tool_shell(&format!("chainlink label {} \"{}\"", id, label))
 }
+
+pub const CHAINLINK_TOOLS_SECTION: &str = r#"
+### Issue Tracker Tools (Chainlink):
+
+31. **ChainlinkInit** - Initialize the issue tracker database
+    Args: `{}`
+    Note: Creates .chainlink/issues.db in current directory.
+
+32. **ChainlinkCreate** - Create a new issue
+    Args: `{"title": "Issue title", "description": "optional desc", "priority": "low|medium|high"}`
+    Note: Priority defaults to "medium" if not specified.
+
+33. **ChainlinkList** - List issues
+    Args: `{"status": "open|closed|all"}`
+    Note: Defaults to "open" if status not specified.
+
+34. **ChainlinkShow** - Show issue details with comments and labels
+    Args: `{"id": 1}`
+
+35. **ChainlinkClose** - Close an issue
+    Args: `{"id": 1}`
+
+36. **ChainlinkReopen** - Reopen a closed issue
+    Args: `{"id": 1}`
+
+37. **ChainlinkComment** - Add a comment to an issue
+    Args: `{"id": 1, "text": "Comment text"}`
+
+38. **ChainlinkLabel** - Add a label to an issue
+    Args: `{"id": 1, "label": "bug"}`
+"#;
