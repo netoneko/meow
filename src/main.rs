@@ -47,14 +47,22 @@ fn print(s: &str) {
     }
 }
 
-/// Print metadata with 9 spaces of indent (matching LLM response start)
-fn print_metadata(content: &str, color: &str) {
+/// Print a notification with 5 spaces of indent and an optional duration suffix
+fn print_notification(color: &str, message: &str, duration_us: u64) {
+    let mut content = String::from(message);
+    if duration_us > 0 {
+        content.push_str(" | Duration: ");
+        content.push_str(&format_duration(duration_us));
+    }
+    content.push('\n');
+    
     if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
-        tui_app::tui_print_with_indent(content, "     --- ", 9, Some(color));
+        // We pass the newline inside content so tui_print_with_indent handles it correctly
+        tui_app::tui_print_with_indent(&content, "     --- ", 9, Some(color));
     } else {
         libakuma::print(color);
         libakuma::print("     --- ");
-        libakuma::print(content);
+        libakuma::print(&content);
         libakuma::print(COLOR_RESET);
     }
 }
@@ -713,15 +721,14 @@ fn print_stats(stats: &StreamStats, full_response: &str) {
     }
 
     let stats_content = format!(
-        "{} | First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}\n",
-        format_iso8601_utc(),
+        "First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}",
         ttft_ms,
         stream_ms,
         kb,
         tps
     );
     
-    print_metadata(&stats_content, COLOR_YELLOW);
+    print_notification(COLOR_YELLOW, &stats_content, stats.ttft_us + stats.stream_us);
 }
 
 fn estimate_tokens_from_bytes(bytes: usize) -> usize {
@@ -1053,10 +1060,8 @@ pub fn chat_once(
                 };
 
                 let status_content = format!(
-                    " --- {} | Tool Status: {} | Duration: {}\n",
-                    format_iso8601_utc(),
-                    status,
-                    tool_duration_str
+                    "Tool Status: {}",
+                    status
                 );
 
                 if tool_result.success {
@@ -1064,14 +1069,13 @@ pub fn chat_once(
                     print(COLOR_GRAY_BRIGHT);
                     print(&tool_result.output);
                     print(COLOR_RESET);
-                    print("\n");
-                    print_metadata(&status_content, color);
+                    print("\n\n");
+                    print_notification(color, &status_content, tool_duration_us);
                     print("\n");
                 } else {
-                    print_metadata(&status_content, color);
+                    print_notification(color, &status_content, tool_duration_us);
+                    print_notification(COLOR_PEARL, "Tool failed", 0);
                     print("\n");
-                    print(COLOR_PEARL);
-                    print("[*] Tool failed\n\n");
                     print(COLOR_GRAY_BRIGHT);
                     print(&tool_result.output);
                     print(COLOR_RESET);
@@ -1107,11 +1111,11 @@ pub fn chat_once(
         let intent_phrases = extract_intent_phrases(&all_responses);
         let mismatch = !intent_phrases.is_empty() && total_tools_called == 0;
 
-        let intent_content = format!(" --- Intent phrases: {} | Tools called: {}\n", intent_phrases.len(), total_tools_called);
+        let intent_content = format!("Intent phrases: {} | Tools called: {}", intent_phrases.len(), total_tools_called);
         if mismatch {
-            print_metadata(&intent_content, COLOR_PEARL);
+            print_notification(COLOR_PEARL, &intent_content, 0);
         } else {
-            print_metadata(&intent_content, COLOR_GREEN_LIGHT);
+            print_notification(COLOR_GREEN_LIGHT, &intent_content, 0);
         }
 
         // Check for mismatch: stated intentions but no tool calls
