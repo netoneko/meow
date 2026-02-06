@@ -31,7 +31,7 @@ pub fn chat_once(
         let mem_kb = libakuma::memory_usage() / 1024;
         let token_limit = context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
 
-        print_msg(COLOR_GRAY_DIM, "");
+        print_msg(COLOR_GRAY_DIM, " ");
 
         let mut messages_json = String::from("[");
         for (i, msg) in history.iter().enumerate() {
@@ -40,9 +40,17 @@ pub fn chat_once(
         }
         messages_json.push(']');
 
-        let stream_result = api::send_with_retry(model, provider, &messages_json, iteration > 0, current_tokens, token_limit, mem_kb)?;
+        let stream_result = api::send_with_retry(model, provider, &messages_json, iteration > 0, current_tokens, token_limit, mem_kb);
         
-        print_msg(COLOR_MEOW, "");
+        let stream_result = match stream_result {
+            Ok(res) => res,
+            Err(e) => {
+                print_notification(COLOR_PEARL, &format!("Request error: {}", e), 0);
+                return Err(e);
+            }
+        };
+        
+        print_msg(COLOR_MEOW, " ");
         
         let (assistant_response, mut stats) = match stream_result {
             StreamResponse::Complete(response, stats) => (response, stats),
