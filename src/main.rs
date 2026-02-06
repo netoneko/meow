@@ -591,11 +591,73 @@ pub fn compact_history(history: &mut Vec<Message>) {
 
 const MAX_RETRIES: u32 = 10;
 
+pub struct StreamStats {
+    pub ttft_us: u64,
+    pub stream_us: u64,
+    pub total_bytes: usize,
+}
+
 pub enum StreamResponse {
     /// Response completed normally (server sent done signal)
-    Complete(String),
+    Complete(String, StreamStats),
     /// Response was interrupted mid-stream (connection closed before done signal)
-    Partial(String),
+    Partial(String, StreamStats),
+}
+
+/// Format microseconds into human-readable duration (min, sec, ms)
+fn format_duration(us: u64) -> String {
+    let ms = us / 1000;
+    let total_secs = ms / 1000;
+    let remaining_ms = ms % 1000;
+    
+    if total_secs >= 60 {
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        format!("{}m {}s {}ms", mins, secs, remaining_ms)
+    } else if total_secs > 0 {
+        format!("{}s {}ms", total_secs, remaining_ms)
+    } else {
+        format!("{}ms", remaining_ms)
+    }
+}
+
+/// Format current timestamp (HH:MM:SS)
+fn format_timestamp() -> String {
+    let ts_us = libakuma::time();
+    let total_secs = ts_us / 1_000_000;
+    let s = total_secs % 60;
+    let m = (total_secs / 60) % 60;
+    let h = (total_secs / 3600) % 24;
+    format!("{:02}:{:02}:{:02}", h, m, s)
+}
+
+/// Print streaming statistics in light gray
+fn print_stats(stats: &StreamStats) {
+    let tps = if stats.stream_us > 0 {
+        let tokens = estimate_tokens_from_bytes(stats.total_bytes);
+        (tokens as f64) / (stats.stream_us as f64 / 1_000_000.0)
+    } else {
+        0.0
+    };
+
+    let ttft_ms = stats.ttft_us / 1000;
+    let stream_ms = stats.stream_us / 1000;
+    let kb = stats.total_bytes as f64 / 1024.0;
+
+    print(COLOR_GRAY_DIM);
+    print(&format!(
+        "\n  [{}] TTFT: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}\n",
+        format_timestamp(),
+        ttft_ms,
+        stream_ms,
+        kb,
+        tps
+    ));
+    print(COLOR_RESET);
+}
+
+fn estimate_tokens_from_bytes(bytes: usize) -> usize {
+    (bytes + 3) / 4
 }
 
 /// Attempt to send request with retries and exponential backoff
@@ -851,10 +913,13 @@ pub fn chat_once(
         // Re-apply assistant color for the response content
         print(COLOR_MEOW);
         
-        // Handle partial responses (stream interrupted before completion)
-        let assistant_response = match stream_result {
-            StreamResponse::Complete(response) => response,
-            StreamResponse::Partial(partial) => {
+        // Handle response and stats
+        let (assistant_response, stats) = match stream_result {
+            StreamResponse::Complete(response, stats) => (response, stats),
+            StreamResponse::Partial(partial, stats) => {
+                // Print stats for partial response
+                print_stats(&stats);
+                
                 // Add partial response as assistant message
                 if !partial.is_empty() {
                     history.push(Message::new("assistant", &partial));
@@ -871,14 +936,17 @@ pub fn chat_once(
         all_responses.push_str(&assistant_response);
         all_responses.push('\n');
 
+        // Print stats for the assistant response
+        print_stats(&stats);
+
         // First check for CompactContext tool (handled specially)
         if let Some(compact_result) = try_execute_compact_context(&assistant_response, history, system_prompt) {
             if compact_result.success {
                 print(COLOR_GREEN_LIGHT);
-                print("\n\n[*] Context compacted successfully nya~!\n");
+                print("\n[*] Context compacted successfully nya~!\n");
             } else {
                 print(COLOR_PEARL);
-                print("\n\n[*] Failed to compact context nya...\n");
+                print("\n[*] Failed to compact context nya...\n");
             }
             print(COLOR_GRAY_BRIGHT);
             print(&compact_result.output);
@@ -900,19 +968,22 @@ pub fn chat_once(
                 }
 
                 // Execute the tool
+                let tool_start = libakuma::uptime();
                 let tool_result = if let Some(result) = tools::execute_tool_command(&tool_call.json) {
                     result
                 } else {
                     tools::ToolResult::err("Failed to parse or execute tool command")
                 };
+                let tool_duration_us = libakuma::uptime() - tool_start;
+                let tool_duration_str = format_duration(tool_duration_us);
                 
                 print("\n");
                 if tool_result.success {
                     print(COLOR_GREEN_LIGHT);
-                    print("\n[*] Tool executed successfully nya~!\n");
+                    print(&format!("\n[*] Tool executed successfully ({})\n\n", tool_duration_str));
                 } else {
                     print(COLOR_PEARL);
-                    print("\n\n[*] Tool failed nya...\n");
+                    print(&format!("\n[*] Tool failed ({})\n\n", tool_duration_str));
                 }
                 print(COLOR_GRAY_BRIGHT);
                 print(&tool_result.output);
@@ -1108,6 +1179,8 @@ fn read_streaming_with_http_stream_tls(
     let mut pending_lines = String::new();
     let mut first_token_received = false;
     let mut stream_completed = false;
+    let mut ttft_us = 0;
+    let mut stream_start_us = 0;
 
     const RESPONSE_WARNING_THRESHOLD: usize = 64 * 1024;
     let mut warned_large_response = false;
@@ -1139,7 +1212,10 @@ fn read_streaming_with_http_stream_tls(
                             if !content.is_empty() {
                                 if !first_token_received {
                                     first_token_received = true;
-                                    let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
+                                    let now = libakuma::uptime();
+                                    ttft_us = now - start_time;
+                                    stream_start_us = now;
+                                    let elapsed_ms = ttft_us / 1000;
                                     // Update status pane with timing
                                     tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
                                     if !is_tui {
@@ -1163,7 +1239,9 @@ fn read_streaming_with_http_stream_tls(
                             if done {
                                 stream_completed = true;
                                 tui_app::clear_streaming_status();
-                                return Ok(StreamResponse::Complete(full_response));
+                                let total_bytes = full_response.len();
+                                let stream_us = if first_token_received { libakuma::uptime() - stream_start_us } else { 0 };
+                                return Ok(StreamResponse::Complete(full_response, StreamStats { ttft_us, stream_us, total_bytes }));
                             }
                         }
                     }
@@ -1183,7 +1261,10 @@ fn read_streaming_with_http_stream_tls(
                         if !content.is_empty() {
                             if !first_token_received {
                                 first_token_received = true;
-                                let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
+                                let now = libakuma::uptime();
+                                ttft_us = now - start_time;
+                                stream_start_us = now;
+                                let elapsed_ms = ttft_us / 1000;
                                 tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
                                 if !is_tui {
                                     libakuma::print(" ");
@@ -1210,17 +1291,21 @@ fn read_streaming_with_http_stream_tls(
         }
     }
 
+    let total_bytes = full_response.len();
+    let stream_us = if first_token_received { libakuma::uptime() - stream_start_us } else { 0 };
+    let stats = StreamStats { ttft_us, stream_us, total_bytes };
+
     // Check if stream completed properly
     if !stream_completed && !full_response.is_empty() {
         // Return partial response for continuation
         print("\n[!] Stream interrupted, will continue...\n");
         full_response.shrink_to_fit();
-        return Ok(StreamResponse::Partial(full_response));
+        return Ok(StreamResponse::Partial(full_response, stats));
     }
 
     // Compact the response to release excess capacity
     full_response.shrink_to_fit();
-    Ok(StreamResponse::Complete(full_response))
+    Ok(StreamResponse::Complete(full_response, stats))
 }
 
 // Default max tokens for model output - high enough to not truncate tool calls
@@ -1317,6 +1402,8 @@ fn read_streaming_response_with_progress(
     let mut first_token_received = false;
     let mut any_data_received = false;
     let mut stream_completed = false;
+    let mut ttft_us = 0;
+    let mut stream_start_us = 0;
 
     const RESPONSE_WARNING_THRESHOLD: usize = 64 * 1024;
     let mut warned_large_response = false;
@@ -1346,7 +1433,10 @@ fn read_streaming_response_with_progress(
                                 if !content.is_empty() {
                                     if !first_token_received {
                                         first_token_received = true;
-                                        let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
+                                        let now = libakuma::uptime();
+                                        ttft_us = now - start_time;
+                                        stream_start_us = now;
+                                        let elapsed_ms = ttft_us / 1000;
                                         tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
                                         if !is_tui {
                                             for _ in 0..(7 + dots_printed) {
@@ -1424,7 +1514,10 @@ fn read_streaming_response_with_progress(
                             if !content.is_empty() {
                                 if !first_token_received {
                                     first_token_received = true;
-                                    let elapsed_ms = (libakuma::uptime() - start_time) / 1000;
+                                    let now = libakuma::uptime();
+                                    ttft_us = now - start_time;
+                                    stream_start_us = now;
+                                    let elapsed_ms = ttft_us / 1000;
                                     tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
                                     if !is_tui {
                                         for _ in 0..(7 + dots_printed) {
@@ -1461,7 +1554,9 @@ fn read_streaming_response_with_progress(
 
                     if is_done {
                         stream_completed = true;
-                        return Ok(StreamResponse::Complete(full_response));
+                        let total_bytes = full_response.len();
+                        let stream_us = if first_token_received { libakuma::uptime() - stream_start_us } else { 0 };
+                        return Ok(StreamResponse::Complete(full_response, StreamStats { ttft_us, stream_us, total_bytes }));
                     }
                 }
             }
@@ -1493,17 +1588,21 @@ fn read_streaming_response_with_progress(
         }
     }
 
+    let total_bytes = full_response.len();
+    let stream_us = if first_token_received { libakuma::uptime() - stream_start_us } else { 0 };
+    let stats = StreamStats { ttft_us, stream_us, total_bytes };
+
     // Check if stream completed properly
     if !stream_completed && !full_response.is_empty() {
         // Return partial response for continuation
         print("\n[!] Stream interrupted, will continue...\n");
         full_response.shrink_to_fit();
-        return Ok(StreamResponse::Partial(full_response));
+        return Ok(StreamResponse::Partial(full_response, stats));
     }
 
     // Compact the response to release excess capacity
     full_response.shrink_to_fit();
-    Ok(StreamResponse::Complete(full_response))
+    Ok(StreamResponse::Complete(full_response, stats))
 }
 
 fn find_header_end(data: &[u8]) -> Option<usize> {
