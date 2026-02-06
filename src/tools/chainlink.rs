@@ -1,0 +1,59 @@
+use alloc::string::String;
+use alloc::format;
+use libakuma::{open, close, open_flags};
+
+use super::mod_types::ToolResult;
+use super::shell::tool_shell;
+
+pub fn chainlink_available() -> bool {
+    let fd = open("/bin/chainlink", open_flags::O_RDONLY);
+    if fd >= 0 {
+        close(fd);
+        true
+    } else {
+        false
+    }
+}
+
+pub fn tool_chainlink_init() -> ToolResult {
+    tool_shell("chainlink init")
+}
+
+pub fn tool_chainlink_create(title: &str, description: Option<&str>, priority: Option<&str>) -> ToolResult {
+    let mut cmd = format!("chainlink create \"{}\"", title.replace('"', "\\\""));
+    if let Some(desc) = description {
+        cmd.push_str(&format!(" -d \"{}\"", desc.replace('"', "\\\"")));
+    }
+    if let Some(prio) = priority {
+        cmd.push_str(&format!(" -p {}", prio));
+    }
+    tool_shell(&cmd)
+}
+
+pub fn tool_chainlink_list(status: Option<&str>) -> ToolResult {
+    match status {
+        Some(s) => tool_shell(&format!("chainlink list -s {}", s)),
+        None => tool_shell("chainlink list"),
+    }
+}
+
+pub fn tool_chainlink_show(id: usize) -> ToolResult {
+    tool_shell(&format!("chainlink show {}", id))
+}
+
+pub fn tool_chainlink_close(id: usize) -> ToolResult {
+    tool_shell(&format!("chainlink close {}", id))
+}
+
+pub fn tool_chainlink_reopen(id: usize) -> ToolResult {
+    tool_shell(&format!("chainlink reopen {}", id))
+}
+
+pub fn tool_chainlink_comment(id: usize, text: &str) -> ToolResult {
+    let escaped = text.replace('"', "\\\"");
+    tool_shell(&format!("chainlink comment {} \"{}\"", id, escaped))
+}
+
+pub fn tool_chainlink_label(id: usize, label: &str) -> ToolResult {
+    tool_shell(&format!("chainlink label {} \"{}\"", id, label))
+}
