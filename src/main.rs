@@ -47,6 +47,18 @@ fn print(s: &str) {
     }
 }
 
+/// Print metadata with 9 spaces of indent (matching LLM response start)
+fn print_metadata(content: &str, color: &str) {
+    if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+        tui_app::tui_print_with_indent(content, "     --- ", 9, Some(color));
+    } else {
+        libakuma::print(color);
+        libakuma::print("     --- ");
+        libakuma::print(content);
+        libakuma::print(COLOR_RESET);
+    }
+}
+
 // Chainlink issue tracker tools section (appended when chainlink is available)
 const CHAINLINK_TOOLS_SECTION: &str = r#"
 ### Issue Tracker Tools (Chainlink):
@@ -672,7 +684,7 @@ fn format_iso8601_utc() -> String {
 }
 
 /// Print streaming statistics in orange (yellow metric color)
-fn print_stats(stats: &StreamStats) {
+fn print_stats(stats: &StreamStats, full_response: &str) {
     let tps = if stats.stream_us > 0 {
         let tokens = estimate_tokens_from_bytes(stats.total_bytes);
         (tokens as f64) / (stats.stream_us as f64 / 1_000_000.0)
@@ -684,17 +696,32 @@ fn print_stats(stats: &StreamStats) {
     let stream_ms = stats.stream_us / 1000;
     let kb = stats.total_bytes as f64 / 1024.0;
 
-    print("\n\n"); // Empty line between model output and stats
-    print(COLOR_YELLOW);
-    print(&format!(
-        " --- {} | First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}\n",
+    // Ensure model output is exactly one line apart from stats.
+    // full_response might end with \n (printed by streaming loop).
+    if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+        if full_response.ends_with('\n') {
+            tui_app::tui_print_with_indent("\n", "", 0, None);
+        } else {
+            tui_app::tui_print_with_indent("\n\n", "", 0, None);
+        }
+    } else {
+        if full_response.ends_with('\n') {
+            libakuma::print("\n");
+        } else {
+            libakuma::print("\n\n");
+        }
+    }
+
+    let stats_content = format!(
+        "{} | First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}\n",
         format_iso8601_utc(),
         ttft_ms,
         stream_ms,
         kb,
         tps
-    ));
-    print(COLOR_RESET);
+    );
+    
+    print_metadata(&stats_content, COLOR_YELLOW);
 }
 
 fn estimate_tokens_from_bytes(bytes: usize) -> usize {
@@ -958,9 +985,8 @@ pub fn chat_once(
         let (assistant_response, stats) = match stream_result {
             StreamResponse::Complete(response, stats) => (response, stats),
             StreamResponse::Partial(partial, stats) => {
-                let partial = String::from(partial.trim_end());
                 // Print stats for partial response
-                print_stats(&stats);
+                print_stats(&stats, &partial);
                 
                 // Add partial response as assistant message
                 if !partial.is_empty() {
@@ -974,14 +1000,12 @@ pub fn chat_once(
             }
         };
 
-        let assistant_response = String::from(assistant_response.trim_end());
-
         // Accumulate all responses for intent counting
         all_responses.push_str(&assistant_response);
         all_responses.push('\n');
 
         // Print stats for the assistant response
-        print_stats(&stats);
+        print_stats(&stats, &assistant_response);
 
         // First check for CompactContext tool (handled specially)
         if let Some(compact_result) = try_execute_compact_context(&assistant_response, history, system_prompt) {
@@ -1007,8 +1031,8 @@ pub fn chat_once(
                 total_tools_called += 1;
 
                 if !current_llm_response_text.is_empty() {
-                    let text = String::from(current_llm_response_text.trim_end());
-                    history.push(Message::new("assistant", &text));
+                    // Use ORIGINAL segment for history
+                    history.push(Message::new("assistant", &current_llm_response_text));
                     current_llm_response_text.clear(); // Clear after adding to history
                 }
 
@@ -1028,20 +1052,23 @@ pub fn chat_once(
                     (COLOR_PEARL, "Failed")
                 };
 
-                print(color);
-                print(&format!(
-                    " --- {} | Tool Status: {} | Duration: {}\n",
+                let status_content = format!(
+                    "{} | Tool Status: {} | Duration: {}\n",
                     format_iso8601_utc(),
                     status,
                     tool_duration_str
-                ));
-                print(COLOR_RESET);
-                print("\n"); // Space before tool output content
+                );
+                print_metadata(&status_content, color);
 
                 if !tool_result.success {
+                    print("\n");
                     print(COLOR_PEARL);
                     print("[*] Tool failed\n\n");
+                } else {
+                    // One line apart from content
+                    print("\n");
                 }
+                
                 print(COLOR_GRAY_BRIGHT);
                 print(&tool_result.output);
                 print(COLOR_RESET);
@@ -1076,13 +1103,12 @@ pub fn chat_once(
         let intent_phrases = extract_intent_phrases(&all_responses);
         let mismatch = !intent_phrases.is_empty() && total_tools_called == 0;
 
+        let intent_content = format!("Intent phrases: {} | Tools called: {}\n", intent_phrases.len(), total_tools_called);
         if mismatch {
-            print(COLOR_PEARL);
+            print_metadata(&intent_content, COLOR_PEARL);
         } else {
-            print(COLOR_GREEN_LIGHT);
+            print_metadata(&intent_content, COLOR_GREEN_LIGHT);
         }
-        print(&format!(" --- Intent phrases: {} | Tools called: {}\n", intent_phrases.len(), total_tools_called));
-        print(COLOR_RESET);
 
         // Check for mismatch: stated intentions but no tool calls
         if mismatch {

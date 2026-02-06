@@ -1048,7 +1048,7 @@ pub fn calculate_history_bytes(history: &[Message]) -> usize {
 }
 
 /// Calculate the visual length of a string, excluding ANSI escape sequences
-fn visual_length(s: &str) -> usize {
+pub fn visual_length(s: &str) -> usize {
     let mut len = 0;
     let mut in_esc = false;
     for c in s.chars() {
