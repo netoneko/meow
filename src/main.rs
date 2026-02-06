@@ -1126,6 +1126,7 @@ pub fn chat_once(
         if mismatch {
             // Model stated intent but never called any tools
             print_notification(COLOR_PEARL, "Self check", 0);
+            print("\n");
             
             // Format the intents as a list
             let mut intents_list = String::new();
