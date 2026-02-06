@@ -1626,8 +1626,10 @@ fn tool_shell(command: &str) -> ToolResult {
                 result_str.push_str("stdout:\n```\n");
                 result_str.push_str(output_str);
                 result_str.push_str("```\n");
+                result_str.push_str(&format!("Exit code: {}", exit_code));
+            } else {
+                result_str.push_str(&format!("(No output)\nExit code: {}", exit_code));
             }
-            result_str.push_str(&format!("\nExit code: {}", exit_code));
 
             if exit_code == 0 {
                 return ToolResult::ok(result_str);

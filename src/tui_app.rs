@@ -21,11 +21,29 @@ const CLEAR_TO_EOL: &str = "\x1b[K";
 // PaneLayout - Three-pane TUI state management
 // =============================================================================
 
+/// The current state of the TUI, driving what is displayed and how input is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiState {
+    /// Waiting for user to type and press Enter.
+    Idle,
+    /// DNS resolution and TCP connection in progress.
+    Connecting,
+    /// Waiting for the first byte of the LLM response.
+    WaitingForResponse,
+    /// Streaming the LLM response.
+    Streaming,
+    /// A local command (e.g. /help) or tool is processing.
+    Processing,
+    /// The application is shutting down.
+    Exiting,
+}
+
 /// Manages the three-pane TUI layout:
 /// - Output pane (top): scrollable LLM output
 /// - Status pane (middle): connection status, timing
 /// - Footer pane (bottom): prompt input, model info
 pub struct PaneLayout {
+    pub state: TuiState,
     pub term_width: u16,
     pub term_height: u16,
     
@@ -38,8 +56,10 @@ pub struct PaneLayout {
     // Status pane - single fixed row
     pub status_row: u16,        // Row for status display
     pub status_text: String,    // Current status text (e.g., "[MEOW]")
+    pub status_color: &'static str, // Color for status text
     pub status_dots: u8,        // Number of dots for progress
     pub status_time_ms: Option<u64>, // Timing info
+    pub status_start_us: u64,   // Start time for current status
     
     // Footer pane - prompt and info
     pub footer_top: u16,        // Separator row
@@ -70,6 +90,7 @@ impl PaneLayout {
         let footer_top = separator_row;
         
         Self {
+            state: TuiState::Idle,
             term_width: width,
             term_height: height,
             output_top: 1,
@@ -78,8 +99,10 @@ impl PaneLayout {
             output_col: 0,
             status_row,
             status_text: String::new(),
+            status_color: "\x1b[38;5;242m", // COLOR_GRAY_DIM
             status_dots: 0,
             status_time_ms: None,
+            status_start_us: 0,
             footer_top,
             footer_height,
             prompt_scroll: 0,
@@ -177,19 +200,30 @@ impl PaneLayout {
         if self.status_text != text {
             self.status_text = String::from(text);
             self.status_dots = if dots > 0 { dots } else { 1 }; // Start at 1 if not specified
+            self.status_start_us = libakuma::uptime();
             self.repaint_counter = 0; // Reset counter for fresh animation
+            
+            // Auto-pick color based on text if not specified otherwise
+            self.status_color = if text.contains("error") || text.contains("failed") || text.contains("retry") || text.contains("cancelled") {
+                "\x1b[38;5;203m" // COLOR_PEARL
+            } else if text.contains("streaming") {
+                "\x1b[38;5;120m" // COLOR_GREEN_LIGHT
+            } else if text.contains("waiting") && !text.contains("awaiting") {
+                "\x1b[38;5;215m" // COLOR_YELLOW
+            } else {
+                "\x1b[38;5;242m" // COLOR_GRAY_DIM
+            };
         }
         self.status_time_ms = time_ms;
-        // Don't render here - it interferes with cursor positioning
-        // Status will be rendered during next footer render or tui_handle_input
     }
     
     /// Clear the status pane (does NOT render).
     pub fn clear_status(&mut self) {
         self.status_text.clear();
+        self.status_color = "\x1b[38;5;242m"; // COLOR_GRAY_DIM
         self.status_dots = 1; // Reset to 1 for idle animation
         self.status_time_ms = None;
-        // Don't render here - will be cleared during next footer render
+        self.status_start_us = 0;
     }
     
     /// Get max output row (alias for output_bottom).
@@ -1084,7 +1118,7 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     
     // Set idle status when not streaming
     if !is_streaming && layout.status_text.is_empty() {
-        layout.status_text = String::from("[MEOW] awaiting user input");
+        layout.update_status("[MEOW] awaiting user input", 0, None);
     }
 
     let token_display = if current_tokens >= 1000 { format!("{}k", current_tokens / 1000) } else { format!("{}", current_tokens) };
@@ -1210,7 +1244,7 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     set_cursor_position(0, streaming_status_row);
     let _ = write!(stdout, "{}", CLEAR_TO_EOL);
     if !layout.status_text.is_empty() {
-        let _ = write!(stdout, "  {}{}", COLOR_GRAY_DIM, layout.status_text);
+        let _ = write!(stdout, "  {}{}", layout.status_color, layout.status_text);
         // Animated dots (1-5), padded to 5 chars so everything stays in place
         for _ in 0..layout.status_dots {
             let _ = write!(stdout, ".");
@@ -1218,8 +1252,17 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
         for _ in layout.status_dots..5 {
             let _ = write!(stdout, " ");
         }
-        // Show time when streaming response received
-        if let Some(ms) = layout.status_time_ms {
+        
+        // Use status_time_ms if available, otherwise calculate from status_start_us
+        let ms = if let Some(ms) = layout.status_time_ms {
+            Some(ms)
+        } else if layout.status_start_us > 0 && !layout.status_text.contains("awaiting") {
+            Some((libakuma::uptime() - layout.status_start_us) / 1000)
+        } else {
+            None
+        };
+
+        if let Some(ms) = ms {
             if ms < 1000 {
                 let _ = write!(stdout, "~(=^‥^)ノ [{}ms]", ms);
             } else {

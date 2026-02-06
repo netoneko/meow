@@ -1122,10 +1122,17 @@ pub fn chat_once(
 
                 // Include current cwd in tool results so LLM always knows where it is
                 let current_cwd = tools::get_working_dir();
-                let tool_result_msg = format!(
-                    "[Tool Result]\n{}\n[End Tool Result]\n[Current Directory: {}]\n\nPlease continue your response based on this result.",
-                    tool_result.output, current_cwd
-                );
+                let tool_result_msg = if tool_result.success {
+                    format!(
+                        "[Tool Result]\n{}\n[End Tool Result]\n[Current Directory: {}]\n\nPlease continue your response based on this result.",
+                        tool_result.output, current_cwd
+                    )
+                } else {
+                    format!(
+                        "[Tool Result]\nTool failed: {}\n[End Tool Result]\n[Current Directory: {}]\n\nPlease analyze the failure and try again with a corrected command or different approach.",
+                        tool_result.output, current_cwd
+                    )
+                };
                 history.push(Message::new("user", &tool_result_msg));
                 
                 // Compact after tool execution to release memory
@@ -1351,7 +1358,7 @@ fn read_streaming_with_http_stream_tls(
                                     stream_start_us = now;
                                     let elapsed_ms = ttft_us / 1000;
                                     // Update status pane with timing
-                                    tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
+                                    tui_app::update_streaming_status("[MEOW] streaming", 0, None);
                                     if !is_tui {
                                         libakuma::print(" ");
                                         print_elapsed(elapsed_ms);
@@ -1571,7 +1578,7 @@ fn read_streaming_response_with_progress(
                                         ttft_us = now - start_time;
                                         stream_start_us = now;
                                         let elapsed_ms = ttft_us / 1000;
-                                        tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
+                                        tui_app::update_streaming_status("[MEOW] streaming", 0, None);
                                         if !is_tui {
                                             for _ in 0..(7 + dots_printed) {
                                                 libakuma::print("\x08 \x08");
@@ -1652,7 +1659,7 @@ fn read_streaming_response_with_progress(
                                     ttft_us = now - start_time;
                                     stream_start_us = now;
                                     let elapsed_ms = ttft_us / 1000;
-                                    tui_app::update_streaming_status("[MEOW] streaming", 0, Some(elapsed_ms));
+                                    tui_app::update_streaming_status("[MEOW] streaming", 0, None);
                                     if !is_tui {
                                         for _ in 0..(7 + dots_printed) {
                                             libakuma::print("\x08 \x08");
