@@ -244,13 +244,12 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
             if u_i.starts_with('/') {
                 let (res, out) = app::commands::handle_command(&u_i, model, provider, config, history, system_prompt);
                 if let Some(o) = out {
-                    akuma_write(fd::STDOUT, format!("  \n{}{}{}\n\n", COLOR_GRAY_BRIGHT, o, COLOR_RESET).as_bytes());
+                    tui_print_with_indent("\n", "", 0, None);
+                    tui_render_markdown(&o);
+                    tui_print_with_indent("\n\n", "", 0, None);
                     history.push(Message::new("system", &o));
                 }
                 if let CommandResult::Quit = res { break; }
-                let o_r = TERM_HEIGHT.load(Ordering::SeqCst).saturating_sub(layout.footer_height + 1 + layout.gap());
-                CUR_ROW.store(o_r, Ordering::SeqCst); CUR_COL.store(0, Ordering::SeqCst);
-                layout.output_row = o_r; layout.output_col = 0;
             } else {
                 state::STREAMING.store(true, Ordering::SeqCst);
                 layout.update_status("[MEOW] jacking in", 1, None);

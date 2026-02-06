@@ -109,78 +109,36 @@ pub fn handle_command(
   Tip: Ask Meow to 'compact the context' when tokens are high nya~!", current, TOKEN_LIMIT_FOR_COMPACTION)))
         }
         "/hotkeys" | "/shortcuts" => {
-            let output = String::from("┌────────────────────────────────────────────────┐
+            let output = String::from("# Meow's Input Shortcuts
 
-                                       │             Meow's Input Shortcuts             │
+* **Shift+Enter** / **Ctrl+J**: Insert newline
+* **Ctrl+A** / **Home**: Move to start of line
+* **Ctrl+E** / **End**: Move to end of line
+* **Ctrl+W**: Delete previous word
+* **Ctrl+U**: Clear entire input line
+* **Alt+B** / **Opt+Left**: Move back one word
+* **Alt+F** / **Opt+Right**: Move forward one word
+* **Arrows**: Navigate history and line
+* **ESC** / **Ctrl+C**: Cancel current AI request
 
-                                       ├────────────────────────────────────────────────┤
-
-                                       │ Shift+Enter      - Insert newline (multiline)  │
-
-                                       │ Ctrl+J           - Insert newline (fallback)   │
-
-                                       │ Ctrl+A / Home    - Move to start of line       │
-
-                                       │ Ctrl+E / End     - Move to end of line         │
-
-                                       │ Ctrl+W           - Delete previous word        │
-
-                                       │ Ctrl+U           - Clear entire input line     │
-
-                                       │ Alt+B / Opt+Left - Move back one word          │
-
-                                       │ Alt+F / Opt+Right- Move forward one word       │
-
-                                       │ Arrows           - Navigate history and line   │
-
-                                       │ ESC / Ctrl+C     - Cancel current AI request   │
-
-                                       ├────────────────────────────────────────────────┤
-
-                                       │ Note: Some terminals intercept Ctrl+W/U/C.     │
-
-                                       │ Try: iTerm2 Prefs > Keys > Left Option = Esc+  │
-
-                                       │ Or disable system shortcuts for these keys.    │
-
-                                       └────────────────────────────────────────────────┘
+*Note: Some terminals intercept Ctrl+W/U/C.*
 ");
             (CommandResult::Continue, Some(output))
         }
         "/help" | "/?" => {
-            let output = String::from("┌────────────────────────────────────────────────┐
+            let output = String::from("# Meow's Command Protocol
 
-                                       │             Meow's Command Protocol            │
+* `/clear`: Wipe memory banks nya~
+* `/model [NAME]`: Check/switch neural link
+* `/model list`: List available models
+* `/provider`: Check/switch provider
+* `/provider list`: List configured providers
+* `/tokens`: Show current token usage
+* `/hotkeys`: Show input shortcuts
+* `/quit`: Jack out of the matrix
+* `/help`: This help screen
 
-                                       ├────────────────────────────────────────────────┤
-
-                                       │ /clear        - Wipe memory banks nya~         │
-
-                                       │ /model [NAME] - Check/switch neural link       │
-
-                                       │ /model list   - List available models          │
-
-                                       │ /provider     - Check/switch provider          │
-
-                                       │ /provider list- List configured providers      │
-
-                                       │ /tokens       - Show current token usage       │
-
-                                       │ /hotkeys      - Show input shortcuts           │
-
-                                       │ /quit         - Jack out of the matrix         │
-
-                                       │ /help         - This help screen               │
-
-                                       ├────────────────────────────────────────────────┤
-
-                                       │ Context compaction: When token count is high,  │
-
-                                       │ ask Meow to compact the context to free up     │
-
-                                       │ memory nya~!                                   │
-
-                                       └────────────────────────────────────────────────┘
+**Context compaction**: When token count is high, ask Meow to compact the context to free up memory nya~!
 ");
             (CommandResult::Continue, Some(output))
         }

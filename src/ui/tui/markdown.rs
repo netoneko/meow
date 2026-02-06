@@ -40,12 +40,14 @@ impl MarkdownRenderer {
             // Handle Headers
             if trimmed.starts_with('#') {
                 let level = trimmed.chars().take_while(|&c| c == '#').count();
-                let content = trimmed[level..].trim();
-                let style = format!("{}{}", COLOR_BOLD, COLOR_VIOLET);
-                tui_print_with_indent("\n", "", self.indent, None);
-                self.render_inline(content, Some(&style));
-                tui_print_with_indent("\n", "", self.indent, None);
-                continue;
+                if level > 0 && level <= 6 {
+                    let content = trimmed[level..].trim();
+                    let style = format!("{}{}", COLOR_BOLD, COLOR_VIOLET);
+                    tui_print_with_indent("\n", "", self.indent, None);
+                    self.render_inline(content, Some(&style));
+                    tui_print_with_indent("\n", "", self.indent, None);
+                    continue;
+                }
             }
 
             // Handle Lists
@@ -56,20 +58,22 @@ impl MarkdownRenderer {
                 continue;
             }
             
-            if trimmed.len() > 2 && trimmed.chars().next().unwrap().is_ascii_digit() && trimmed.contains(". ") {
+            if trimmed.len() > 2 && trimmed.chars().next().unwrap().is_ascii_digit() {
                 if let Some(pos) = trimmed.find(". ") {
-                    let num = &trimmed[..pos+2];
-                    tui_print_with_indent(num, "", self.indent, Some(COLOR_VIOLET));
-                    self.render_inline(&trimmed[pos+2..], None);
-                    tui_print_with_indent("\n", "", self.indent, None);
-                    continue;
+                    let num_part = &trimmed[..pos+2];
+                    if num_part.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ' ') {
+                        tui_print_with_indent(num_part, "", self.indent, Some(COLOR_VIOLET));
+                        self.render_inline(&trimmed[pos+2..], None);
+                        tui_print_with_indent("\n", "", self.indent, None);
+                        continue;
+                    }
                 }
             }
 
             // Regular paragraph line
             if !trimmed.is_empty() {
                 self.render_inline(line, None);
-                tui_print_with_indent(" ", "", self.indent, None); // Space between lines in same paragraph
+                tui_print_with_indent(" ", "", self.indent, None);
             } else {
                 tui_print_with_indent("\n\n", "", self.indent, None);
             }
@@ -82,8 +86,9 @@ impl MarkdownRenderer {
         let mut current_bold = false;
         let mut current_italic = false;
         let mut current_code = false;
+        let mut text_buf = String::new();
 
-        let apply_styles = |bold: bool, italic: bool, code: bool| {
+        let mut apply_styles = |bold: bool, italic: bool, code: bool| {
             let mut s = String::from(COLOR_RESET);
             if let Some(base) = base_style { s.push_str(base); }
             if bold { s.push_str(COLOR_BOLD); }
@@ -92,38 +97,45 @@ impl MarkdownRenderer {
             s
         };
 
-        if let Some(base) = base_style {
-            tui_print_with_indent("", "", self.indent, Some(base));
-        }
+        let mut current_style = apply_styles(false, false, false);
+        tui_print_with_indent("", "", self.indent, Some(&current_style));
 
         while i < chars.len() {
+            let mut style_changed = false;
+            
             // Bold **
             if i + 1 < chars.len() && chars[i] == '*' && chars[i+1] == '*' {
                 current_bold = !current_bold;
-                tui_print_with_indent("", "", self.indent, Some(&apply_styles(current_bold, current_italic, current_code)));
+                style_changed = true;
                 i += 2;
-                continue;
             }
-            
             // Inline Code `
-            if chars[i] == '`' {
+            else if chars[i] == '`' {
                 current_code = !current_code;
-                tui_print_with_indent("", "", self.indent, Some(&apply_styles(current_bold, current_italic, current_code)));
+                style_changed = true;
                 i += 1;
-                continue;
             }
-
             // Italic *
-            if chars[i] == '*' {
+            else if chars[i] == '*' {
                 current_italic = !current_italic;
-                tui_print_with_indent("", "", self.indent, Some(&apply_styles(current_bold, current_italic, current_code)));
+                style_changed = true;
                 i += 1;
-                continue;
+            }
+            else {
+                text_buf.push(chars[i]);
+                i += 1;
             }
 
-            let mut buf = [0u8; 4];
-            tui_print_with_indent(chars[i].encode_utf8(&mut buf), "", self.indent, None);
-            i += 1;
+            if style_changed || i == chars.len() {
+                if !text_buf.is_empty() {
+                    tui_print_with_indent(&text_buf, "", self.indent, None);
+                    text_buf.clear();
+                }
+                if style_changed {
+                    current_style = apply_styles(current_bold, current_italic, current_code);
+                    tui_print_with_indent("", "", self.indent, Some(&current_style));
+                }
+            }
         }
 
         tui_print_with_indent("", "", self.indent, Some(COLOR_RESET));
