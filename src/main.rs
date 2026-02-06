@@ -1113,7 +1113,6 @@ pub fn chat_once(
                     print("\n");
                 } else {
                     print_notification(color, &status_content, tool_duration_us);
-                    print_notification(COLOR_PEARL, "Tool failed", 0);
                     print("\n");
                     print(COLOR_GRAY_BRIGHT);
                     print(&tool_result.output);
@@ -1168,7 +1167,7 @@ pub fn chat_once(
         if mismatch {
             // Model stated intent but never called any tools
             print_notification(COLOR_PEARL, "Self check", 0);
-            print("\n");
+            print("\n\n");
             
             // Format the intents as a list
             let mut intents_list = String::new();
