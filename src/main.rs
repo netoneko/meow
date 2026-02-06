@@ -906,9 +906,10 @@ pub fn chat_once(
                     tools::ToolResult::err("Failed to parse or execute tool command")
                 };
                 
+                print("\n");
                 if tool_result.success {
                     print(COLOR_GREEN_LIGHT);
-                    print("\n\n[*] Tool executed successfully nya~!\n");
+                    print("\n[*] Tool executed successfully nya~!\n");
                 } else {
                     print(COLOR_PEARL);
                     print("\n\n[*] Tool failed nya...\n");

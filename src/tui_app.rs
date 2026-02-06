@@ -330,7 +330,12 @@ impl Write for Stdout {
 /// TUI-aware print function that handles word-wrapping, indentation, and cursor management.
 /// Uses atomics as source of truth, with PaneLayout for boundary calculations.
 pub fn tui_print(s: &str) {
-    if s.is_empty() { return; }
+    tui_print_with_indent(s, "", 9, None);
+}
+
+/// Print with custom prefix, indentation for wrapped lines, and optional color.
+pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&str>) {
+    if s.is_empty() && prefix.is_empty() { return; }
     
     // Read from atomics (source of truth)
     let w = TERM_WIDTH.load(Ordering::SeqCst);
@@ -343,10 +348,20 @@ pub fn tui_print(s: &str) {
     let layout = get_pane_layout();
     let gap = layout.gap();
     let max_row = h.saturating_sub(f_h + 1 + gap);
-    let indent = 9u16; // Indentation for wrapped lines
 
     // Jump to the current output position in the scroll area.
     set_cursor_position(col as u64, row as u64);
+    
+    // Apply initial color if provided
+    if let Some(c) = color {
+        akuma_write(fd::STDOUT, c.as_bytes());
+    }
+
+    // Print initial prefix if we are at start of line
+    if col == 0 && !prefix.is_empty() {
+        akuma_write(fd::STDOUT, prefix.as_bytes());
+        col = visual_length(prefix) as u16;
+    }
     
     // Word buffer for word-wrapping (buffer the current word)
     let mut word_buf: alloc::vec::Vec<char> = alloc::vec::Vec::with_capacity(64);
@@ -356,7 +371,7 @@ pub fn tui_print(s: &str) {
     let mut esc_buf: alloc::vec::Vec<char> = alloc::vec::Vec::with_capacity(16);
     
     // Helper closure to wrap to next line
-    let wrap_line = |row: &mut u16, col: &mut u16, max_row: u16| {
+    let mut wrap_line = |row: &mut u16, col: &mut u16, max_row: u16| {
         *row += 1;
         if *row > max_row {
             *row = max_row;
@@ -364,27 +379,23 @@ pub fn tui_print(s: &str) {
         } else {
             set_cursor_position(0, *row as u64);
         }
-        akuma_write(fd::STDOUT, b"         ");
+        
+        // Apply indent
+        for _ in 0..indent {
+            akuma_write(fd::STDOUT, b" ");
+        }
         *col = indent;
     };
     
     // Helper to flush the word buffer
-    let flush_word = |word_buf: &mut alloc::vec::Vec<char>, word_display_len: &mut u16, 
+    let mut flush_word = |word_buf: &mut alloc::vec::Vec<char>, word_display_len: &mut u16, 
                       col: &mut u16, row: &mut u16, max_row: u16, w: u16, indent: u16| {
         if word_buf.is_empty() { return; }
         
         // Check if word fits on current line
         if *col + *word_display_len > w - 1 && *col > indent {
             // Word doesn't fit - wrap first
-            *row += 1;
-            if *row > max_row {
-                *row = max_row;
-                akuma_write(fd::STDOUT, b"\n");
-            } else {
-                set_cursor_position(0, *row as u64);
-            }
-            akuma_write(fd::STDOUT, b"         ");
-            *col = indent;
+            wrap_line(row, col, max_row);
         }
         
         // Print the buffered word
@@ -456,6 +467,11 @@ pub fn tui_print(s: &str) {
     // Flush any remaining word
     flush_word(&mut word_buf, &mut word_display_len, &mut col, &mut row, max_row, w, indent);
     
+    // Reset color at end
+    if color.is_some() {
+        akuma_write(fd::STDOUT, COLOR_RESET.as_bytes());
+    }
+
     // Update atomics (source of truth)
     CUR_COL.store(col, Ordering::SeqCst);
     CUR_ROW.store(row, Ordering::SeqCst);
@@ -1381,7 +1397,10 @@ pub fn run_tui(
             let cur_row = CUR_ROW.load(Ordering::SeqCst);
             set_cursor_position(0, cur_row as u64);
             
-            let _ = write!(stdout, "\n {}> {}{}{}\n", COLOR_VIOLET, COLOR_BOLD, user_input, COLOR_RESET);
+            tui_print_with_indent("\n\n", "", 0, None);
+            tui_print_with_indent(&user_input, " >  ", 4, Some(&format!("{}{}", COLOR_VIOLET, COLOR_BOLD)));
+            tui_print("\n");
+
             if user_input.starts_with('/') {
                 let (res, output) = crate::handle_command(&user_input, model, provider, config, history, system_prompt);
                 if let Some(out) = output {
