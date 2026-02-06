@@ -671,7 +671,7 @@ fn format_iso8601_utc() -> String {
     )
 }
 
-/// Print streaming statistics in orange
+/// Print streaming statistics in orange (yellow metric color)
 fn print_stats(stats: &StreamStats) {
     let tps = if stats.stream_us > 0 {
         let tokens = estimate_tokens_from_bytes(stats.total_bytes);
@@ -684,10 +684,10 @@ fn print_stats(stats: &StreamStats) {
     let stream_ms = stats.stream_us / 1000;
     let kb = stats.total_bytes as f64 / 1024.0;
 
-    print("\n"); // Newline between model output and stats
+    print("\n\n"); // Empty line between model output and stats
     print(COLOR_YELLOW);
     print(&format!(
-        "[{:^} | First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}]\n",
+        "[{:^} | First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}]",
         format_iso8601_utc(),
         ttft_ms,
         stream_ms,
@@ -695,6 +695,7 @@ fn print_stats(stats: &StreamStats) {
         tps
     ));
     print(COLOR_RESET);
+    print("\n"); // End stats line
 }
 
 fn estimate_tokens_from_bytes(bytes: usize) -> usize {
@@ -958,6 +959,7 @@ pub fn chat_once(
         let (assistant_response, stats) = match stream_result {
             StreamResponse::Complete(response, stats) => (response, stats),
             StreamResponse::Partial(partial, stats) => {
+                let partial = String::from(partial.trim_end());
                 // Print stats for partial response
                 print_stats(&stats);
                 
@@ -972,6 +974,8 @@ pub fn chat_once(
                 continue;
             }
         };
+
+        let assistant_response = String::from(assistant_response.trim_end());
 
         // Accumulate all responses for intent counting
         all_responses.push_str(&assistant_response);
@@ -1004,7 +1008,8 @@ pub fn chat_once(
                 total_tools_called += 1;
 
                 if !current_llm_response_text.is_empty() {
-                    history.push(Message::new("assistant", &current_llm_response_text));
+                    let text = String::from(current_llm_response_text.trim_end());
+                    history.push(Message::new("assistant", &text));
                     current_llm_response_text.clear(); // Clear after adding to history
                 }
 
@@ -1018,13 +1023,13 @@ pub fn chat_once(
                 let tool_duration_us = libakuma::uptime() - tool_start;
                 let tool_duration_str = format_duration(tool_duration_us);
                 
-                print("\n");
+                print("\n"); // Empty line between stats/prev-tool and this tool status
                 if tool_result.success {
                     print(COLOR_GREEN_LIGHT);
-                    print(&format!("\n[*] Tool executed successfully ({})\n\n", tool_duration_str));
+                    print(&format!("[*] Tool executed successfully ({})\n\n", tool_duration_str));
                 } else {
                     print(COLOR_PEARL);
-                    print(&format!("\n[*] Tool failed ({})\n\n", tool_duration_str));
+                    print(&format!("[*] Tool failed ({})\n\n", tool_duration_str));
                 }
                 print(COLOR_GRAY_BRIGHT);
                 print(&tool_result.output);
