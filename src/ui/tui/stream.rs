@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::format;
-use crate::config::{COLOR_GREEN_LIGHT, COLOR_RESET, COLOR_BOLD, COLOR_GRAY_DIM};
+use crate::config::{COLOR_GREEN_LIGHT, COLOR_RESET, COLOR_BOLD, COLOR_GRAY_DIM, COLOR_VIOLET};
 use super::render::{tui_print_with_indent, tui_print_assistant};
 
 pub enum StreamState {
@@ -100,6 +100,32 @@ impl StreamingRenderer {
     fn process_markdown_char(&mut self, c: char) {
         self.markdown_buf.push(c);
         
+        // Handle newline and look for block elements
+        if c == '\n' {
+            let buf = self.markdown_buf.clone();
+            self.markdown_buf.clear();
+            let trimmed = buf.trim();
+            
+            if trimmed.starts_with('#') {
+                let level = trimmed.chars().take_while(|&c| c == '#').count();
+                if level > 0 && level <= 6 {
+                    let style = format!("{}{}", COLOR_BOLD, COLOR_VIOLET);
+                    tui_print_with_indent("", "", self.indent, Some(&style));
+                    tui_print_assistant(trimmed[level..].trim());
+                    tui_print_with_indent("\n", "", self.indent, Some(COLOR_RESET));
+                    return;
+                }
+            } else if trimmed.starts_with("* ") || trimmed.starts_with("- ") {
+                tui_print_with_indent(" • ", "", self.indent, Some(COLOR_VIOLET));
+                tui_print_assistant(&trimmed[2..]);
+                tui_print_assistant("\n");
+                return;
+            }
+            
+            tui_print_assistant(&buf);
+            return;
+        }
+
         if self.markdown_buf.ends_with("**") {
             self.markdown_buf.truncate(self.markdown_buf.len() - 2);
             self.flush_markdown_buf();
@@ -120,7 +146,7 @@ impl StreamingRenderer {
                 self.flush_markdown_buf();
                 self.in_italic = !self.in_italic;
                 self.apply_style();
-            } else if first != '*' {
+            } else if first != '*' && first != '#' && first != '-' { // Don't flush if it could be a header or list
                 self.flush_first_char();
             }
         }

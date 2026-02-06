@@ -35,7 +35,10 @@ pub fn tui_print(s: &str) { render::tui_print(s); }
 pub fn tui_print_assistant(s: &str) { render::tui_print_assistant(s); }
 pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&str>) { render::tui_print_with_indent(s, prefix, indent, color); }
 pub fn tui_render_markdown(markdown: &str) {
-    let renderer = crate::ui::tui::markdown::MarkdownRenderer::new(9, "");
+    tui_render_markdown_with_indent(markdown, 9);
+}
+pub fn tui_render_markdown_with_indent(markdown: &str, indent: u16) {
+    let renderer = crate::ui::tui::markdown::MarkdownRenderer::new(indent, "");
     renderer.render(markdown);
 }
 pub fn update_streaming_status(text: &str, dots: u8, time_ms: Option<u64>) { 
@@ -238,7 +241,8 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
             render::render_footer(c_t, context_window, m_kb);
             set_cursor_position(0, CUR_ROW.load(Ordering::SeqCst) as u64);
             tui_print_with_indent("\n\n", "", 0, None);
-            tui_print_with_indent(&u_i, " >  ", 4, Some(&format!("{}{}", COLOR_VIOLET, COLOR_BOLD)));
+            tui_print_with_indent(" >  ", "", 0, Some(&format!("{}{}", COLOR_VIOLET, COLOR_BOLD)));
+            tui_render_markdown_with_indent(&u_i, 4);
             tui_print("\n");
 
             if u_i.starts_with('/') {
