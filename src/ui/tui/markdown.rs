@@ -88,7 +88,7 @@ impl MarkdownRenderer {
         let mut current_code = false;
         let mut text_buf = String::new();
 
-        let mut apply_styles = |bold: bool, italic: bool, code: bool| {
+        let apply_styles = |bold: bool, italic: bool, code: bool| {
             let mut s = String::from(COLOR_RESET);
             if let Some(base) = base_style { s.push_str(base); }
             if bold { s.push_str(COLOR_BOLD); }

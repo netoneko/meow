@@ -4,7 +4,7 @@ use core::sync::atomic::Ordering;
 use libakuma::{set_cursor_position, hide_cursor, show_cursor, write as akuma_write, fd};
 
 use crate::config::{COLOR_YELLOW, COLOR_RESET, COLOR_VIOLET, COLOR_BOLD, COLOR_GRAY_DIM};
-use crate::app::state::{self, STREAMING, get_model_and_provider};
+use crate::app::state::{self, STREAMING};
 use super::layout::{get_pane_layout, TERM_WIDTH, TERM_HEIGHT, CLEAR_TO_EOL, Stdout};
 use super::input::{INPUT_LEN, CURSOR_IDX, PROMPT_SCROLL_TOP};
 
@@ -63,7 +63,7 @@ pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&
         *col = indent;
     };
     
-    let mut flush_word = |word_buf: &mut alloc::vec::Vec<char>, word_display_len: &mut u16, col: &mut u16, row: &mut u16, max_row: u16, w: u16, indent: u16| {
+    let flush_word = |word_buf: &mut alloc::vec::Vec<char>, word_display_len: &mut u16, col: &mut u16, row: &mut u16, max_row: u16, w: u16, indent: u16| {
         if word_buf.is_empty() { return; }
         if *col + *word_display_len > w.saturating_sub(1) && *col > indent { wrap_line(row, col, max_row); }
         for c in word_buf.iter() {

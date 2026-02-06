@@ -1,10 +1,8 @@
 use alloc::string::String;
-use alloc::format;
 use core::fmt::Write;
 use core::sync::atomic::{Ordering, AtomicU16};
-use libakuma::{set_cursor_position, write as akuma_write, fd};
+use libakuma::{write as akuma_write, fd};
 
-use crate::config::{COLOR_GRAY_DIM, COLOR_RESET, COLOR_YELLOW};
 
 // ANSI escapes
 pub const CLEAR_TO_EOL: &str = "\x1b[K";

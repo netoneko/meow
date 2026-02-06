@@ -18,7 +18,6 @@ mod ui;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
 
 use config::{Config, Provider, DEFAULT_CONTEXT_WINDOW, SYSTEM_PROMPT_BASE};
 use libakuma::{arg, argc, exit};

@@ -1,8 +1,5 @@
-use alloc::string::String;
-use alloc::vec::Vec;
 use alloc::collections::VecDeque;
-use core::sync::atomic::{AtomicU16, Ordering};
-use libakuma::poll_input_event;
+use core::sync::atomic::AtomicU16;
 
 pub static INPUT_LEN: AtomicU16 = AtomicU16::new(0);
 pub static CURSOR_IDX: AtomicU16 = AtomicU16::new(0);

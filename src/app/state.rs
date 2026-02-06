@@ -1,7 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::collections::VecDeque;
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::cell::UnsafeCell;
 
 pub static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);

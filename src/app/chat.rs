@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use alloc::format;
 use core::sync::atomic::Ordering;
 
-use crate::config::{Provider, DEFAULT_CONTEXT_WINDOW, COLOR_MEOW, COLOR_GRAY_DIM, COLOR_PEARL, COLOR_GREEN_LIGHT, COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, TOKEN_LIMIT_FOR_COMPACTION};
+use crate::config::{Provider, DEFAULT_CONTEXT_WINDOW, COLOR_PEARL, COLOR_GREEN_LIGHT, COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, TOKEN_LIMIT_FOR_COMPACTION};
 use crate::api::{self, StreamResponse};
 use crate::tools;
 use crate::tui_app;

@@ -1,4 +1,3 @@
-use alloc::string::String;
 use alloc::format;
 use libakuma::{open, close, open_flags};
 
