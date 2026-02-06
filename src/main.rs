@@ -1125,10 +1125,7 @@ pub fn chat_once(
         // Check for mismatch: stated intentions but no tool calls
         if mismatch {
             // Model stated intent but never called any tools
-            print(&format!(
-                "\n[!] Detected {} intent phrase(s) but {} tool call(s) - prompting self-check\n",
-                intent_phrases.len(), total_tools_called
-            ));
+            print_notification(COLOR_PEARL, "Self check", 0);
             
             // Format the intents as a list
             let mut intents_list = String::new();
