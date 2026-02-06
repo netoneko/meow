@@ -101,13 +101,14 @@ pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&
     crate::tui_app::CUR_ROW.store(row, Ordering::SeqCst);
     layout.output_col = col; layout.output_row = row;
 
-    let input_str = state::get_global_input();
-    let (cx, cy_off) = calculate_input_cursor(&input_str, CURSOR_IDX.load(Ordering::SeqCst) as usize, INPUT_LEN.load(Ordering::SeqCst) as usize, w as usize);
-    let scroll_top = PROMPT_SCROLL_TOP.load(Ordering::SeqCst) as u64;
-    let prompt_start_row = h as u64 - layout.footer_height as u64 + 2;
-    let final_cy = prompt_start_row + (cy_off - scroll_top);
-    let clamped_cy = if final_cy >= h as u64 { h as u64 - 1 } else { final_cy };
-    set_cursor_position(cx, clamped_cy);
+    state::with_global_input(|input_str| {
+        let (cx, cy_off) = calculate_input_cursor(input_str, CURSOR_IDX.load(Ordering::SeqCst) as usize, INPUT_LEN.load(Ordering::SeqCst) as usize, w as usize);
+        let scroll_top = PROMPT_SCROLL_TOP.load(Ordering::SeqCst) as u64;
+        let prompt_start_row = h as u64 - layout.footer_height as u64 + 2;
+        let final_cy = prompt_start_row + (cy_off - scroll_top);
+        let clamped_cy = if final_cy >= h as u64 { h as u64 - 1 } else { final_cy };
+        set_cursor_position(cx, clamped_cy);
+    });
 }
 
 pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
@@ -132,76 +133,84 @@ pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
     INPUT_LEN.store(p_len as u16, Ordering::SeqCst);
     layout.input_prefix_len = p_len as u16;
 
-    let input_str = state::get_global_input();
-    let wrapped = count_wrapped_lines(&input_str, p_len, w);
-    let n_f_h = (core::cmp::min(wrapped, core::cmp::min(10, (h / 3) as usize)) + 2) as u16;
-    let o_f_h = layout.footer_height;
-    let eff_f_h = if is_streaming && n_f_h < o_f_h { o_f_h } else { n_f_h };
-    let eff_p_l = (eff_f_h as usize).saturating_sub(2);
-    
-    if eff_f_h != o_f_h {
-        let (o_o_b, o_s_r) = (layout.output_bottom, layout.status_row);
-        if eff_f_h > o_f_h {
-            let growth = eff_f_h - o_f_h;
-            for r in o_s_r..=(o_s_r + growth) { set_cursor_position(0, r as u64); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes()); }
-            set_cursor_position(0, o_o_b as u64); for _ in 0..growth { akuma_write(fd::STDOUT, b"\n"); }
-            layout.recalculate(eff_f_h); layout.set_scroll_region();
-            layout.output_row = layout.output_row.saturating_sub(growth);
-            if layout.output_row > layout.output_bottom { layout.output_row = layout.output_bottom; }
-            crate::tui_app::CUR_ROW.store(layout.output_row, Ordering::SeqCst);
-        } else {
-            for r in (h as u16 - o_f_h)..(h as u16 - eff_f_h) { set_cursor_position(0, r as u64); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes()); }
-            layout.recalculate(eff_f_h); layout.set_scroll_region();
-        }
-    }
-
-    let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
-    let (_, cy_abs) = calculate_input_cursor(&input_str, idx, p_len, w);
-    let mut s_t = layout.prompt_scroll;
-    if cy_abs < s_t as u64 { s_t = cy_abs as u16; } 
-    else if cy_abs >= (s_t as u64 + eff_p_l as u64) { s_t = (cy_abs - eff_p_l as u64 + 1) as u16; }
-    layout.prompt_scroll = s_t; PROMPT_SCROLL_TOP.store(s_t, Ordering::SeqCst);
-
-    hide_cursor();
-    let s_r = h - eff_f_h as u64;
-    if eff_f_h < o_f_h {
-        let o_st_r = (h - o_f_h as u64).saturating_sub(1);
-        for r in o_st_r..s_r { set_cursor_position(0, r); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes()); }
-    }
-    
-    set_cursor_position(0, s_r.saturating_sub(1)); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes());
-    if !layout.status_text.is_empty() {
-        let _ = akuma_write(fd::STDOUT, format!("  {}{}", layout.status_color, layout.status_text).as_bytes());
-        for _ in 0..layout.status_dots { let _ = akuma_write(fd::STDOUT, b"."); }
-        for _ in layout.status_dots..5 { let _ = akuma_write(fd::STDOUT, b" "); }
-        let ms = if let Some(ms) = layout.status_time_ms { Some(ms) } else if layout.status_start_us > 0 && !layout.status_text.contains("awaiting") { Some((libakuma::uptime() - layout.status_start_us) / 1000) } else { None };
-        if let Some(ms) = ms { if ms < 1000 { let _ = akuma_write(fd::STDOUT, format!("~(=^‥^)ノ [{}ms]", ms).as_bytes()); } else { let _ = akuma_write(fd::STDOUT, format!("~(=^‥^)ノ [{}.{}s]", ms / 1000, (ms % 1000) / 100).as_bytes()); } }
-        let _ = akuma_write(fd::STDOUT, COLOR_RESET.as_bytes());
-    }
-    
-    set_cursor_position(0, s_r); let _ = akuma_write(fd::STDOUT, format!("{}{}{}", COLOR_GRAY_DIM, "━".repeat(w), COLOR_RESET).as_bytes());
-    let p_r = s_r + 1; set_cursor_position(0, p_r); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes());
-    let (mod_n, prov_n) = get_model_and_provider();
-    let _ = akuma_write(fd::STDOUT, format!("  {}{}[Provider: {}] [Model: {}]{}", COLOR_GRAY_DIM, COLOR_RESET, prov_n, mod_n, COLOR_RESET).as_bytes());
-
-    for i in 0..eff_p_l { set_cursor_position(0, p_r + 1 + i as u64); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes()); }
-    if s_t == 0 { set_cursor_position(0, p_r + 1); let _ = akuma_write(fd::STDOUT, format!("{}{}{}{}", COLOR_VIOLET, COLOR_BOLD, prompt_prefix, COLOR_RESET).as_bytes()); }
-    let _ = akuma_write(fd::STDOUT, COLOR_VIOLET.as_bytes());
-    let (mut c_l, mut c_c) = (0, p_len);
-    for c in input_str.chars() {
-        if c == '\n' { c_l += 1; c_c = 4; }
-        else {
-            if c_l >= s_t as usize && c_l < (s_t as usize + eff_p_l) {
-                set_cursor_position(c_c as u64, p_r + 1 + (c_l as u64 - s_t as u64));
-                let mut b = [0u8; 4]; let _ = akuma_write(fd::STDOUT, c.encode_utf8(&mut b).as_bytes());
+    state::with_global_input(|input_str| {
+        let wrapped = count_wrapped_lines(input_str, p_len, w);
+        let n_f_h = (core::cmp::min(wrapped, core::cmp::min(10, (h / 3) as usize)) + 2) as u16;
+        let o_f_h = layout.footer_height;
+        let eff_f_h = if is_streaming && n_f_h < o_f_h { o_f_h } else { n_f_h };
+        let eff_p_l = (eff_f_h as usize).saturating_sub(2);
+        
+        if eff_f_h != o_f_h {
+            let (o_o_b, o_s_r) = (layout.output_bottom, layout.status_row);
+            if eff_f_h > o_f_h {
+                let growth = eff_f_h - o_f_h;
+                for r in o_s_r..=(o_s_r + growth) { set_cursor_position(0, r as u64); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes()); }
+                set_cursor_position(0, o_o_b as u64); for _ in 0..growth { akuma_write(fd::STDOUT, b"\n"); }
+                layout.recalculate(eff_f_h); layout.set_scroll_region();
+                layout.output_row = layout.output_row.saturating_sub(growth);
+                if layout.output_row > layout.output_bottom { layout.output_row = layout.output_bottom; }
+                crate::tui_app::CUR_ROW.store(layout.output_row, Ordering::SeqCst);
+            } else {
+                for r in (h as u16 - o_f_h)..(h as u16 - eff_f_h) { set_cursor_position(0, r as u64); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes()); }
+                layout.recalculate(eff_f_h); layout.set_scroll_region();
             }
-            c_c += 1; if c_c >= w { c_l += 1; c_c = 4; }
         }
-    }
-    let _ = akuma_write(fd::STDOUT, COLOR_RESET.as_bytes());
-    let (cx, cy_off) = calculate_input_cursor(&input_str, idx, p_len, w);
-    set_cursor_position(cx, p_r + 1 + (cy_off - s_t as u64));
-    show_cursor();
+
+        let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
+        let (_, cy_abs) = calculate_input_cursor(input_str, idx, p_len, w);
+        let mut s_t = layout.prompt_scroll;
+        if cy_abs < s_t as u64 { s_t = cy_abs as u16; } 
+        else if cy_abs >= (s_t as u64 + eff_p_l as u64) { s_t = (cy_abs - eff_p_l as u64 + 1) as u16; }
+        layout.prompt_scroll = s_t; PROMPT_SCROLL_TOP.store(s_t, Ordering::SeqCst);
+
+        hide_cursor();
+        let s_r = h - eff_f_h as u64;
+        if eff_f_h < o_f_h {
+            let o_st_r = (h - o_f_h as u64).saturating_sub(1);
+            for r in o_st_r..s_r { set_cursor_position(0, r); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes()); }
+        }
+        
+        set_cursor_position(0, s_r.saturating_sub(1)); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes());
+        if !layout.status_text.is_empty() {
+            let _ = akuma_write(fd::STDOUT, format!("  {}{}", layout.status_color, layout.status_text).as_bytes());
+            for _ in 0..layout.status_dots { let _ = akuma_write(fd::STDOUT, b"."); }
+            for _ in layout.status_dots..5 { let _ = akuma_write(fd::STDOUT, b" "); }
+            let ms = if let Some(ms) = layout.status_time_ms { Some(ms) } else if layout.status_start_us > 0 && !layout.status_text.contains("awaiting") { Some((libakuma::uptime() - layout.status_start_us) / 1000) } else { None };
+            if let Some(ms) = ms { if ms < 1000 { let _ = akuma_write(fd::STDOUT, format!("~(=^‥^)ノ [{}ms]", ms).as_bytes()); } else { let _ = akuma_write(fd::STDOUT, format!("~(=^‥^)ノ [{}.{}s]", ms / 1000, (ms % 1000) / 100).as_bytes()); } }
+            let _ = akuma_write(fd::STDOUT, COLOR_RESET.as_bytes());
+        }
+        
+        set_cursor_position(0, s_r);
+        akuma_write(fd::STDOUT, COLOR_GRAY_DIM.as_bytes());
+        for _ in 0..w { akuma_write(fd::STDOUT, "━".as_bytes()); }
+        akuma_write(fd::STDOUT, COLOR_RESET.as_bytes());
+
+        let p_r = s_r + 1; set_cursor_position(0, p_r); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes());
+        
+        state::with_model_and_provider(|mod_n, prov_n| {
+            let info = format!("  {}{}[Provider: {}] [Model: {}]{}", COLOR_GRAY_DIM, COLOR_RESET, prov_n, mod_n, COLOR_RESET);
+            let _ = akuma_write(fd::STDOUT, info.as_bytes());
+        });
+
+        for i in 0..eff_p_l { set_cursor_position(0, p_r + 1 + i as u64); let _ = akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes()); }
+        if s_t == 0 { set_cursor_position(0, p_r + 1); let _ = akuma_write(fd::STDOUT, format!("{}{}{}{}", COLOR_VIOLET, COLOR_BOLD, prompt_prefix, COLOR_RESET).as_bytes()); }
+        let _ = akuma_write(fd::STDOUT, COLOR_VIOLET.as_bytes());
+        let (mut c_l, mut c_c) = (0, p_len);
+        for c in input_str.chars() {
+            if c == '\n' { c_l += 1; c_c = 4; }
+            else {
+                if c_l >= s_t as usize && c_l < (s_t as usize + eff_p_l) {
+                    set_cursor_position(c_c as u64, p_r + 1 + (c_l as u64 - s_t as u64));
+                    let mut b = [0u8; 4]; let _ = akuma_write(fd::STDOUT, c.encode_utf8(&mut b).as_bytes());
+                }
+                c_c += 1; if c_c >= w { c_l += 1; c_c = 4; }
+            }
+        }
+        let _ = akuma_write(fd::STDOUT, COLOR_RESET.as_bytes());
+        let (cx, cy_off) = calculate_input_cursor(input_str, idx, p_len, w);
+        set_cursor_position(cx, p_r + 1 + (cy_off - s_t as u64));
+        show_cursor();
+    });
 }
 
 pub fn print_greeting() {

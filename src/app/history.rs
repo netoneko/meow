@@ -16,12 +16,12 @@ impl Message {
         }
     }
 
-    pub fn to_json(&self) -> String {
-        let escaped_content = json_escape(&self.content);
-        format!(
-            "{{\"role\":\"{}\",\"content\":\"{}\"}}",
-            self.role, escaped_content
-        )
+    pub fn write_json(&self, out: &mut String) {
+        out.push_str("{\"role\":\"");
+        out.push_str(&self.role);
+        out.push_str("\",\"content\":\"");
+        json_escape_to(&self.content, out);
+        out.push_str("\"}");
     }
 }
 
@@ -53,22 +53,19 @@ pub fn calculate_history_tokens(history: &[Message]) -> usize {
         .sum()
 }
 
-fn json_escape(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
+fn json_escape_to(s: &str, out: &mut String) {
     for c in s.chars() {
         match c {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
             c if c.is_control() => {
                 let code = c as u32;
-                // Use double backslash for the format string itself
-                result.push_str(&format!("\\u{:04x}", code));
+                out.push_str(&format!("\\u{:04x}", code));
             }
-            _ => result.push(c),
+            _ => out.push(c),
         }
     }
-    result
 }

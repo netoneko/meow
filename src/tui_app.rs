@@ -16,7 +16,6 @@ use crate::ui::tui::render;
 
 pub static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static CANCELLED: AtomicBool = AtomicBool::new(false);
-pub static STREAMING: AtomicBool = AtomicBool::new(false);
 pub static CUR_COL: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 pub static CUR_ROW: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 
@@ -117,6 +116,12 @@ pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize
     let b_r = poll_input_event(0, &mut e_b);
     let q = input::get_raw_input_queue();
     if b_r > 0 { for i in 0..b_r as usize { q.push_back(e_b[i]); } input::update_last_input_time(); }
+    
+    if q.is_empty() {
+        if state::STREAMING.load(Ordering::SeqCst) { render::render_footer(current_tokens, token_limit, mem_kb); }
+        return;
+    }
+
     let mut input = state::get_global_input();
     let (mut redraw, mut quit) = (false, false);
     while !q.is_empty() {
@@ -127,7 +132,7 @@ pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize
         for _ in 0..n { q.pop_front(); }
         handle_input_event(event, &mut input, &mut redraw, &mut quit, false);
     }
-    if redraw { state::set_global_input(input.clone()); }
+    if redraw { state::set_global_input(input); }
     if redraw || state::STREAMING.load(Ordering::SeqCst) { render::render_footer(current_tokens, token_limit, mem_kb); }
 }
 
@@ -177,7 +182,7 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
     loop {
         let c_t = calculate_history_tokens(history);
         let m_kb = libakuma::memory_usage() / 1024;
-        state::set_last_history_kb(app::history::calculate_history_tokens(history) / 1024);
+        state::set_last_history_kb(c_t / 1024);
         render::render_footer(c_t, context_window, m_kb);
 
         let mut e_b = [0u8; 16];
@@ -185,19 +190,21 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
         let q = input::get_raw_input_queue();
         if b_r > 0 { for i in 0..b_r as usize { q.push_back(e_b[i]); } input::update_last_input_time(); }
 
-        let mut inp = state::get_global_input();
-        let (mut q_l, mut red) = (false, false);
-        while !q.is_empty() {
-            let mut t_b = [0u8; 16]; let n_c = core::cmp::min(q.len(), 16);
-            for i in 0..n_c { t_b[i] = q[i]; }
-            let (ev, n) = input::parse_input(&t_b[..n_c]);
-            if n == 0 { break; }
-            for _ in 0..n { q.pop_front(); }
-            handle_input_event(ev, &mut inp, &mut red, &mut q_l, config.exit_on_escape);
-            if ev == InputEvent::Enter { break; }
+        if !q.is_empty() {
+            let mut inp = state::get_global_input();
+            let (mut q_l, mut red) = (false, false);
+            while !q.is_empty() {
+                let mut t_b = [0u8; 16]; let n_c = core::cmp::min(q.len(), 16);
+                for i in 0..n_c { t_b[i] = q[i]; }
+                let (ev, n) = input::parse_input(&t_b[..n_c]);
+                if n == 0 { break; }
+                for _ in 0..n { q.pop_front(); }
+                handle_input_event(ev, &mut inp, &mut red, &mut q_l, config.exit_on_escape);
+                if ev == InputEvent::Enter { break; }
+            }
+            if red { state::set_global_input(inp); }
+            if q_l { break; }
         }
-        if red { state::set_global_input(inp.clone()); }
-        if q_l { break; }
 
         if let Some(u_i) = state::pop_message() {
             render::render_footer(c_t, context_window, m_kb);

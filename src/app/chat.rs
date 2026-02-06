@@ -31,10 +31,11 @@ pub fn chat_once(
         let mem_kb = libakuma::memory_usage() / 1024;
         let token_limit = context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
 
-        let mut messages_json = String::from("[");
+        let mut messages_json = String::with_capacity(current_tokens * 4);
+        messages_json.push('[');
         for (i, msg) in history.iter().enumerate() {
             if i > 0 { messages_json.push(','); }
-            messages_json.push_str(&msg.to_json());
+            msg.write_json(&mut messages_json);
         }
         messages_json.push(']');
 
