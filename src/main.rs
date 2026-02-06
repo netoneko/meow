@@ -57,7 +57,12 @@ fn print_notification(color: &str, message: &str, duration_us: u64) {
     content.push('\n');
     
     if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
-        // We pass the newline inside content so tui_print_with_indent handles it correctly
+        // Force newline to col 0 if we are indented or in middle of line
+        // to ensure the "     --- " prefix is printed correctly
+        let col = tui_app::CUR_COL.load(Ordering::SeqCst);
+        if col != 0 {
+            tui_app::tui_print_with_indent("\n", "", 0, None);
+        }
         tui_app::tui_print_with_indent(&content, "     --- ", 9, Some(color));
     } else {
         libakuma::print(color);
@@ -704,8 +709,7 @@ fn print_stats(stats: &StreamStats, full_response: &str) {
     let stream_ms = stats.stream_us / 1000;
     let kb = stats.total_bytes as f64 / 1024.0;
 
-    // Ensure model output is exactly one line apart from stats.
-    // full_response might end with \n (printed by streaming loop).
+    // Start with empty line between model output and metadata block
     if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
         if full_response.ends_with('\n') {
             tui_app::tui_print_with_indent("\n", "", 0, None);
