@@ -244,12 +244,19 @@ fn read_streaming_with_http_stream_tls(
                                         libakuma::print(" ");
                                         print_elapsed(ttft_us / 1000);
                                         libakuma::print("\n");
+                                    } else {
+                                        tui_app::start_streaming(9);
                                     }
                                 }
-                                tui_app::tui_print_assistant(&content);
+                                if is_tui {
+                                    tui_app::process_streaming_chunk(&content);
+                                } else {
+                                    tui_app::tui_print_assistant(&content);
+                                }
                                 full_response.push_str(&content);
                             }
                             if done {
+                                if is_tui { tui_app::finish_streaming(); }
                                 tui_app::clear_streaming_status();
                                 return Ok(StreamResponse::Complete(full_response.clone(), StreamStats { ttft_us, stream_us: libakuma::uptime() - stream_start_us, total_bytes: 0, fakes: 0 }));
                             }
@@ -258,39 +265,49 @@ fn read_streaming_with_http_stream_tls(
                     pending_lines.drain(..newline_pos + 1);
                 }
             }
-            StreamResult::WouldBlock => { libakuma::sleep_ms(10); }
-            StreamResult::Done => {
-                let remaining = pending_lines.trim();
-                if !remaining.is_empty() {
-                    if let Some((content, done)) = parse_streaming_line(remaining, provider) {
-                        if !content.is_empty() {
-                            if !first_token_received {
-                                first_token_received = true;
-                                let now = libakuma::uptime();
-                                ttft_us = now - start_time;
-                                stream_start_us = now;
-                                tui_app::update_streaming_status("[MEOW] streaming", 0, Some(ttft_us / 1000));
-                                if !is_tui {
-                                    libakuma::print(" ");
-                                    print_elapsed(ttft_us / 1000);
-                                    libakuma::print("\n");
+                                    StreamResult::WouldBlock => { libakuma::sleep_ms(10); }
+                                    StreamResult::Done => {
+                                        let remaining = pending_lines.trim();
+                                        if !remaining.is_empty() {
+                                            if let Some((content, done)) = parse_streaming_line(remaining, provider) {
+                                                if !content.is_empty() {
+                                                    if !first_token_received {
+                                                        first_token_received = true;
+                                                        let now = libakuma::uptime();
+                                                        ttft_us = now - start_time;
+                                                        stream_start_us = now;
+                                                        tui_app::update_streaming_status("[MEOW] streaming", 0, Some(ttft_us / 1000));
+                                                        if !is_tui {
+                                                            libakuma::print(" ");
+                                                            print_elapsed(ttft_us / 1000);
+                                                            libakuma::print("\n");
+                                                        } else {
+                                                            tui_app::start_streaming(9);
+                                                        }
+                                                    }
+                                                    if is_tui {
+                                                        tui_app::process_streaming_chunk(&content);
+                                                    } else {
+                                                        tui_app::tui_print(&content);
+                                                    }
+                                                    full_response.push_str(&content);
+                                                }
+                                                if done {
+                                                    if is_tui { tui_app::finish_streaming(); }
+                                                    stream_completed = true;
+                                                    tui_app::clear_streaming_status();
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    StreamResult::Error(_) => { 
+                                        if is_tui { tui_app::finish_streaming(); }
+                                        return Err("Server returned error"); 
+                                    }
                                 }
                             }
-                            tui_app::tui_print(&content);
-                            full_response.push_str(&content);
-                        }
-                        if done {
-                            stream_completed = true;
-                            tui_app::clear_streaming_status();
-                        }
-                    }
-                }
-                break;
-            }
-            StreamResult::Error(_) => { return Err("Server returned error"); }
-        }
-    }
-    let stats = StreamStats { ttft_us, stream_us: if first_token_received { libakuma::uptime() - stream_start_us } else { 0 }, total_bytes: full_response.len(), fakes: 0 };
+                            let stats = StreamStats { ttft_us, stream_us: if first_token_received { libakuma::uptime() - stream_start_us } else { 0 }, total_bytes: full_response.len(), fakes: 0 };
     if !stream_completed && !full_response.is_empty() {
         full_response.shrink_to_fit();
         return Ok(StreamResponse::Partial(full_response, stats));
@@ -340,12 +357,22 @@ fn read_streaming_response_with_progress(
                                         for _ in 0..(7 + dots_printed) { libakuma::print("\x08 \x08"); }
                                         print_elapsed(ttft_us / 1000);
                                         libakuma::print("\n");
+                                    } else {
+                                        tui_app::start_streaming(9);
                                     }
                                 }
-                                tui_app::tui_print_assistant(&content);
+                                if is_tui {
+                                    tui_app::process_streaming_chunk(&content);
+                                } else {
+                                    tui_app::tui_print_assistant(&content);
+                                }
                                 full_response.push_str(&content);
                             }
-                            if done { stream_completed = true; tui_app::clear_streaming_status(); }
+                            if done { 
+                                if is_tui { tui_app::finish_streaming(); }
+                                stream_completed = true; 
+                                tui_app::clear_streaming_status(); 
+                            }
                         }
                     }
                 }
@@ -382,12 +409,23 @@ fn read_streaming_response_with_progress(
                                         for _ in 0..(7 + dots_printed) { libakuma::print("\x08 \x08"); }
                                         print_elapsed(ttft_us / 1000);
                                         libakuma::print("\n");
+                                    } else {
+                                        tui_app::start_streaming(9);
                                     }
                                 }
-                                tui_app::tui_print_assistant(&content);
+                                if is_tui {
+                                    tui_app::process_streaming_chunk(&content);
+                                } else {
+                                    tui_app::tui_print_assistant(&content);
+                                }
                                 full_response.push_str(&content);
                             }
-                            if done { is_done = true; tui_app::clear_streaming_status(); break; }
+                            if done { 
+                                if is_tui { tui_app::finish_streaming(); }
+                                is_done = true; 
+                                tui_app::clear_streaming_status(); 
+                                break; 
+                            }
                         }
                     }
                     if let Some(pos) = last_newline { pending_data.drain(..pos + 1); }

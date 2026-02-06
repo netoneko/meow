@@ -34,6 +34,10 @@ pub mod mode_flags {
 pub fn tui_print(s: &str) { render::tui_print(s); }
 pub fn tui_print_assistant(s: &str) { render::tui_print_assistant(s); }
 pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&str>) { render::tui_print_with_indent(s, prefix, indent, color); }
+pub fn tui_render_markdown(markdown: &str) {
+    let renderer = crate::ui::tui::markdown::MarkdownRenderer::new(9, "");
+    renderer.render(markdown);
+}
 pub fn update_streaming_status(text: &str, dots: u8, time_ms: Option<u64>) { 
     state::STREAMING.store(true, Ordering::SeqCst);
     get_pane_layout().update_status(text, dots, time_ms); 
@@ -44,6 +48,30 @@ pub fn clear_streaming_status() {
 }
 pub fn set_model_and_provider(model: &str, provider: &str) { state::set_model_and_provider(model, provider); }
 pub fn tui_is_cancelled() -> bool { state::CANCELLED.load(Ordering::SeqCst) }
+
+static mut STREAMING_RENDERER: Option<crate::ui::tui::stream::StreamingRenderer> = None;
+
+pub fn start_streaming(indent: u16) {
+    unsafe { STREAMING_RENDERER = Some(crate::ui::tui::stream::StreamingRenderer::new(indent)); }
+}
+
+pub fn process_streaming_chunk(chunk: &str) {
+    unsafe {
+        if let Some(r) = &mut STREAMING_RENDERER {
+            r.process_chunk(chunk);
+        } else {
+            render::tui_print_assistant(chunk);
+        }
+    }
+}
+
+pub fn finish_streaming() {
+    unsafe {
+        if let Some(mut r) = STREAMING_RENDERER.take() {
+            r.finalize();
+        }
+    }
+}
 
 fn handle_input_event(event: InputEvent, input: &mut String, redraw: &mut bool, quit: &mut bool, exit_on_escape: bool) {
     let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;

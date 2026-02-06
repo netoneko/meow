@@ -63,9 +63,9 @@ pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&
         *col = indent;
     };
     
-    let flush_word = |word_buf: &mut alloc::vec::Vec<char>, word_display_len: &mut u16, col: &mut u16, row: &mut u16, max_row: u16, w: u16, indent: u16| {
+    let mut flush_word = |word_buf: &mut alloc::vec::Vec<char>, word_display_len: &mut u16, col: &mut u16, row: &mut u16, max_row: u16, w: u16, indent: u16| {
         if word_buf.is_empty() { return; }
-        if *col + *word_display_len > w - 1 && *col > indent { wrap_line(row, col, max_row); }
+        if *col + *word_display_len > w.saturating_sub(1) && *col > indent { wrap_line(row, col, max_row); }
         for c in word_buf.iter() {
             let mut buf = [0u8; 4];
             akuma_write(fd::STDOUT, c.encode_utf8(&mut buf).as_bytes());
@@ -74,8 +74,12 @@ pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&
         word_buf.clear();
         *word_display_len = 0;
     };
+
+    let is_delimiter = |c: char| c == ' ' || c == '\t' || c == '-' || c == '/' || c == '\\' || c == ':';
+    let is_punctuation = |c: char| c == ',' || c == '.' || c == '!' || c == '?' || c == ';' || c == ':';
     
-    for c in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
         if in_esc {
             esc_buf.push(c);
             if c != '[' && c >= '@' && c <= '~' {
@@ -89,10 +93,32 @@ pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&
             continue;
         }
         if c == '\x1b' { in_esc = true; esc_buf.clear(); esc_buf.push(c); continue; }
-        if c == '\n' { flush_word(&mut word_buf, &mut word_display_len, &mut col, &mut row, max_row, w, indent); wrap_line(&mut row, &mut col, max_row); }
-        else if c == '\x08' { if col > indent { col -= 1; akuma_write(fd::STDOUT, b"\x08"); } }
-        else if c == ' ' || c == '\t' { flush_word(&mut word_buf, &mut word_display_len, &mut col, &mut row, max_row, w, indent); if col >= w - 1 { wrap_line(&mut row, &mut col, max_row); } akuma_write(fd::STDOUT, b" "); col += 1; }
-        else { word_buf.push(c); word_display_len += 1; if word_display_len >= w - indent { flush_word(&mut word_buf, &mut word_display_len, &mut col, &mut row, max_row, w, indent); } }
+        
+        if c == '\n' {
+            flush_word(&mut word_buf, &mut word_display_len, &mut col, &mut row, max_row, w, indent);
+            wrap_line(&mut row, &mut col, max_row);
+        } else if c == '\x08' {
+            if col > indent { col -= 1; akuma_write(fd::STDOUT, b"\x08"); }
+        } else if is_delimiter(c) {
+            word_buf.push(c);
+            if c != '\t' { word_display_len += 1; } else { word_display_len += 4; } // Basic tab handling
+            
+            // If it's a space, we flush AFTER the space to allow wrapping.
+            // If it's a hyphen/slash, we also flush to allow wrapping there.
+            flush_word(&mut word_buf, &mut word_display_len, &mut col, &mut row, max_row, w, indent);
+            
+            if col >= w.saturating_sub(1) { wrap_line(&mut row, &mut col, max_row); }
+        } else {
+            word_buf.push(c);
+            word_display_len += 1;
+            
+            // Peek next to see if it's punctuation. If so, don't flush yet even if we are at the end of line.
+            let next_is_punct = chars.peek().map(|&next| is_punctuation(next)).unwrap_or(false);
+            
+            if word_display_len >= w.saturating_sub(indent) && !next_is_punct {
+                flush_word(&mut word_buf, &mut word_display_len, &mut col, &mut row, max_row, w, indent);
+            }
+        }
     }
     flush_word(&mut word_buf, &mut word_display_len, &mut col, &mut row, max_row, w, indent);
     if color.is_some() { akuma_write(fd::STDOUT, COLOR_RESET.as_bytes()); }

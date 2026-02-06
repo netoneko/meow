@@ -149,6 +149,11 @@ pub fn chat_once(
 
         if !current_llm_response_text.is_empty() {
             history.push(Message::new("assistant", &current_llm_response_text));
+            if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) && tool_calls.is_empty() {
+                // We've already printed it raw during streaming. 
+                // For now, let's just leave it. If the user wants a full re-render, 
+                // we'd need a way to clear the previous output.
+            }
         }
         
         trim_history(history);
