@@ -687,7 +687,7 @@ fn print_stats(stats: &StreamStats) {
     print("\n\n"); // Empty line between model output and stats
     print(COLOR_YELLOW);
     print(&format!(
-        "[{:^} | First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}]",
+        " --- {} | First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}\n",
         format_iso8601_utc(),
         ttft_ms,
         stream_ms,
@@ -695,7 +695,6 @@ fn print_stats(stats: &StreamStats) {
         tps
     ));
     print(COLOR_RESET);
-    print("\n"); // End stats line
 }
 
 fn estimate_tokens_from_bytes(bytes: usize) -> usize {
@@ -1023,13 +1022,25 @@ pub fn chat_once(
                 let tool_duration_us = libakuma::uptime() - tool_start;
                 let tool_duration_str = format_duration(tool_duration_us);
                 
-                print("\n"); // Empty line between stats/prev-tool and this tool status
-                if tool_result.success {
-                    print(COLOR_GREEN_LIGHT);
-                    print(&format!("[*] Tool executed successfully ({})\n\n", tool_duration_str));
+                let (color, status) = if tool_result.success {
+                    (COLOR_GREEN_LIGHT, "Success")
                 } else {
+                    (COLOR_PEARL, "Failed")
+                };
+
+                print(color);
+                print(&format!(
+                    " --- {} | Tool Status: {} | Duration: {}\n",
+                    format_iso8601_utc(),
+                    status,
+                    tool_duration_str
+                ));
+                print(COLOR_RESET);
+                print("\n"); // Space before tool output content
+
+                if !tool_result.success {
                     print(COLOR_PEARL);
-                    print(&format!("[*] Tool failed ({})\n\n", tool_duration_str));
+                    print("[*] Tool failed\n\n");
                 }
                 print(COLOR_GRAY_BRIGHT);
                 print(&tool_result.output);
@@ -1070,11 +1081,11 @@ pub fn chat_once(
         } else {
             print(COLOR_GREEN_LIGHT);
         }
-        print(&format!("\n\n[*] Intent phrases: {}, tools called: {}\n", intent_phrases.len(), total_tools_called));
+        print(&format!(" --- Intent phrases: {} | Tools called: {}\n", intent_phrases.len(), total_tools_called));
         print(COLOR_RESET);
 
         // Check for mismatch: stated intentions but no tool calls
-        if !intent_phrases.is_empty() && total_tools_called == 0 {
+        if mismatch {
             // Model stated intent but never called any tools
             print(&format!(
                 "\n[!] Detected {} intent phrase(s) but {} tool call(s) - prompting self-check\n",

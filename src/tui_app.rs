@@ -1105,8 +1105,8 @@ fn render_footer_internal(input: &str, current_tokens: usize, token_limit: usize
     let queue_len = get_message_queue().len();
     let queue_display = if queue_len > 0 { format!(" [QUEUED: {}]", queue_len) } else { String::new() };
 
-    let prompt_prefix = format!("  [{}/{}|{}{}] {}(=^･ω･^=) > ", 
-        token_display, limit_display, mem_display, hist_display, queue_display);
+    let prompt_prefix = format!("  {}[{}/{}|{}{}{}] {}(=^･ω･^=) > ", 
+        COLOR_YELLOW, token_display, limit_display, mem_display, hist_display, COLOR_YELLOW, queue_display);
     let prompt_prefix_len = visual_length(&prompt_prefix);
     INPUT_LEN.store(prompt_prefix_len as u16, Ordering::SeqCst);
     layout.input_prefix_len = prompt_prefix_len as u16;
