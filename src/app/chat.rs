@@ -44,6 +44,7 @@ pub fn chat_once(
         let stream_result = match stream_result {
             Ok(res) => res,
             Err(e) => {
+                print_msg(COLOR_RESET, "\n");
                 print_notification(COLOR_PEARL, &format!("Request error: {}", e), 0);
                 return Err(e);
             }
@@ -83,6 +84,7 @@ pub fn chat_once(
             self_check_msg.push_str("\nAvailable tools:\n(Refer to the tool list provided in your system prompt)");
             history.push(Message::new("user", &self_check_msg));
             print_notification(COLOR_PEARL, "Fake Tool Result detected", 0);
+            print_msg(COLOR_RESET, "\n");
             continue;
         }
 
