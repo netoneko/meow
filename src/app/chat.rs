@@ -31,8 +31,6 @@ pub fn chat_once(
         let mem_kb = libakuma::memory_usage() / 1024;
         let token_limit = context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
 
-        print_msg(COLOR_GRAY_DIM, " ");
-
         let mut messages_json = String::from("[");
         for (i, msg) in history.iter().enumerate() {
             if i > 0 { messages_json.push(','); }
@@ -49,8 +47,6 @@ pub fn chat_once(
                 return Err(e);
             }
         };
-        
-        print_msg(COLOR_MEOW, " ");
         
         let (assistant_response, mut stats) = match stream_result {
             StreamResponse::Complete(response, stats) => (response, stats),
@@ -189,13 +185,11 @@ pub fn chat_once(
 
 fn print_msg(color: &str, s: &str) {
     if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
-        if !color.is_empty() && color != COLOR_RESET { tui_app::tui_print(color); }
-        if !s.is_empty() { tui_app::tui_print(s); }
-        if !color.is_empty() && color != COLOR_RESET { tui_app::tui_print(COLOR_RESET); }
+        crate::tui_app::tui_print_with_indent(s, "", 9, Some(color));
     } else {
-        if !color.is_empty() && color != COLOR_RESET { libakuma::print(color); }
-        if !s.is_empty() { libakuma::print(s); }
-        if !color.is_empty() && color != COLOR_RESET { libakuma::print(COLOR_RESET); }
+        if color != COLOR_RESET { libakuma::print(color); }
+        libakuma::print(s);
+        if color != COLOR_RESET { libakuma::print(COLOR_RESET); }
     }
 }
 

@@ -25,6 +25,10 @@ const CAT_ASCII: &str = r#"
                   ::::---#@%%*"#;
 
 pub fn tui_print(s: &str) {
+    tui_print_with_indent(s, "", 9, None);
+}
+
+pub fn tui_print_assistant(s: &str) {
     tui_print_with_indent(s, "", 9, Some(crate::config::COLOR_MEOW));
 }
 

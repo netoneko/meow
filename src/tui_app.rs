@@ -33,6 +33,7 @@ pub mod mode_flags {
 }
 
 pub fn tui_print(s: &str) { render::tui_print(s); }
+pub fn tui_print_assistant(s: &str) { render::tui_print_assistant(s); }
 pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&str>) { render::tui_print_with_indent(s, prefix, indent, color); }
 pub fn update_streaming_status(text: &str, dots: u8, time_ms: Option<u64>) { 
     state::STREAMING.store(true, Ordering::SeqCst);

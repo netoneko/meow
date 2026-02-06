@@ -246,7 +246,7 @@ fn read_streaming_with_http_stream_tls(
                                         libakuma::print("\n");
                                     }
                                 }
-                                tui_app::tui_print(&content);
+                                tui_app::tui_print_assistant(&content);
                                 full_response.push_str(&content);
                             }
                             if done {
@@ -342,7 +342,7 @@ fn read_streaming_response_with_progress(
                                         libakuma::print("\n");
                                     }
                                 }
-                                tui_app::tui_print(&content);
+                                tui_app::tui_print_assistant(&content);
                                 full_response.push_str(&content);
                             }
                             if done { stream_completed = true; tui_app::clear_streaming_status(); }
@@ -384,7 +384,7 @@ fn read_streaming_response_with_progress(
                                         libakuma::print("\n");
                                     }
                                 }
-                                tui_app::tui_print(&content);
+                                tui_app::tui_print_assistant(&content);
                                 full_response.push_str(&content);
                             }
                             if done { is_done = true; tui_app::clear_streaming_status(); break; }
