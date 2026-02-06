@@ -1053,26 +1053,30 @@ pub fn chat_once(
                 };
 
                 let status_content = format!(
-                    "{} | Tool Status: {} | Duration: {}\n",
+                    " --- {} | Tool Status: {} | Duration: {}\n",
                     format_iso8601_utc(),
                     status,
                     tool_duration_str
                 );
-                print_metadata(&status_content, color);
 
-                if !tool_result.success {
+                if tool_result.success {
+                    print("\n");
+                    print(COLOR_GRAY_BRIGHT);
+                    print(&tool_result.output);
+                    print(COLOR_RESET);
+                    print("\n");
+                    print_metadata(&status_content, color);
+                    print("\n");
+                } else {
+                    print_metadata(&status_content, color);
                     print("\n");
                     print(COLOR_PEARL);
                     print("[*] Tool failed\n\n");
-                } else {
-                    // One line apart from content
-                    print("\n");
+                    print(COLOR_GRAY_BRIGHT);
+                    print(&tool_result.output);
+                    print(COLOR_RESET);
+                    print("\n\n");
                 }
-                
-                print(COLOR_GRAY_BRIGHT);
-                print(&tool_result.output);
-                print(COLOR_RESET);
-                print("\n\n");
 
                 // Include current cwd in tool results so LLM always knows where it is
                 let current_cwd = tools::get_working_dir();
@@ -1103,7 +1107,7 @@ pub fn chat_once(
         let intent_phrases = extract_intent_phrases(&all_responses);
         let mismatch = !intent_phrases.is_empty() && total_tools_called == 0;
 
-        let intent_content = format!("Intent phrases: {} | Tools called: {}\n", intent_phrases.len(), total_tools_called);
+        let intent_content = format!(" --- Intent phrases: {} | Tools called: {}\n", intent_phrases.len(), total_tools_called);
         if mismatch {
             print_metadata(&intent_content, COLOR_PEARL);
         } else {
