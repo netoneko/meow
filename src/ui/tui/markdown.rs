@@ -5,11 +5,12 @@ use super::render::tui_print_with_indent;
 
 pub struct MarkdownRenderer {
     indent: u16,
+    base_style: Option<&'static str>, // Store base style
 }
 
 impl MarkdownRenderer {
-    pub fn new(indent: u16, _prefix: &str) -> Self {
-        Self { indent }
+    pub fn new(indent: u16, _prefix: &str, base_style: Option<&'static str>) -> Self {
+        Self { indent, base_style }
     }
 
     pub fn render(&self, markdown: &str) {

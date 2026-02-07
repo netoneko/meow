@@ -7,7 +7,7 @@ use libakuma::{
     set_cursor_position, clear_screen, poll_input_event, write as akuma_write, show_cursor, fd
 };
 
-use crate::config::{Provider, Config, COLOR_GRAY_BRIGHT, COLOR_YELLOW, COLOR_RESET, COLOR_BOLD, COLOR_VIOLET};
+use crate::config::{Provider, Config, COLOR_GRAY_BRIGHT, COLOR_YELLOW, COLOR_RESET, COLOR_BOLD, COLOR_VIOLET, COLOR_USER};
 use crate::app::{self, Message, commands::CommandResult, calculate_history_tokens, compact_history, state};
 use crate::ui::tui::layout::{get_pane_layout, TERM_WIDTH, TERM_HEIGHT};
 use crate::ui::tui::input::{self, InputEvent, CURSOR_IDX};
@@ -34,10 +34,10 @@ pub fn tui_print(s: &str) { render::tui_print(s); }
 pub fn tui_print_assistant(s: &str) { render::tui_print_assistant(s); }
 pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&str>) { render::tui_print_with_indent(s, prefix, indent, color); }
 pub fn tui_render_markdown(markdown: &str) {
-    tui_render_markdown_with_indent(markdown, 9);
+    tui_render_markdown_with_indent(markdown, 9, None); // Default to None for general markdown
 }
-pub fn tui_render_markdown_with_indent(markdown: &str, indent: u16) {
-    let renderer = crate::ui::tui::markdown::MarkdownRenderer::new(indent, "");
+pub fn tui_render_markdown_with_indent(markdown: &str, indent: u16, base_style: Option<&'static str>) {
+    let renderer = crate::ui::tui::markdown::MarkdownRenderer::new(indent, "", base_style);
     renderer.render(markdown);
 }
 pub fn update_streaming_status(text: &str, dots: u8, time_ms: Option<u64>) { 
@@ -247,7 +247,7 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
         let mut color_buf = crate::util::StackBuffer::new(&mut color_buf_data);
         let _ = write!(color_buf, "{}{}", COLOR_VIOLET, COLOR_BOLD);
         tui_print_with_indent(" >  ", "", 0, Some(color_buf.as_str()));
-            tui_render_markdown_with_indent(&u_i, 4);
+            tui_render_markdown_with_indent(&u_i, 4, Some(COLOR_USER)); // Pass user color here
             tui_print("\n");
 
             if u_i.starts_with('/') {
