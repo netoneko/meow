@@ -324,7 +324,7 @@ impl Default for Config {
             current_model: String::from("gemma3:27b"),
             providers: alloc::vec![Provider::ollama_default()],
             exit_on_escape: false,
-            render_markdown: true,
+            render_markdown: false,
         }
     }
 }
