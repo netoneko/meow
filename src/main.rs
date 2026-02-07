@@ -150,6 +150,20 @@ fn print_usage() {
 
 fn run_init(config: &mut Config) -> i32 {
     libakuma::print("\n  /\\_/\\  ╔══════════════════════════════════════╗\n ( o.o ) ║  M E O W - C H A N   I N I T         ║\n  > ^ <  ║  ～ Provider Configuration ～        ║\n /|   |\\ ╚══════════════════════════════════════╝\n\n～ Current providers: ～\n");
+    
+    // Try to create the config file if it's missing
+    let fd = libakuma::open("/etc/meow/config", libakuma::open_flags::O_RDONLY);
+    if fd < 0 {
+        libakuma::print("  [*] Config file missing, initializing with defaults...\n");
+        if let Err(e) = config.save() {
+            libakuma::print(&format!("  [!] Failed to save default config: {}\n", e));
+        } else {
+            libakuma::print("  [*] Default config created at /etc/meow/config\n");
+        }
+    } else {
+        libakuma::close(fd);
+    }
+
     if config.providers.is_empty() {
         libakuma::print("  (none configured)\n");
     } else {

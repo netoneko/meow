@@ -334,6 +334,7 @@ impl Config {
     pub fn load() -> Self {
         let fd = open(CONFIG_PATH, open_flags::O_RDONLY);
         if fd < 0 {
+            // libakuma::print("  [DEBUG] Config file not found, using defaults\n");
             return Self::default();
         }
 
@@ -341,13 +342,21 @@ impl Config {
         let stat = match fstat(fd) {
             Ok(s) => s,
             Err(_) => {
+                libakuma::print("  [DEBUG] Failed to stat config file\n");
                 close(fd);
                 return Self::default();
             }
         };
 
         let size = stat.st_size as usize;
-        if size == 0 || size > 16 * 1024 {
+        if size == 0 {
+            // libakuma::print("  [DEBUG] Config file is empty\n");
+            close(fd);
+            return Self::default();
+        }
+        
+        if size > 16 * 1024 {
+            libakuma::print("  [DEBUG] Config file too large\n");
             close(fd);
             return Self::default();
         }
@@ -357,12 +366,16 @@ impl Config {
         close(fd);
 
         if bytes_read <= 0 {
+            libakuma::print("  [DEBUG] Failed to read config file\n");
             return Self::default();
         }
 
         let content = match core::str::from_utf8(&buf[..bytes_read as usize]) {
             Ok(s) => s,
-            Err(_) => return Self::default(),
+            Err(_) => {
+                libakuma::print("  [DEBUG] Config file is not valid UTF-8\n");
+                return Self::default();
+            }
         };
 
         Self::parse(content)
@@ -453,7 +466,7 @@ impl Config {
     /// Save configuration to disk
     pub fn save(&self) -> Result<(), &'static str> {
         // Create directory if needed
-        mkdir(CONFIG_DIR);
+        libakuma::mkdir_p(CONFIG_DIR);
 
         let content = self.serialize();
 
