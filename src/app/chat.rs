@@ -238,7 +238,7 @@ fn print_stats(stats: &api::StreamStats, full_response: &str) {
         if full_response.ends_with('\n') { libakuma::print("\n"); }
         else { libakuma::print("\n\n"); }
     }
-    let stats_content = format!("First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1} | Fakes: {}", stats.ttft_us / 1000, stats.stream_us / 1000, stats.total_bytes as f64 / 1024.0, tps, stats.fakes);
+    let stats_content = format!("First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}", stats.ttft_us / 1000, stats.stream_us / 1000, stats.total_bytes as f64 / 1024.0, tps);
     print_notification(COLOR_YELLOW, &stats_content, stats.ttft_us + stats.stream_us);
 }
 
