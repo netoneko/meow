@@ -16,18 +16,6 @@ impl<'a> StackBuffer<'a> {
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buffer[..self.offset]).unwrap_or("")
     }
-
-    pub fn len(&self) -> usize {
-        self.offset
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.offset == 0
-    }
-
-    pub fn clear(&mut self) {
-        self.offset = 0;
-    }
 }
 
 impl<'a> Write for StackBuffer<'a> {

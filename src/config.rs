@@ -6,7 +6,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libakuma::{open, close, read_fd, write_fd, fstat, mkdir, open_flags};
+use libakuma::{open, close, read_fd, write_fd, fstat, open_flags};
 
 /// Token limit for context compaction (when LLM should consider compacting)
 pub const TOKEN_LIMIT_FOR_COMPACTION: usize = 32_000;

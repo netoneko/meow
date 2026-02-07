@@ -78,7 +78,6 @@ where
 
 pub fn get_global_input() -> String { with_state(|s| s.global_input.clone()) }
 pub fn set_global_input(val: String) { with_state(|s| s.global_input = val); }
-pub fn clear_global_input() { with_state(|s| s.global_input.clear()); }
 
 pub fn push_message(msg: String) { with_state(|s| s.message_queue.push_back(msg)); }
 pub fn pop_message() -> Option<String> { with_state(|s| s.message_queue.pop_front()) }
@@ -107,10 +106,6 @@ pub fn set_model_and_provider(model: &str, provider: &str) {
         s.model_name = String::from(model);
         s.provider_name = String::from(provider);
     });
-}
-
-pub fn get_model_and_provider() -> (String, String) {
-    with_state(|s| (s.model_name.clone(), s.provider_name.clone()))
 }
 
 pub fn with_model_and_provider<F, R>(f: F) -> R

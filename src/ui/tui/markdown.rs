@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::format;
-use crate::config::{COLOR_BOLD, COLOR_RESET, COLOR_GRAY_DIM, COLOR_VIOLET};
+use crate::config::{COLOR_BOLD, COLOR_RESET, COLOR_GRAY_DIM, COLOR_VIOLET, COLOR_YELLOW};
 use super::render::tui_print_with_indent;
 
 pub struct MarkdownRenderer {
@@ -14,20 +14,37 @@ impl MarkdownRenderer {
 
     pub fn render(&self, markdown: &str) {
         let mut in_code_block = false;
+        const BG_CODE: &str = "\x1b[48;5;235m"; // Darker grey background for code blocks
         
         for line in markdown.lines() {
             let trimmed = line.trim();
             
             // Handle Code Blocks
             if trimmed.starts_with("```") {
-                in_code_block = !in_code_block;
-                tui_print_with_indent("\n", "", self.indent, None);
+                if !in_code_block {
+                    // Entering code block
+                    let lang = &trimmed[3..].trim();
+                    if !lang.is_empty() {
+                        tui_print_with_indent(format!("{}\n", lang).as_str(), "", self.indent, Some(COLOR_YELLOW));
+                    }
+                    in_code_block = true;
+                } else {
+                    // Leaving code block
+                    in_code_block = false;
+                    tui_print_with_indent(COLOR_RESET, "", 0, None);
+                    tui_print_with_indent("\n", "", self.indent, None);
+                }
                 continue;
             }
             
             if in_code_block {
-                tui_print_with_indent(line, "", self.indent + 2, Some(COLOR_GRAY_DIM));
-                tui_print_with_indent("\n", "", self.indent, None);
+                let mut styled_line = String::from(BG_CODE);
+                styled_line.push_str(COLOR_GRAY_DIM);
+                styled_line.push_str(line);
+                // Fill the rest of the line with background color? 
+                // TUI usually renders line by line. Let's just apply it to the text.
+                tui_print_with_indent(&styled_line, "", self.indent + 2, None);
+                tui_print_with_indent(format!("{}\n", COLOR_RESET).as_str(), "", 0, None);
                 continue;
             }
 

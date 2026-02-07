@@ -1,7 +1,6 @@
 use alloc::string::String;
 use alloc::format;
 use crate::config::MAX_TOOL_OUTPUT_SIZE;
-const MAX_FILE_SIZE: usize = 512 * 1024;
 use libakuma::{mkdir, open, open_flags, write_fd, close};
 
 use super::context::get_sandbox_root;

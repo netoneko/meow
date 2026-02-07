@@ -10,15 +10,15 @@ pub const CLEAR_TO_EOL: &str = "\x1b[K";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiState {
     Idle,
-    Connecting,
-    WaitingForResponse,
-    Streaming,
-    Processing,
-    Exiting,
+    _Connecting,
+    _WaitingForResponse,
+    _Streaming,
+    _Processing,
+    _Exiting,
 }
 
 pub struct PaneLayout {
-    pub state: TuiState,
+    pub _state: TuiState,
     pub term_width: u16,
     pub term_height: u16,
     pub output_top: u16,
@@ -34,7 +34,7 @@ pub struct PaneLayout {
     pub footer_top: u16,
     pub footer_height: u16,
     pub prompt_scroll: u16,
-    pub cursor_idx: u16,
+    pub _cursor_idx: u16,
     pub input_prefix_len: u16,
     pub repaint_counter: u16,
 }
@@ -48,7 +48,7 @@ impl PaneLayout {
         let output_bottom = status_row.saturating_sub(gap);
         
         Self {
-            state: TuiState::Idle,
+            _state: TuiState::Idle,
             term_width: width,
             term_height: height,
             output_top: 1,
@@ -64,7 +64,7 @@ impl PaneLayout {
             footer_top: separator_row,
             footer_height,
             prompt_scroll: 0,
-            cursor_idx: 0,
+            _cursor_idx: 0,
             input_prefix_len: 0,
             repaint_counter: 0,
         }
@@ -139,11 +139,12 @@ static mut PANE_LAYOUT: Option<PaneLayout> = None;
 
 pub fn get_pane_layout() -> &'static mut PaneLayout {
     unsafe {
-        if PANE_LAYOUT.is_none() {
+        let ptr = core::ptr::addr_of_mut!(PANE_LAYOUT);
+        if (*ptr).is_none() {
             let w = TERM_WIDTH.load(Ordering::SeqCst);
             let h = TERM_HEIGHT.load(Ordering::SeqCst);
-            PANE_LAYOUT = Some(PaneLayout::new(w, h));
+            *ptr = Some(PaneLayout::new(w, h));
         }
-        PANE_LAYOUT.as_mut().unwrap()
+        (*ptr).as_mut().unwrap()
     }
 }

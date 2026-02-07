@@ -1,19 +1,20 @@
 use alloc::collections::VecDeque;
-use core::sync::atomic::AtomicU16;
+use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 pub static INPUT_LEN: AtomicU16 = AtomicU16::new(0);
 pub static CURSOR_IDX: AtomicU16 = AtomicU16::new(0);
 pub static PROMPT_SCROLL_TOP: AtomicU16 = AtomicU16::new(0);
+static LAST_INPUT_TIME: AtomicU64 = AtomicU64::new(0);
 
 static mut RAW_INPUT_QUEUE: Option<VecDeque<u8>> = None;
-static mut LAST_INPUT_TIME: u64 = 0;
 
 pub fn get_raw_input_queue() -> &'static mut VecDeque<u8> {
     unsafe {
-        if RAW_INPUT_QUEUE.is_none() {
-            RAW_INPUT_QUEUE = Some(VecDeque::with_capacity(64));
+        let ptr = core::ptr::addr_of_mut!(RAW_INPUT_QUEUE);
+        if (*ptr).is_none() {
+            *ptr = Some(VecDeque::with_capacity(64));
         }
-        RAW_INPUT_QUEUE.as_mut().unwrap()
+        (*ptr).as_mut().unwrap()
     }
 }
 
@@ -54,10 +55,8 @@ pub fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
         0x1B => {
             if buf.len() == 1 {
                 let now = libakuma::uptime();
-                unsafe {
-                    if now.saturating_sub(LAST_INPUT_TIME) > 50000 { return (InputEvent::Esc, 1); }
-                    else { return (InputEvent::Unknown, 0); }
-                }
+                if now.saturating_sub(LAST_INPUT_TIME.load(Ordering::Relaxed)) > 50000 { return (InputEvent::Esc, 1); }
+                else { return (InputEvent::Unknown, 0); }
             }
             if buf[1] == 0x5B {
                 let mut i = 2;
@@ -161,5 +160,5 @@ pub fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
 }
 
 pub fn update_last_input_time() {
-    unsafe { LAST_INPUT_TIME = libakuma::uptime(); }
+    LAST_INPUT_TIME.store(libakuma::uptime(), Ordering::Relaxed);
 }

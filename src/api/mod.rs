@@ -135,7 +135,7 @@ fn parse_model_object(json: &str) -> Option<ModelInfo> {
     let name = extract_json_string(json, "name")?;
     let size = extract_json_number(json, "size");
     let parameter_size = extract_json_string(json, "parameter_size");
-    Some(ModelInfo { name, size, parameter_size })
+    Some(ModelInfo { name, _size: size, _parameter_size: parameter_size })
 }
 
 fn list_openai_models(provider: &Provider) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -188,7 +188,7 @@ fn parse_openai_models(json: &str) -> Result<Vec<ModelInfo>, ProviderError> {
                     if let Some(start) = obj_start {
                         let obj = &json[start..=i];
                         if let Some(id) = extract_json_string(obj, "id") {
-                            models.push(ModelInfo { name: id, size: None, parameter_size: None });
+                            models.push(ModelInfo { name: id, _size: None, _parameter_size: None });
                         }
                     }
                     obj_start = None;

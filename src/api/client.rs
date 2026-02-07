@@ -448,7 +448,6 @@ fn read_streaming_response_with_progress(
                     }
                     if let Some(pos) = last_newline { pending_data.drain(..pos + 1); }
                     if is_done {
-                        stream_completed = true;
                         return Ok(StreamResponse::Complete(full_response, StreamStats { ttft_us, stream_us: libakuma::uptime() - stream_start_us, total_bytes: 0, fakes: 0 }));
                     }
                 }

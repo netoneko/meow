@@ -17,11 +17,12 @@ pub enum StreamResponse {
 #[derive(Debug)]
 pub struct ModelInfo {
     pub name: String,
-    pub size: Option<u64>,
-    pub parameter_size: Option<String>,
+    pub _size: Option<u64>,
+    pub _parameter_size: Option<String>,
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum ProviderError {
     ConnectionFailed(String),
     RequestFailed(String),

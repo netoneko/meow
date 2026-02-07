@@ -45,7 +45,7 @@ pub fn handle_command(
                             } else {
                                 for (i, m) in models.iter().enumerate() {
                                     let current_marker = if m.name == *model { " (current)" } else { "" };
-                                    let size_info = m.parameter_size.as_ref().map(|s| format!(" [{}]", s)).unwrap_or_default();
+                                    let size_info = m._parameter_size.as_ref().map(|s| format!(" [{}]", s)).unwrap_or_default();
                                     output.push_str(&format!("  {}. {}{}{}
 ", i + 1, m.name, size_info, current_marker));
                                 }

@@ -54,12 +54,12 @@ pub fn tui_is_cancelled() -> bool { state::CANCELLED.load(Ordering::SeqCst) }
 static mut STREAMING_RENDERER: Option<crate::ui::tui::stream::StreamingRenderer> = None;
 
 pub fn start_streaming(indent: u16) {
-    unsafe { STREAMING_RENDERER = Some(crate::ui::tui::stream::StreamingRenderer::new(indent)); }
+    unsafe { *core::ptr::addr_of_mut!(STREAMING_RENDERER) = Some(crate::ui::tui::stream::StreamingRenderer::new(indent)); }
 }
 
 pub fn process_streaming_chunk(chunk: &str) {
     unsafe {
-        if let Some(r) = &mut STREAMING_RENDERER {
+        if let Some(r) = (*core::ptr::addr_of_mut!(STREAMING_RENDERER)).as_mut() {
             r.process_chunk(chunk);
         } else {
             render::tui_print_assistant(chunk);
@@ -69,7 +69,7 @@ pub fn process_streaming_chunk(chunk: &str) {
 
 pub fn finish_streaming() {
     unsafe {
-        if let Some(mut r) = STREAMING_RENDERER.take() {
+        if let Some(mut r) = (*core::ptr::addr_of_mut!(STREAMING_RENDERER)).take() {
             r.finalize();
         }
     }
