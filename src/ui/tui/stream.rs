@@ -1,7 +1,7 @@
 use alloc::string::String;
 use alloc::format;
 use core::sync::atomic::Ordering;
-use crate::config::{COLOR_GREEN_LIGHT, COLOR_RESET, COLOR_BOLD, COLOR_GRAY_DIM, COLOR_VIOLET, COLOR_YELLOW, BG_CODE};
+use crate::config::{COLOR_RESET, COLOR_BOLD, COLOR_GRAY_DIM, COLOR_VIOLET, COLOR_YELLOW, BG_CODE};
 use super::render::tui_print_with_indent;
 use crate::tui_app::CUR_COL;
 
@@ -10,9 +10,8 @@ pub enum StreamState {
     BufferingJson {
         buffer: String,
         depth: usize,
-    },
-    SkippingJson {
-        depth: usize,
+        in_string: bool,
+        escape: bool,
     },
 }
 
@@ -46,47 +45,57 @@ impl StreamingRenderer {
 
             match &mut self.state {
                 StreamState::Text => {
+                    // Start buffering if we see '{', but only if not in inline code.
+                    // We allow it even in code blocks because that's where tools live.
                     if c == '{' && !self.in_code {
                         next_state = Some(StreamState::BufferingJson {
                             buffer: alloc::format!("{}", c),
                             depth: 1,
+                            in_string: false,
+                            escape: false,
                         });
                     } else {
                         chars_to_process.push(c);
                     }
                 }
-                StreamState::BufferingJson { buffer, depth } => {
+                StreamState::BufferingJson { buffer, depth, in_string, escape } => {
                     buffer.push(c);
-                    if c == '{' {
-                        *depth += 1;
-                    } else if c == '}' {
-                        *depth -= 1;
-                        if *depth == 0 {
-                            chars_to_process = buffer.clone();
-                            next_state = Some(StreamState::Text);
+                    
+                    if *escape {
+                        *escape = false;
+                    } else if c == '\\' && *in_string {
+                        *escape = true;
+                    } else if c == '"' {
+                        *in_string = !*in_string;
+                    } else if !*in_string {
+                        if c == '{' {
+                            *depth += 1;
+                        } else if c == '}' {
+                            *depth -= 1;
+                            if *depth == 0 {
+                                // Block complete, check if it's a tool call
+                                let is_tool = (buffer.contains("\"command\"") || buffer.contains("command")) && 
+                                             (buffer.contains("\"tool\"") || buffer.contains("tool"));
+                                
+                                if is_tool {
+                                    if let Some((tool, args)) = extract_tool_info(buffer) {
+                                        print_tool_notification(&tool, &args, self.indent);
+                                    } else {
+                                        // Failed to extract info, just print it
+                                        chars_to_process = buffer.clone();
+                                    }
+                                } else {
+                                    // Not a tool call, print it
+                                    chars_to_process = buffer.clone();
+                                }
+                                next_state = Some(StreamState::Text);
+                            }
                         }
                     }
                     
-                    if next_state.is_none() {
-                        if buffer.contains("\"command\"") {
-                            if let Some(cmd) = extract_command_name(buffer) {
-                                print_tool_notification(&cmd, self.indent);
-                                next_state = Some(StreamState::SkippingJson { depth: *depth });
-                            }
-                        } else if buffer.len() > 1024 {
-                            chars_to_process = buffer.clone();
-                            next_state = Some(StreamState::Text);
-                        }
-                    }
-                }
-                StreamState::SkippingJson { depth } => {
-                    if c == '{' {
-                        *depth += 1;
-                    } else if c == '}' {
-                        *depth -= 1;
-                        if *depth == 0 {
-                            next_state = Some(StreamState::Text);
-                        }
+                    if next_state.is_none() && buffer.len() > 16384 {
+                        chars_to_process = buffer.clone();
+                        next_state = Some(StreamState::Text);
                     }
                 }
             }
@@ -235,20 +244,95 @@ impl StreamingRenderer {
     }
 }
 
-fn extract_command_name(json: &str) -> Option<String> {
-    if let Some(pos) = json.find("\"command\"") {
-        let after = &json[pos + 9..];
-        if let Some(start_quote) = after.find('"') {
-            let after_start = &after[start_quote + 1..];
-            if let Some(end_quote) = after_start.find('"') {
-                return Some(String::from(&after_start[..end_quote]));
+fn extract_tool_info(json: &str) -> Option<(String, String)> {
+    let tool = extract_field_value(json, "tool")?;
+    
+    let mut args = String::new();
+    let fields = [
+        "filename", "path", "cmd", "url", "message", "branch", 
+        "source", "destination", "source_filename", "destination_filename",
+        "pattern", "content", "old_text", "new_text", "id", "status"
+    ];
+    
+    for field in fields {
+        if let Some(val) = extract_field_value(json, field) {
+            // Avoid including the tool name itself if it somehow matches a field name
+            if field == "tool" || field == "command" { continue; }
+            
+            if !args.is_empty() {
+                args.push_str(", ");
+            }
+            args.push_str(field);
+            args.push_str("=\"");
+            args.push_str(&val);
+            args.push_str("\"");
+        }
+    }
+    
+    Some((tool, args))
+}
+
+fn extract_field_value(json: &str, field: &str) -> Option<String> {
+    let pattern = alloc::format!("\"{}\"", field);
+    if let Some(pos) = json.find(&pattern) {
+        let after = &json[pos + pattern.len()..];
+        // Find the colon after the key
+        if let Some(colon_pos) = after.find(':') {
+            let after_colon = after[colon_pos + 1..].trim_start();
+            if after_colon.starts_with('"') {
+                let after_quote = &after_colon[1..];
+                // Find the closing quote, but respect escapes
+                let mut val = String::new();
+                let mut escape = false;
+                for c in after_quote.chars() {
+                    if escape {
+                        match c {
+                            'n' => val.push('\n'),
+                            'r' => val.push('\r'),
+                            't' => val.push('\t'),
+                            _ => val.push(c),
+                        }
+                        escape = false;
+                    } else if c == '\\' {
+                        escape = true;
+                    } else if c == '"' {
+                        return Some(val);
+                    } else {
+                        val.push(c);
+                    }
+                }
+            } else {
+                // Number, boolean, etc.
+                let end = after_colon.find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace())
+                    .unwrap_or(after_colon.len());
+                if end > 0 {
+                    let val = after_colon[..end].trim();
+                    if !val.is_empty() && val != "{" {
+                        return Some(String::from(val));
+                    }
+                }
             }
         }
     }
     None
 }
 
-fn print_tool_notification(cmd: &str, indent: u16) {
-    let content = format!("--- [TOOL CALL: {}] ---\n", cmd);
-    tui_print_with_indent(&content, "", indent, Some(COLOR_GREEN_LIGHT));
+fn print_tool_notification(tool: &str, args: &str, indent: u16) {
+    // We want to be at col 0 on a new line.
+    // Use indent=0 for the newline to ensure we go to the very start.
+    tui_print_with_indent("\n", "", 0, None);
+    
+    let content = if args.is_empty() {
+        format!("ToolCalled: {}\n", tool)
+    } else {
+        format!("ToolCalled: {} | Arguments {}\n", tool, args)
+    };
+    
+    // Print with 1 space indent as requested.
+    // prefix is empty, indent=1.
+    tui_print_with_indent(&content, "", 1, Some(COLOR_GRAY_DIM));
+    
+    // Ensure the next content starts with the original assistant indentation.
+    tui_print_with_indent("", "", indent, None);
 }
+
