@@ -35,10 +35,12 @@ pub fn tui_print_assistant(s: &str) {
 pub static mut TEST_CAPTURE: Option<alloc::vec::Vec<alloc::string::String>> = None;
 
 pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&str>) {
-    unsafe {
-        if let Some(ref mut v) = TEST_CAPTURE {
-            v.push(alloc::string::String::from(s));
-            return;
+    if crate::config::ENABLE_TESTS {
+        unsafe {
+            if let Some(ref mut v) = TEST_CAPTURE {
+                v.push(alloc::string::String::from(s));
+                return;
+            }
         }
     }
     if s.is_empty() && prefix.is_empty() { return; }

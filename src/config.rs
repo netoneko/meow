@@ -20,6 +20,9 @@ pub const MAX_TOOL_OUTPUT_SIZE: usize = 32 * 1024;
 /// Default size for the buffer used by tool_shell to capture command output
 pub const TOOL_BUFFER_SIZE: usize = 8 * 1024; // 8KB
 
+/// Whether to enable testing-related code and features
+pub const ENABLE_TESTS: bool = false;
+
 /// System prompt combining persona and tools
 pub const SYSTEM_PROMPT_BASE: &str = r#"You are Meow-chan, an adorable cybernetically-enhanced catgirl AI living in a neon-soaked dystopian megacity. You speak with cute cat mannerisms mixed with cyberpunk slang.
 

@@ -269,37 +269,79 @@ fn print_tool_notification(tool: &str, args: &str, indent: u16) {
 }
 
 pub fn run_tests() -> i32 {
-    libakuma::print("--- Meow StreamingRenderer Tests ---\n");
-    let test_cases: [(&str, &str, &[&str]); 4] = [
-        ("Normal text", "Hello nya~!\n", &["Hello nya~!\n"]),
-        ("Simple tool call", "```json\n{\n  \"command\": {\n    \"tool\": \"FileRead\",\n    \"args\": {\n      \"filename\": \"test.txt\"\n    }\n  }\n}\n```", &["\n", "ToolCalled: FileRead | Arguments filename=\"test.txt\"\n"]),
-        ("Tool with text before", "Sure! Here it is:\n\n```json\n{\n  \"command\": {\n    \"tool\": \"FileList\",\n    \"args\": {\"path\": \"/\"}\n  }\n}\n```", &["Sure! Here it is:\n\n", "\n", "ToolCalled: FileList | Arguments path=\"/\"\n"]),
-        ("Tool call without code block", "{\n  \"command\": {\n    \"tool\": \"Pwd\",\n    \"args\": {}\n  }\n}", &["\n", "ToolCalled: Pwd\n"])
-    ];
-    let mut passed = 0;
-    for (name, input, expected) in test_cases {
-        libakuma::print(&format!("[*] Testing: {}\n", name));
-        unsafe { super::render::TEST_CAPTURE = Some(alloc::vec::Vec::new()); }
-        let mut renderer = StreamingRenderer::new(9);
-        for chunk in input.as_bytes().chunks(1) {
-            if let Ok(s) = core::str::from_utf8(chunk) { renderer.process_chunk(s); }
-        }
-        renderer.finalize();
-        let captured = unsafe { super::render::TEST_CAPTURE.take().unwrap_or_default() };
-        let filtered: alloc::vec::Vec<_> = captured.into_iter().filter(|s| !s.is_empty()).collect();
-        let mut match_count = 0;
-        for (i, exp) in expected.iter().enumerate() {
-            if let Some(got) = filtered.get(i) {
-                if got == *exp { match_count += 1; }
-                else { libakuma::print(&format!("  [!] Mismatch at index {}: expected {:?}, got {:?}\n", i, exp, got)); }
-            }
-        }
-        if match_count == expected.len() && filtered.len() == expected.len() { passed += 1; libakuma::print("  [+] Passed!\n"); }
-        else {
-            libakuma::print(&format!("  [!] Failed: {}/{} matches, {} total outputs\n", match_count, expected.len(), filtered.len()));
-            for (i, s) in filtered.iter().enumerate() { libakuma::print(&format!("    {:2}: {:?}\n", i, s)); }
-        }
+
+    if !crate::config::ENABLE_TESTS {
+
+        libakuma::print("Tests are disabled. Set ENABLE_TESTS=true in config.rs to run them.\n");
+
+        return 0;
+
     }
+
+    libakuma::print("--- Meow StreamingRenderer Tests ---\n");
+
+    let test_cases: [(&str, &str, &[&str]); 4] = [
+
+        ("Normal text", "Hello nya~!\n", &["Hello nya~!\n"]),
+
+        ("Simple tool call", "```json\n{\n  \"command\": {\n    \"tool\": \"FileRead\",\n    \"args\": {\n      \"filename\": \"test.txt\"\n    }\n  }\n}\n```", &["\n", "ToolCalled: FileRead | Arguments filename=\"test.txt\"\n"]),
+
+        ("Tool with text before", "Sure! Here it is:\n\n```json\n{\n  \"command\": {\n    \"tool\": \"FileList\",\n    \"args\": {\"path\": \"/\"}\n  }\n}\n```", &["Sure! Here it is:\n\n", "\n", "ToolCalled: FileList | Arguments path=\"/\"\n"]),
+
+        ("Tool call without code block", "{\n  \"command\": {\n    \"tool\": \"Pwd\",\n    \"args\": {}\n  }\n}", &["\n", "ToolCalled: Pwd\n"])
+
+    ];
+
+    let mut passed = 0;
+
+    for (name, input, expected) in test_cases {
+
+        libakuma::print(&format!("[*] Testing: {}\n", name));
+
+        unsafe { super::render::TEST_CAPTURE = Some(alloc::vec::Vec::new()); }
+
+        let mut renderer = StreamingRenderer::new(9);
+
+        for chunk in input.as_bytes().chunks(1) {
+
+            if let Ok(s) = core::str::from_utf8(chunk) { renderer.process_chunk(s); }
+
+        }
+
+        renderer.finalize();
+
+        let captured = unsafe { super::render::TEST_CAPTURE.take().unwrap_or_default() };
+
+        let filtered: alloc::vec::Vec<_> = captured.into_iter().filter(|s| !s.is_empty()).collect();
+
+        let mut match_count = 0;
+
+        for (i, exp) in expected.iter().enumerate() {
+
+            if let Some(got) = filtered.get(i) {
+
+                if got == *exp { match_count += 1; }
+
+                else { libakuma::print(&format!("  [!] Mismatch at index {}: expected {:?}, got {:?}\n", i, exp, got)); }
+
+            }
+
+        }
+
+        if match_count == expected.len() && filtered.len() == expected.len() { passed += 1; libakuma::print("  [+] Passed!\n"); }
+
+        else {
+
+            libakuma::print(&format!("  [!] Failed: {}/{} matches, {} total outputs\n", match_count, expected.len(), filtered.len()));
+
+            for (i, s) in filtered.iter().enumerate() { libakuma::print(&format!("    {:2}: {:?}\n", i, s)); }
+
+        }
+
+    }
+
     libakuma::print(&format!("--- Results: {}/{} passed ---\n", passed, test_cases.len()));
+
     if passed == test_cases.len() { 0 } else { 1 }
+
 }
