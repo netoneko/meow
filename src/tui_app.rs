@@ -195,6 +195,7 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
     let (w, h) = probe_terminal_size();
     TERM_WIDTH.store(w, Ordering::SeqCst); TERM_HEIGHT.store(h, Ordering::SeqCst);
     state::set_model_and_provider(model, &provider.name);
+    state::set_render_markdown(config.render_markdown);
     
     let layout = get_pane_layout();
     layout.term_width = w; layout.term_height = h; layout.recalculate(4);
@@ -243,18 +244,27 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
             render::render_footer(c_t, context_window, m_kb);
             set_cursor_position(0, CUR_ROW.load(Ordering::SeqCst) as u64);
             tui_print_with_indent("\n\n", "", 0, None);
-        let mut color_buf_data = [0u8; 32];
-        let mut color_buf = crate::util::StackBuffer::new(&mut color_buf_data);
-        let _ = write!(color_buf, "{}{}", COLOR_VIOLET, COLOR_BOLD);
-        tui_print_with_indent(" >  ", "", 0, Some(color_buf.as_str()));
-            tui_render_markdown_with_indent(&u_i, 4, Some(COLOR_USER)); // Pass user color here
+            let mut color_buf_data = [0u8; 32];
+            let mut color_buf = crate::util::StackBuffer::new(&mut color_buf_data);
+            let _ = write!(color_buf, "{}{}", COLOR_VIOLET, COLOR_BOLD);
+            tui_print_with_indent(" >  ", "", 0, Some(color_buf.as_str()));
+            
+            if config.render_markdown {
+                tui_render_markdown_with_indent(&u_i, 4, Some(COLOR_USER)); // Pass user color here
+            } else {
+                tui_print_with_indent(&u_i, "", 4, Some(COLOR_USER));
+            }
             tui_print("\n");
 
             if u_i.starts_with('/') {
                 let (res, out) = app::commands::handle_command(&u_i, model, provider, config, history, system_prompt);
                 if let Some(o) = out {
                     tui_print_with_indent("\n", "", 0, None);
-                    tui_render_markdown(&o);
+                    if config.render_markdown {
+                        tui_render_markdown(&o);
+                    } else {
+                        tui_print_assistant(&o);
+                    }
                     tui_print_with_indent("\n\n", "", 0, None);
                     history.push(Message::new("system", &o));
                 }

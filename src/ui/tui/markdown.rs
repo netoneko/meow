@@ -1,7 +1,9 @@
 use alloc::string::String;
 use alloc::format;
+use core::sync::atomic::Ordering;
 use crate::config::{COLOR_BOLD, COLOR_RESET, COLOR_GRAY_DIM, COLOR_VIOLET, COLOR_YELLOW, BG_CODE};
 use super::render::tui_print_with_indent;
+use crate::tui_app::CUR_COL;
 
 pub struct MarkdownRenderer {
     indent: u16,
@@ -27,9 +29,9 @@ impl MarkdownRenderer {
                     let style = format!("{}{}", BG_CODE, COLOR_YELLOW);
                     tui_print_with_indent("  ", "", 0, Some(BG_CODE));
                     if !lang.is_empty() {
-                        tui_print_with_indent(format!("{}\n", lang).as_str(), "", self.indent + 2, Some(style.as_str()));
+                        tui_print_with_indent(format!("{}          \n", lang).as_str(), "", self.indent + 2, Some(style.as_str()));
                     } else {
-                        tui_print_with_indent("\n", "", self.indent + 2, Some(BG_CODE));
+                        tui_print_with_indent("          \n", "", self.indent + 2, Some(style.as_str()));
                     }
                     in_code_block = true;
                 } else {
@@ -73,6 +75,9 @@ impl MarkdownRenderer {
 
             // Handle Lists
             if trimmed.starts_with("* ") || trimmed.starts_with("- ") {
+                if CUR_COL.load(Ordering::SeqCst) > self.indent {
+                    tui_print_with_indent("\n", "", self.indent, None);
+                }
                 tui_print_with_indent(" • ", "", self.indent, Some(COLOR_VIOLET));
                 self.render_inline(&trimmed[2..], None);
                 tui_print_with_indent("\n", "", self.indent, None);

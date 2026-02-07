@@ -1,7 +1,9 @@
 use alloc::string::String;
 use alloc::format;
+use core::sync::atomic::Ordering;
 use crate::config::{COLOR_GREEN_LIGHT, COLOR_RESET, COLOR_BOLD, COLOR_GRAY_DIM, COLOR_VIOLET, COLOR_YELLOW, BG_CODE};
-use super::render::{tui_print_with_indent, tui_print_assistant};
+use super::render::tui_print_with_indent;
+use crate::tui_app::CUR_COL;
 
 pub enum StreamState {
     Text,
@@ -115,9 +117,9 @@ impl StreamingRenderer {
                     let style = format!("{}{}", BG_CODE, COLOR_YELLOW);
                     tui_print_with_indent("  ", "", 0, Some(BG_CODE));
                     if !lang.is_empty() {
-                        tui_print_with_indent(format!("{}\n", lang).as_str(), "", self.indent + 2, Some(style.as_str()));
+                        tui_print_with_indent(format!("{}          \n", lang).as_str(), "", self.indent + 2, Some(style.as_str()));
                     } else {
-                        tui_print_with_indent("\n", "", self.indent + 2, Some(BG_CODE));
+                        tui_print_with_indent("          \n", "", self.indent + 2, Some(style.as_str()));
                     }
                     return;
                 } else {
@@ -144,18 +146,21 @@ impl StreamingRenderer {
                 if level > 0 && level <= 6 {
                     let style = format!("{}{}", COLOR_BOLD, COLOR_VIOLET);
                     tui_print_with_indent("", "", self.indent, Some(&style));
-                    tui_print_assistant(trimmed[level..].trim());
+                    tui_print_with_indent(trimmed[level..].trim(), "", self.indent, None);
                     tui_print_with_indent("\n", "", self.indent, Some(COLOR_RESET));
                     return;
                 }
             } else if trimmed.starts_with("* ") || trimmed.starts_with("- ") {
+                if CUR_COL.load(Ordering::SeqCst) > self.indent {
+                    tui_print_with_indent("\n", "", self.indent, None);
+                }
                 tui_print_with_indent(" • ", "", self.indent, Some(COLOR_VIOLET));
-                tui_print_assistant(&trimmed[2..]);
-                tui_print_assistant("\n");
+                tui_print_with_indent(&trimmed[2..], "", self.indent, None);
+                tui_print_with_indent("\n", "", self.indent, None);
                 return;
             }
             
-            tui_print_assistant(&buf);
+            tui_print_with_indent(&buf, "", self.indent, None);
             return;
         }
 
@@ -165,6 +170,10 @@ impl StreamingRenderer {
             self.in_bold = !self.in_bold;
             self.apply_style();
         } else if self.markdown_buf.ends_with("`") {
+            if self.markdown_buf == "```" {
+                // Potential code block, don't toggle in_code yet
+                return;
+            }
             self.markdown_buf.truncate(self.markdown_buf.len() - 1);
             self.flush_markdown_buf();
             self.in_code = !self.in_code;
@@ -179,7 +188,7 @@ impl StreamingRenderer {
                 self.flush_markdown_buf();
                 self.in_italic = !self.in_italic;
                 self.apply_style();
-            } else if first != '*' && first != '#' && first != '-' { // Don't flush if it could be a header or list
+            } else if first != '*' && first != '#' && first != '-' && first != '`' { // Don't flush if it could be a header, list, or code
                 self.flush_first_char();
             }
         }
@@ -187,15 +196,16 @@ impl StreamingRenderer {
 
     fn flush_first_char(&mut self) {
         if self.markdown_buf.is_empty() { return; }
+        if self.markdown_buf.starts_with("```") { return; }
         let c = self.markdown_buf.remove(0);
         let mut s = String::new();
         s.push(c);
-        tui_print_assistant(&s);
+        tui_print_with_indent(&s, "", self.indent, None);
     }
 
     fn flush_markdown_buf(&mut self) {
         if !self.markdown_buf.is_empty() {
-            tui_print_assistant(&self.markdown_buf);
+            tui_print_with_indent(&self.markdown_buf, "", self.indent, None);
             self.markdown_buf.clear();
         }
     }
@@ -216,7 +226,7 @@ impl StreamingRenderer {
         self.flush_markdown_buf();
         match &mut self.state {
             StreamState::BufferingJson { buffer, .. } => {
-                tui_print_assistant(buffer);
+                tui_print_with_indent(buffer, "", self.indent, None);
             }
             _ => {}
         }

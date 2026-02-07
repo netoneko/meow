@@ -108,6 +108,13 @@ pub fn handle_command(
             (CommandResult::Continue, Some(format!("～ Current token usage: {} / {} 
   Tip: Ask Meow to 'compact the context' when tokens are high nya~!", current, TOKEN_LIMIT_FOR_COMPACTION)))
         }
+        "/markdown" => {
+            config.render_markdown = !config.render_markdown;
+            crate::app::state::set_render_markdown(config.render_markdown);
+            let _ = config.save();
+            let status = if config.render_markdown { "enabled" } else { "disabled" };
+            (CommandResult::Continue, Some(format!("～ *tail swishes* Markdown rendering {} nya~!", status)))
+        }
         "/hotkeys" | "/shortcuts" => {
             let output = String::from("# Meow's Input Shortcuts
 
@@ -134,6 +141,7 @@ pub fn handle_command(
 * `/provider`: Check/switch provider
 * `/provider list`: List configured providers
 * `/tokens`: Show current token usage
+* `/markdown`: Toggle Markdown rendering nya~
 * `/hotkeys`: Show input shortcuts
 * `/quit`: Jack out of the matrix
 * `/help`: This help screen

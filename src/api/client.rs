@@ -262,11 +262,11 @@ fn read_streaming_with_http_stream_tls(
                                         libakuma::print(" ");
                                         print_elapsed(ttft_us / 1000);
                                         libakuma::print("\n");
-                                    } else {
+                                    } else if crate::app::state::get_render_markdown() {
                                         tui_app::start_streaming(9);
                                     }
                                 }
-                                if is_tui {
+                                if is_tui && crate::app::state::get_render_markdown() {
                                     tui_app::process_streaming_chunk(&content);
                                 } else {
                                     tui_app::tui_print_assistant(&content);
@@ -299,11 +299,11 @@ fn read_streaming_with_http_stream_tls(
                                                             libakuma::print(" ");
                                                             print_elapsed(ttft_us / 1000);
                                                             libakuma::print("\n");
-                                                        } else {
+                                                        } else if crate::app::state::get_render_markdown() {
                                                             tui_app::start_streaming(9);
                                                         }
                                                     }
-                                                    if is_tui {
+                                                    if is_tui && crate::app::state::get_render_markdown() {
                                                         tui_app::process_streaming_chunk(&content);
                                                     } else {
                                                         tui_app::tui_print(&content);
@@ -375,11 +375,11 @@ fn read_streaming_response_with_progress(
                                         for _ in 0..(7 + dots_printed) { libakuma::print("\x08 \x08"); }
                                         print_elapsed(ttft_us / 1000);
                                         libakuma::print("\n");
-                                    } else {
+                                    } else if crate::app::state::get_render_markdown() {
                                         tui_app::start_streaming(9);
                                     }
                                 }
-                                if is_tui {
+                                if is_tui && crate::app::state::get_render_markdown() {
                                     tui_app::process_streaming_chunk(&content);
                                 } else {
                                     tui_app::tui_print_assistant(&content);
@@ -427,11 +427,11 @@ fn read_streaming_response_with_progress(
                                         for _ in 0..(7 + dots_printed) { libakuma::print("\x08 \x08"); }
                                         print_elapsed(ttft_us / 1000);
                                         libakuma::print("\n");
-                                    } else {
+                                    } else if crate::app::state::get_render_markdown() {
                                         tui_app::start_streaming(9);
                                     }
                                 }
-                                if is_tui {
+                                if is_tui && crate::app::state::get_render_markdown() {
                                     tui_app::process_streaming_chunk(&content);
                                 } else {
                                     tui_app::tui_print_assistant(&content);

@@ -313,6 +313,8 @@ pub struct Config {
     pub providers: Vec<Provider>,
     /// Behavioral flag: exit the app when Escape key is pressed
     pub exit_on_escape: bool,
+    /// Whether to render markdown or show raw text
+    pub render_markdown: bool,
 }
 
 impl Default for Config {
@@ -322,6 +324,7 @@ impl Default for Config {
             current_model: String::from("gemma3:27b"),
             providers: alloc::vec![Provider::ollama_default()],
             exit_on_escape: false,
+            render_markdown: true,
         }
     }
 }
@@ -390,6 +393,7 @@ impl Config {
             current_model: String::from("gemma3:27b"),
             providers: Vec::new(),
             exit_on_escape: false,
+            render_markdown: true,
         };
 
         let mut current_provider: Option<Provider> = None;
@@ -445,6 +449,9 @@ impl Config {
                         "current_model" => config.current_model = String::from(value),
                         "exit_on_escape" => {
                             config.exit_on_escape = value.to_lowercase() == "true";
+                        }
+                        "render_markdown" => {
+                            config.render_markdown = value.to_lowercase() != "false";
                         }
                         _ => {}
                     }
@@ -502,6 +509,10 @@ impl Config {
 
         content.push_str("exit_on_escape=");
         content.push_str(if self.exit_on_escape { "true" } else { "false" });
+        content.push('\n');
+
+        content.push_str("render_markdown=");
+        content.push_str(if self.render_markdown { "true" } else { "false" });
         content.push_str("\n\n");
 
         // Providers

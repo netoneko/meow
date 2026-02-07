@@ -17,6 +17,7 @@ pub struct AppState {
     pub model_name: String,
     pub provider_name: String,
     pub last_history_kb: usize,
+    pub render_markdown: bool,
 }
 
 struct AtomicAppState {
@@ -47,6 +48,7 @@ impl AtomicAppState {
                     model_name: String::from("unknown"),
                     provider_name: String::from("unknown"),
                     last_history_kb: 0,
+                    render_markdown: true,
                 });
             }
             self.initialized.store(true, Ordering::Release);
@@ -117,3 +119,6 @@ where
 
 pub fn get_last_history_kb() -> usize { with_state(|s| s.last_history_kb) }
 pub fn set_last_history_kb(kb: usize) { with_state(|s| s.last_history_kb = kb); }
+
+pub fn get_render_markdown() -> bool { with_state(|s| s.render_markdown) }
+pub fn set_render_markdown(val: bool) { with_state(|s| s.render_markdown = val); }
