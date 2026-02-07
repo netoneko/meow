@@ -6,7 +6,7 @@ use core::fmt::Write;
 use crate::config::{COLOR_YELLOW, COLOR_RESET, COLOR_VIOLET, COLOR_BOLD, COLOR_GRAY_DIM};
 use crate::app::state::{self, STREAMING};
 use super::layout::{get_pane_layout, TERM_WIDTH, TERM_HEIGHT, CLEAR_TO_EOL, Stdout};
-use super::input::{INPUT_LEN, CURSOR_IDX, PROMPT_SCROLL_TOP};
+use super::input::{self, INPUT_LEN, CURSOR_IDX, PROMPT_SCROLL_TOP};
 
 const CAT_ASCII: &str = r#"
                       =#=      .-
@@ -56,7 +56,7 @@ pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&
     if col == 0 {
         if !prefix.is_empty() {
             akuma_write(fd::STDOUT, prefix.as_bytes());
-            col = visual_length(prefix) as u16;
+            col = input::visual_length(prefix) as u16;
         } else if indent > 0 {
             for _ in 0..indent { akuma_write(fd::STDOUT, b" "); }
             col = indent;
@@ -141,7 +141,7 @@ pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&
     layout.output_col = col; layout.output_row = row;
 
     state::with_global_input(|input_str| {
-        let (cx, cy_off) = calculate_input_cursor(input_str, CURSOR_IDX.load(Ordering::SeqCst) as usize, INPUT_LEN.load(Ordering::SeqCst) as usize, w as usize);
+        let (cx, cy_off) = input::calculate_input_cursor(input_str, CURSOR_IDX.load(Ordering::SeqCst) as usize, INPUT_LEN.load(Ordering::SeqCst) as usize, w as usize);
         let scroll_top = PROMPT_SCROLL_TOP.load(Ordering::SeqCst) as u64;
         let prompt_start_row = h as u64 - layout.footer_height as u64 + 2;
         let final_cy = prompt_start_row + (cy_off - scroll_top);
@@ -189,12 +189,12 @@ pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
     let mut prompt_prefix_buf = StackBuffer::new(&mut prompt_prefix_buf_data);
     let _ = write!(prompt_prefix_buf, "  {}[{}/{}|{}{}{}] {}(=^･ω･^=) > ", COLOR_YELLOW, t_disp, l_disp, m_disp, hist_disp, COLOR_YELLOW, q_disp);
     let prompt_prefix = prompt_prefix_buf.as_str();
-    let p_len = visual_length(&prompt_prefix);
+    let p_len = input::visual_length(&prompt_prefix);
     INPUT_LEN.store(p_len as u16, Ordering::SeqCst);
     layout.input_prefix_len = p_len as u16;
 
     state::with_global_input(|input_str| {
-        let wrapped = count_wrapped_lines(input_str, p_len, w);
+        let wrapped = input::count_wrapped_lines(input_str, p_len, w);
         let n_f_h = (core::cmp::min(wrapped, core::cmp::min(10, (h / 3) as usize)) + 2) as u16;
         let o_f_h = layout.footer_height;
         let eff_f_h = if is_streaming && n_f_h < o_f_h { o_f_h } else { n_f_h };
@@ -217,7 +217,7 @@ pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
         }
 
         let idx = CURSOR_IDX.load(Ordering::SeqCst) as usize;
-        let (_, cy_abs) = calculate_input_cursor(input_str, idx, p_len, w);
+        let (_, cy_abs) = input::calculate_input_cursor(input_str, idx, p_len, w);
         let mut s_t = layout.prompt_scroll;
         if cy_abs < s_t as u64 { s_t = cy_abs as u16; } 
         else if cy_abs >= (s_t as u64 + eff_p_l as u64) { s_t = (cy_abs - eff_p_l as u64 + 1) as u16; }
@@ -267,7 +267,7 @@ pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
             }
         }
         let _ = akuma_write(fd::STDOUT, COLOR_RESET.as_bytes());
-        let (cx, cy_off) = calculate_input_cursor(input_str, idx, p_len, w);
+        let (cx, cy_off) = input::calculate_input_cursor(input_str, idx, p_len, w);
         set_cursor_position(cx, p_r + 1 + (cy_off - s_t as u64));
         show_cursor();
     });
@@ -279,35 +279,4 @@ pub fn print_greeting() {
     let _ = write!(stdout, "\n{}\x1b[38;5;236m", COLOR_RESET);
     let _ = write!(stdout, "{}", CAT_ASCII);
     let _ = write!(stdout, "{}\n  {}MEOW!{} ~(=^‥^)ノ\n\n", COLOR_RESET, COLOR_BOLD, COLOR_RESET);
-}
-
-fn calculate_input_cursor(input: &str, idx: usize, prompt_width: usize, width: usize) -> (u64, u64) {
-    if width == 0 { return (0, 0); }
-    let (mut cx, mut cy) = (prompt_width, 0);
-    for (i, c) in input.chars().enumerate() {
-        if i >= idx { break; }
-        if c == '\n' { cx = 4; cy += 1; }
-        else { cx += 1; if cx >= width { cx = 4; cy += 1; } }
-    }
-    (cx as u64, cy as u64)
-}
-
-fn count_wrapped_lines(input: &str, prompt_width: usize, width: usize) -> usize {
-    if width == 0 { return 1; }
-    let (mut lines, mut current_col) = (1, prompt_width);
-    for c in input.chars() {
-        if c == '\n' { lines += 1; current_col = 4; }
-        else { current_col += 1; if current_col >= width { lines += 1; current_col = 4; } }
-    }
-    lines
-}
-
-pub fn visual_length(s: &str) -> usize {
-    let (mut len, mut in_esc) = (0, false);
-    for c in s.chars() {
-        if in_esc { if c != '[' && c >= '@' && c <= '~' { in_esc = false; } continue; }
-        if c == '\x1b' { in_esc = true; continue; }
-        len += 1;
-    }
-    len
 }

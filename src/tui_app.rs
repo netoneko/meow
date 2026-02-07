@@ -84,27 +84,46 @@ fn handle_input_event(event: InputEvent, input: &mut String, redraw: &mut bool, 
         InputEvent::Left => { if idx > 0 { CURSOR_IDX.store((idx - 1) as u16, Ordering::SeqCst); *redraw = true; } }
         InputEvent::Right => { if idx < input.chars().count() { CURSOR_IDX.store((idx + 1) as u16, Ordering::SeqCst); *redraw = true; } }
         InputEvent::Up => {
-            let history_len = state::get_history_len();
-            let history_index = state::get_history_index();
-            if history_index > 0 {
-                if history_index == history_len { state::set_saved_input(input.clone()); }
-                state::set_history_index(history_index - 1);
-                if let Some(item) = state::get_history_item(history_index - 1) {
-                    *input = item;
-                    CURSOR_IDX.store(input.chars().count() as u16, Ordering::SeqCst);
-                    *redraw = true;
+            let w = TERM_WIDTH.load(Ordering::SeqCst) as usize;
+            let p_w = input::INPUT_LEN.load(Ordering::SeqCst) as usize;
+            let (cx, cy) = input::calculate_input_cursor(input, idx, p_w, w);
+            if cy > 0 {
+                let new_idx = input::get_idx_from_coords(input, cx, cy - 1, p_w, w);
+                CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst);
+                *redraw = true;
+            } else {
+                let history_len = state::get_history_len();
+                let history_index = state::get_history_index();
+                if history_index > 0 {
+                    if history_index == history_len { state::set_saved_input(input.clone()); }
+                    state::set_history_index(history_index - 1);
+                    if let Some(item) = state::get_history_item(history_index - 1) {
+                        *input = item;
+                        CURSOR_IDX.store(input.chars().count() as u16, Ordering::SeqCst);
+                        *redraw = true;
+                    }
                 }
             }
         }
         InputEvent::Down => {
-            let history_len = state::get_history_len();
-            let history_index = state::get_history_index();
-            if history_index < history_len {
-                state::set_history_index(history_index + 1);
-                if history_index + 1 == history_len { *input = state::get_saved_input(); }
-                else if let Some(item) = state::get_history_item(history_index + 1) { *input = item; }
-                CURSOR_IDX.store(input.chars().count() as u16, Ordering::SeqCst);
+            let w = TERM_WIDTH.load(Ordering::SeqCst) as usize;
+            let p_w = input::INPUT_LEN.load(Ordering::SeqCst) as usize;
+            let (cx, cy) = input::calculate_input_cursor(input, idx, p_w, w);
+            let num_lines = input::count_wrapped_lines(input, p_w, w);
+            if (cy as usize) < num_lines - 1 {
+                let new_idx = input::get_idx_from_coords(input, cx, cy + 1, p_w, w);
+                CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst);
                 *redraw = true;
+            } else {
+                let history_len = state::get_history_len();
+                let history_index = state::get_history_index();
+                if history_index < history_len {
+                    state::set_history_index(history_index + 1);
+                    if history_index + 1 == history_len { *input = state::get_saved_input(); }
+                    else if let Some(item) = state::get_history_item(history_index + 1) { *input = item; }
+                    CURSOR_IDX.store(input.chars().count() as u16, Ordering::SeqCst);
+                    *redraw = true;
+                }
             }
         }
         InputEvent::Home | InputEvent::CtrlA => { CURSOR_IDX.store(0, Ordering::SeqCst); *redraw = true; }
@@ -115,8 +134,12 @@ fn handle_input_event(event: InputEvent, input: &mut String, redraw: &mut bool, 
         InputEvent::CtrlW | InputEvent::AltLeft => {
             let mut new_idx = idx;
             while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b == b' ') { new_idx -= 1; }
-            while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b != b' ') { new_idx -= 1; }
-            if event == InputEvent::CtrlW { for _ in 0..(idx - new_idx) { if new_idx < input.len() { input.remove(new_idx); } } }
+            if event == InputEvent::CtrlW {
+                while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b != b' ' && b != b'\n') { new_idx -= 1; }
+                for _ in 0..(idx - new_idx) { if new_idx < input.len() { input.remove(new_idx); } }
+            } else {
+                while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b != b' ') { new_idx -= 1; }
+            }
             CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst); *redraw = true;
         }
         InputEvent::AltRight => {

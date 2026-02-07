@@ -162,3 +162,61 @@ pub fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
 pub fn update_last_input_time() {
     LAST_INPUT_TIME.store(libakuma::uptime(), Ordering::Relaxed);
 }
+
+pub fn calculate_input_cursor(input: &str, idx: usize, prompt_width: usize, width: usize) -> (u64, u64) {
+    if width == 0 { return (0, 0); }
+    let (mut cx, mut cy) = (prompt_width, 0);
+    for (i, c) in input.chars().enumerate() {
+        if i >= idx { break; }
+        if c == '\n' { cx = 4; cy += 1; }
+        else { cx += 1; if cx >= width { cx = 4; cy += 1; } }
+    }
+    (cx as u64, cy as u64)
+}
+
+pub fn get_idx_from_coords(input: &str, target_cx: u64, target_cy: u64, prompt_width: usize, width: usize) -> usize {
+    if width == 0 { return 0; }
+    let (mut cx, mut cy) = (prompt_width as u64, 0u64);
+    let mut best_idx = 0;
+    
+    for (i, c) in input.chars().enumerate() {
+        if cy == target_cy {
+            best_idx = i;
+            if cx >= target_cx {
+                return i;
+            }
+        }
+        if cy > target_cy {
+            return best_idx;
+        }
+        
+        if c == '\n' { cx = 4; cy += 1; }
+        else { cx += 1; if cx >= width as u64 { cx = 4; cy += 1; } }
+    }
+    
+    if cy == target_cy {
+        return input.chars().count();
+    }
+    
+    best_idx
+}
+
+pub fn count_wrapped_lines(input: &str, prompt_width: usize, width: usize) -> usize {
+    if width == 0 { return 1; }
+    let (mut lines, mut current_col) = (1, prompt_width);
+    for c in input.chars() {
+        if c == '\n' { lines += 1; current_col = 4; }
+        else { current_col += 1; if current_col >= width { lines += 1; current_col = 4; } }
+    }
+    lines
+}
+
+pub fn visual_length(s: &str) -> usize {
+    let (mut len, mut in_esc) = (0, false);
+    for c in s.chars() {
+        if in_esc { if c != '[' && c >= '@' && c <= '~' { in_esc = false; } continue; }
+        if c == '\x1b' { in_esc = true; continue; }
+        len += 1;
+    }
+    len
+}
