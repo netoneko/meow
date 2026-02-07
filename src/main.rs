@@ -43,6 +43,9 @@ fn main() -> i32 {
             if first_arg == "init" {
                 return run_init(&mut app_config);
             }
+            if first_arg == "test_stream" {
+                return crate::ui::tui::stream::run_tests();
+            }
         }
     }
 

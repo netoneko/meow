@@ -143,12 +143,22 @@ pub fn handle_command(
 * `/tokens`: Show current token usage
 * `/markdown`: Toggle Markdown rendering nya~
 * `/hotkeys`: Show input shortcuts
+* `/test_stream`: Run internal renderer tests
 * `/quit`: Jack out of the matrix
 * `/help`: This help screen
 
 **Context compaction**: When token count is high, ask Meow to compact the context to free up memory nya~!
 ");
             (CommandResult::Continue, Some(output))
+        }
+        "/test_stream" => {
+            let res = crate::ui::tui::stream::run_tests();
+            let msg = if res == 0 {
+                String::from("～ Renderer tests passed nya~! (=^・ω・^=)")
+            } else {
+                String::from("～ Renderer tests failed nya... check console output (=｀ω´=)")
+            };
+            (CommandResult::Continue, Some(msg))
         }
         _ => {
             (CommandResult::Continue, Some(format!("～ Nyaa? Unknown command: {} ...Meow-chan is confused (=｀ω´=)", command)))

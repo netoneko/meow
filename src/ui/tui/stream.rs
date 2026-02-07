@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::format;
-use crate::config::{COLOR_GRAY_DIM, COLOR_MEOW, COLOR_RESET};
+use crate::config::{COLOR_MEOW, COLOR_RESET};
 use super::render::tui_print_with_indent;
 
 pub enum StreamState {
@@ -40,51 +40,51 @@ impl StreamingRenderer {
 
             match &mut self.state {
                 StreamState::Text => {
-                    if self.at_line_start && c.is_whitespace() && c != '\n' {
-                        self.line_buf.push(c);
-                    } else if self.at_line_start && c == '`' {
-                        self.line_buf.push(c);
-                        if self.line_buf.trim_start().starts_with("```") {
-                            // Potentially a tool block
-                        }
-                    } else if c == '{' && self.at_line_start {
-                        next_state = Some(StreamState::BufferingJson {
-                            buffer: alloc::format!("{}", c),
-                            depth: 1,
-                            in_string: false,
-                            escape: false,
-                        });
-                        self.at_line_start = false;
-                    } else if c == '\n' {
+                    if c == '\n' {
                         chars_to_flush = self.line_buf.clone();
                         chars_to_flush.push('\n');
                         self.line_buf.clear();
                         self.at_line_start = true;
+                    } else if self.at_line_start && c.is_whitespace() {
+                        self.line_buf.push(c);
                     } else {
                         self.line_buf.push(c);
-                        self.at_line_start = false;
-                        
                         let trimmed = self.line_buf.trim_start();
-                        if trimmed.starts_with("```json") {
-                            next_state = Some(StreamState::BufferingPotentialTool {
+                        
+                        if trimmed.starts_with("```") {
+                            // Only switch if it could be a tool (has json tag or we're at start of block)
+                            if trimmed.contains("json") || trimmed.len() <= 3 {
+                                next_state = Some(StreamState::BufferingPotentialTool {
+                                    buffer: self.line_buf.clone(),
+                                });
+                                self.line_buf.clear();
+                            }
+                        } else if trimmed.starts_with("{") {
+                            next_state = Some(StreamState::BufferingJson {
                                 buffer: self.line_buf.clone(),
+                                depth: 1,
+                                in_string: false,
+                                escape: false,
                             });
                             self.line_buf.clear();
-                        } else if self.line_buf.len() > 128 {
-                            // Not a tool start, flush it
+                        } else if self.line_buf.len() > 256 {
                             chars_to_flush = self.line_buf.clone();
                             self.line_buf.clear();
+                            self.at_line_start = false;
+                        } else {
+                            self.at_line_start = false;
                         }
                     }
                 }
                 StreamState::BufferingPotentialTool { buffer } => {
                     buffer.push(c);
-                    if buffer.ends_with("```") && buffer.len() > 15 {
+                    if buffer.ends_with("```") && buffer.len() > 10 {
                         if let Some((tool, args)) = extract_tool_info(buffer) {
                             print_tool_notification(&tool, &args, self.indent);
                             next_state = Some(StreamState::Text);
                             self.at_line_start = true;
                         } else {
+                            // Not a tool, flush it all
                             chars_to_flush = buffer.clone();
                             next_state = Some(StreamState::Text);
                             self.at_line_start = buffer.ends_with('\n');
@@ -109,14 +109,16 @@ impl StreamingRenderer {
                                    (buffer.contains("\"tool\"") || buffer.contains("tool")) {
                                     if let Some((tool, args)) = extract_tool_info(buffer) {
                                         print_tool_notification(&tool, &args, self.indent);
+                                        self.at_line_start = true;
                                     } else {
                                         chars_to_flush = buffer.clone();
+                                        self.at_line_start = buffer.ends_with('\n');
                                     }
                                 } else {
                                     chars_to_flush = buffer.clone();
+                                    self.at_line_start = buffer.ends_with('\n');
                                 }
                                 next_state = Some(StreamState::Text);
-                                self.at_line_start = buffer.ends_with('\n');
                             }
                         }
                     }
@@ -128,7 +130,7 @@ impl StreamingRenderer {
             }
 
             if !chars_to_flush.is_empty() {
-                tui_print_with_indent(&chars_to_flush, "", self.indent, Some(crate::config::COLOR_MEOW));
+                tui_print_with_indent(&chars_to_flush, "", self.indent, Some(COLOR_MEOW));
             }
         }
     }
@@ -136,13 +138,9 @@ impl StreamingRenderer {
     pub fn finalize(&mut self) {
         let to_flush = match &mut self.state {
             StreamState::Text => {
-                if !self.line_buf.is_empty() {
-                    let s = self.line_buf.clone();
-                    self.line_buf.clear();
-                    s
-                } else {
-                    String::new()
-                }
+                let s = self.line_buf.clone();
+                self.line_buf.clear();
+                s
             }
             StreamState::BufferingPotentialTool { buffer } => {
                 let s = buffer.clone();
@@ -159,7 +157,7 @@ impl StreamingRenderer {
             tui_print_with_indent(&to_flush, "", self.indent, Some(COLOR_MEOW));
         }
         self.state = StreamState::Text;
-        tui_print_with_indent("", "", self.indent, Some(COLOR_RESET));
+        self.at_line_start = true;
     }
 }
 
@@ -176,7 +174,7 @@ fn extract_tool_info(json: &str) -> Option<(String, String)> {
     
     for field in fields {
         if let Some(val) = extract_field_value(json, field) {
-            if field == "tool" || field == "command" { continue; }
+            if field == "tool" || field == "command" || field == "args" { continue; }
             if !args.is_empty() { args.push_str(", "); }
             args.push_str(field);
             args.push_str("=\"");
@@ -188,34 +186,42 @@ fn extract_tool_info(json: &str) -> Option<(String, String)> {
 }
 
 fn extract_field_value(json: &str, field: &str) -> Option<String> {
-    let pattern = alloc::format!("\"{}\"", field);
-    if let Some(pos) = json.find(&pattern) {
-        let after = &json[pos + pattern.len()..];
-        if let Some(colon_pos) = after.find(':') {
-            let after_colon = after[colon_pos + 1..].trim_start();
-            if after_colon.starts_with('"') {
-                let after_quote = &after_colon[1..];
-                let mut val = String::new();
-                let mut escape = false;
-                for c in after_quote.chars() {
-                    if escape {
-                        match c {
-                            'n' => val.push('\n'),
-                            'r' => val.push('\r'),
-                            't' => val.push('\t'),
-                            _ => val.push(c),
-                        }
-                        escape = false;
-                    } else if c == '\\' { escape = true; }
-                    else if c == '"' { return Some(val); }
-                    else { val.push(c); }
-                }
-            } else {
-                let end = after_colon.find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace())
-                    .unwrap_or(after_colon.len());
-                if end > 0 {
-                    let val = after_colon[..end].trim();
-                    if !val.is_empty() && val != "{" { return Some(String::from(val)); }
+    let patterns = [
+        alloc::format!("\"{}\"", field),
+        alloc::format!("'{}'", field),
+        alloc::format!("{}:", field),
+    ];
+
+    for pattern in patterns {
+        if let Some(pos) = json.find(&pattern) {
+            let after = &json[pos + pattern.len()..];
+            if let Some(colon_pos) = after.find(':') {
+                let after_colon = after[colon_pos + 1..].trim_start();
+                if after_colon.starts_with('"') || after_colon.starts_with('\'') {
+                    let quote = after_colon.chars().next().unwrap();
+                    let after_quote = &after_colon[1..];
+                    let mut val = String::new();
+                    let mut escape = false;
+                    for c in after_quote.chars() {
+                        if escape {
+                            match c {
+                                'n' => val.push('\n'),
+                                'r' => val.push('\r'),
+                                't' => val.push('\t'),
+                                _ => val.push(c),
+                            }
+                            escape = false;
+                        } else if c == '\\' { escape = true; }
+                        else if c == quote { return Some(val); }
+                        else { val.push(c); }
+                    }
+                } else {
+                    let end = after_colon.find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace())
+                        .unwrap_or(after_colon.len());
+                    if end > 0 {
+                        let val = after_colon[..end].trim();
+                        if !val.is_empty() && val != "{" { return Some(String::from(val)); }
+                    }
                 }
             }
         }
@@ -224,19 +230,48 @@ fn extract_field_value(json: &str, field: &str) -> Option<String> {
 }
 
 fn print_tool_notification(tool: &str, args: &str, indent: u16) {
-    // We want to be at col 0 on a new line.
     tui_print_with_indent("\n", "", 0, None);
-    
     let content = if args.is_empty() {
-        format!("ToolCalled: {}\n", tool)
+        format!(" ToolCalled: {}\n", tool)
     } else {
-        format!("ToolCalled: {} | Arguments {}\n", tool, args)
+        format!(" ToolCalled: {} | Arguments {}\n", tool, args)
     };
-    
-    // Print with 1 space indent as requested.
-    tui_print_with_indent(&content, "", 1, Some(crate::config::COLOR_GRAY_DIM));
-    
-    // Ensure the next content starts with the original assistant indentation.
-    tui_print_with_indent("", "", indent, Some(crate::config::COLOR_MEOW));
+    tui_print_with_indent(&content, "", 0, Some(crate::config::COLOR_GRAY_DIM));
+    tui_print_with_indent("", "", indent, None);
 }
 
+pub fn run_tests() -> i32 {
+    libakuma::print("--- Meow StreamingRenderer Tests ---\n");
+    let test_cases: [(&str, &str, &[&str]); 4] = [
+        ("Normal text", "Hello nya~!\n", &["Hello nya~!\n"]),
+        ("Simple tool call", "```json\n{\n  \"command\": {\n    \"tool\": \"FileRead\",\n    \"args\": {\n      \"filename\": \"test.txt\"\n    }\n  }\n}\n```", &["\n", " ToolCalled: FileRead | Arguments filename=\"test.txt\"\n"]),
+        ("Tool with text before", "Sure! Here it is:\n\n```json\n{\n  \"command\": {\n    \"tool\": \"FileList\",\n    \"args\": {\"path\": \"/\"}\n  }\n}\n```", &["Sure! Here it is:\n", "\n", "\n", " ToolCalled: FileList | Arguments path=\"/\"\n"]),
+        ("Tool call without code block", "{\n  \"command\": {\n    \"tool\": \"Pwd\",\n    \"args\": {}\n  }\n}", &["\n", " ToolCalled: Pwd\n"])
+    ];
+    let mut passed = 0;
+    for (name, input, expected) in test_cases {
+        libakuma::print(&format!("[*] Testing: {}\n", name));
+        unsafe { super::render::TEST_CAPTURE = Some(alloc::vec::Vec::new()); }
+        let mut renderer = StreamingRenderer::new(9);
+        for chunk in input.as_bytes().chunks(4) {
+            if let Ok(s) = core::str::from_utf8(chunk) { renderer.process_chunk(s); }
+        }
+        renderer.finalize();
+        let captured = unsafe { super::render::TEST_CAPTURE.take().unwrap_or_default() };
+        let filtered: alloc::vec::Vec<_> = captured.into_iter().filter(|s| !s.is_empty()).collect();
+        let mut match_count = 0;
+        for (i, exp) in expected.iter().enumerate() {
+            if let Some(got) = filtered.get(i) {
+                if got == *exp { match_count += 1; }
+                else { libakuma::print(&format!("  [!] Mismatch at index {}: expected {:?}, got {:?}\n", i, exp, got)); }
+            }
+        }
+        if match_count == expected.len() && filtered.len() == expected.len() { passed += 1; libakuma::print("  [+] Passed!\n"); }
+        else {
+            libakuma::print(&format!("  [!] Failed: {}/{} matches, {} total outputs\n", match_count, expected.len(), filtered.len()));
+            for (i, s) in filtered.iter().enumerate() { libakuma::print(&format!("    {:2}: {:?}\n", i, s)); }
+        }
+    }
+    libakuma::print(&format!("--- Results: {}/{} passed ---\n", passed, test_cases.len()));
+    if passed == test_cases.len() { 0 } else { 1 }
+}

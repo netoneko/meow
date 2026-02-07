@@ -32,7 +32,15 @@ pub fn tui_print_assistant(s: &str) {
     tui_print_with_indent(s, "", 9, Some(crate::config::COLOR_MEOW));
 }
 
+pub static mut TEST_CAPTURE: Option<alloc::vec::Vec<alloc::string::String>> = None;
+
 pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&str>) {
+    unsafe {
+        if let Some(ref mut v) = TEST_CAPTURE {
+            v.push(alloc::string::String::from(s));
+            return;
+        }
+    }
     if s.is_empty() && prefix.is_empty() { return; }
     let w = TERM_WIDTH.load(Ordering::SeqCst);
     let h = TERM_HEIGHT.load(Ordering::SeqCst);
@@ -45,9 +53,14 @@ pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&
 
     set_cursor_position(col as u64, row as u64);
     if let Some(c) = color { akuma_write(fd::STDOUT, c.as_bytes()); }
-    if col == 0 && !prefix.is_empty() {
-        akuma_write(fd::STDOUT, prefix.as_bytes());
-        col = visual_length(prefix) as u16;
+    if col == 0 {
+        if !prefix.is_empty() {
+            akuma_write(fd::STDOUT, prefix.as_bytes());
+            col = visual_length(prefix) as u16;
+        } else if indent > 0 {
+            for _ in 0..indent { akuma_write(fd::STDOUT, b" "); }
+            col = indent;
+        }
     }
     
     let mut word_buf: alloc::vec::Vec<char> = alloc::vec::Vec::with_capacity(64);
