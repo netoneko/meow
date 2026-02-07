@@ -1,12 +1,13 @@
 use alloc::string::String;
 use alloc::format;
-use core::sync::atomic::Ordering;
-use crate::config::{COLOR_RESET, COLOR_BOLD, COLOR_GRAY_DIM, COLOR_VIOLET, COLOR_YELLOW, BG_CODE};
+use crate::config::{COLOR_GRAY_DIM, COLOR_MEOW, COLOR_RESET};
 use super::render::tui_print_with_indent;
-use crate::tui_app::CUR_COL;
 
 pub enum StreamState {
     Text,
+    BufferingPotentialTool {
+        buffer: String,
+    },
     BufferingJson {
         buffer: String,
         depth: usize,
@@ -18,11 +19,8 @@ pub enum StreamState {
 pub struct StreamingRenderer {
     state: StreamState,
     indent: u16,
-    in_bold: bool,
-    in_italic: bool,
-    in_code: bool,
-    in_code_block: bool,
-    markdown_buf: String,
+    line_buf: String,
+    at_line_start: bool,
 }
 
 impl StreamingRenderer {
@@ -30,72 +28,97 @@ impl StreamingRenderer {
         Self {
             state: StreamState::Text,
             indent,
-            in_bold: false,
-            in_italic: false,
-            in_code: false,
-            in_code_block: false,
-            markdown_buf: String::new(),
+            line_buf: String::new(),
+            at_line_start: true,
         }
     }
 
     pub fn process_chunk(&mut self, chunk: &str) {
         for c in chunk.chars() {
             let mut next_state = None;
-            let mut chars_to_process = String::new();
+            let mut chars_to_flush = String::new();
 
             match &mut self.state {
                 StreamState::Text => {
-                    // Start buffering if we see '{', but only if not in inline code.
-                    // We allow it even in code blocks because that's where tools live.
-                    if c == '{' && !self.in_code {
+                    if self.at_line_start && c.is_whitespace() && c != '\n' {
+                        self.line_buf.push(c);
+                    } else if self.at_line_start && c == '`' {
+                        self.line_buf.push(c);
+                        if self.line_buf.trim_start().starts_with("```") {
+                            // Potentially a tool block
+                        }
+                    } else if c == '{' && self.at_line_start {
                         next_state = Some(StreamState::BufferingJson {
                             buffer: alloc::format!("{}", c),
                             depth: 1,
                             in_string: false,
                             escape: false,
                         });
+                        self.at_line_start = false;
+                    } else if c == '\n' {
+                        chars_to_flush = self.line_buf.clone();
+                        chars_to_flush.push('\n');
+                        self.line_buf.clear();
+                        self.at_line_start = true;
                     } else {
-                        chars_to_process.push(c);
+                        self.line_buf.push(c);
+                        self.at_line_start = false;
+                        
+                        let trimmed = self.line_buf.trim_start();
+                        if trimmed.starts_with("```json") {
+                            next_state = Some(StreamState::BufferingPotentialTool {
+                                buffer: self.line_buf.clone(),
+                            });
+                            self.line_buf.clear();
+                        } else if self.line_buf.len() > 128 {
+                            // Not a tool start, flush it
+                            chars_to_flush = self.line_buf.clone();
+                            self.line_buf.clear();
+                        }
+                    }
+                }
+                StreamState::BufferingPotentialTool { buffer } => {
+                    buffer.push(c);
+                    if buffer.ends_with("```") && buffer.len() > 15 {
+                        if let Some((tool, args)) = extract_tool_info(buffer) {
+                            print_tool_notification(&tool, &args, self.indent);
+                            next_state = Some(StreamState::Text);
+                            self.at_line_start = true;
+                        } else {
+                            chars_to_flush = buffer.clone();
+                            next_state = Some(StreamState::Text);
+                            self.at_line_start = buffer.ends_with('\n');
+                        }
+                    } else if buffer.len() > 16384 {
+                        chars_to_flush = buffer.clone();
+                        next_state = Some(StreamState::Text);
+                        self.at_line_start = buffer.ends_with('\n');
                     }
                 }
                 StreamState::BufferingJson { buffer, depth, in_string, escape } => {
                     buffer.push(c);
-                    
-                    if *escape {
-                        *escape = false;
-                    } else if c == '\\' && *in_string {
-                        *escape = true;
-                    } else if c == '"' {
-                        *in_string = !*in_string;
-                    } else if !*in_string {
-                        if c == '{' {
-                            *depth += 1;
-                        } else if c == '}' {
+                    if *escape { *escape = false; }
+                    else if c == '\\' && *in_string { *escape = true; }
+                    else if c == '"' { *in_string = !*in_string; }
+                    else if !*in_string {
+                        if c == '{' { *depth += 1; }
+                        else if c == '}' {
                             *depth -= 1;
                             if *depth == 0 {
-                                // Block complete, check if it's a tool call
-                                let is_tool = (buffer.contains("\"command\"") || buffer.contains("command")) && 
-                                             (buffer.contains("\"tool\"") || buffer.contains("tool"));
-                                
-                                if is_tool {
+                                if (buffer.contains("\"command\"") || buffer.contains("command")) && 
+                                   (buffer.contains("\"tool\"") || buffer.contains("tool")) {
                                     if let Some((tool, args)) = extract_tool_info(buffer) {
                                         print_tool_notification(&tool, &args, self.indent);
                                     } else {
-                                        // Failed to extract info, just print it
-                                        chars_to_process = buffer.clone();
+                                        chars_to_flush = buffer.clone();
                                     }
                                 } else {
-                                    // Not a tool call, print it
-                                    chars_to_process = buffer.clone();
+                                    chars_to_flush = buffer.clone();
                                 }
                                 next_state = Some(StreamState::Text);
+                                self.at_line_start = buffer.ends_with('\n');
                             }
                         }
-                    }
-                    
-                    if next_state.is_none() && buffer.len() > 16384 {
-                        chars_to_process = buffer.clone();
-                        next_state = Some(StreamState::Text);
                     }
                 }
             }
@@ -103,141 +126,37 @@ impl StreamingRenderer {
             if let Some(ns) = next_state {
                 self.state = ns;
             }
-            
-            for bc in chars_to_process.chars() {
-                self.process_markdown_char(bc);
+
+            if !chars_to_flush.is_empty() {
+                tui_print_with_indent(&chars_to_flush, "", self.indent, Some(crate::config::COLOR_MEOW));
             }
         }
     }
 
-    fn process_markdown_char(&mut self, c: char) {
-        self.markdown_buf.push(c);
-        
-        // Handle newline and look for block elements
-        if c == '\n' {
-            let buf = self.markdown_buf.clone();
-            self.markdown_buf.clear();
-            let trimmed = buf.trim();
-            
-            if trimmed.starts_with("```") {
-                if !self.in_code_block {
-                    self.in_code_block = true;
-                    let lang = trimmed[3..].trim();
-                    let style = format!("{}{}", BG_CODE, COLOR_YELLOW);
-                    tui_print_with_indent("  ", "", 0, Some(BG_CODE));
-                    if !lang.is_empty() {
-                        tui_print_with_indent(format!("{}          \n", lang).as_str(), "", self.indent + 2, Some(style.as_str()));
-                    } else {
-                        tui_print_with_indent("          \n", "", self.indent + 2, Some(style.as_str()));
-                    }
-                    return;
-                } else {
-                    self.in_code_block = false;
-                    tui_print_with_indent(COLOR_RESET, "", 0, None);
-                    tui_print_with_indent("\n", "", self.indent, None);
-                    return;
-                }
-            }
-
-            if self.in_code_block {
-                let content = &buf[..buf.len().saturating_sub(1)]; // Remove newline
-                let mut styled = String::from(BG_CODE);
-                styled.push_str(COLOR_GRAY_DIM);
-                styled.push_str(content);
-                
-                tui_print_with_indent(&styled, "", self.indent + 2, None);
-                tui_print_with_indent(format!("{}\n", COLOR_RESET).as_str(), "", self.indent + 2, None);
-                return;
-            }
-            
-            if trimmed.starts_with('#') {
-                let level = trimmed.chars().take_while(|&c| c == '#').count();
-                if level > 0 && level <= 6 {
-                    let style = format!("{}{}", COLOR_BOLD, COLOR_VIOLET);
-                    tui_print_with_indent("", "", self.indent, Some(&style));
-                    tui_print_with_indent(trimmed[level..].trim(), "", self.indent, None);
-                    tui_print_with_indent("\n", "", self.indent, Some(COLOR_RESET));
-                    return;
-                }
-            } else if trimmed.starts_with("* ") || trimmed.starts_with("- ") {
-                if CUR_COL.load(Ordering::SeqCst) > self.indent {
-                    tui_print_with_indent("\n", "", self.indent, None);
-                }
-                tui_print_with_indent(" • ", "", self.indent, Some(COLOR_VIOLET));
-                tui_print_with_indent(&trimmed[2..], "", self.indent, None);
-                tui_print_with_indent("\n", "", self.indent, None);
-                return;
-            }
-            
-            tui_print_with_indent(&buf, "", self.indent, None);
-            return;
-        }
-
-        if self.markdown_buf.ends_with("**") {
-            self.markdown_buf.truncate(self.markdown_buf.len() - 2);
-            self.flush_markdown_buf();
-            self.in_bold = !self.in_bold;
-            self.apply_style();
-        } else if self.markdown_buf.ends_with("`") {
-            if self.markdown_buf == "```" {
-                // Potential code block, don't toggle in_code yet
-                return;
-            }
-            self.markdown_buf.truncate(self.markdown_buf.len() - 1);
-            self.flush_markdown_buf();
-            self.in_code = !self.in_code;
-            self.apply_style();
-        } else if self.markdown_buf.len() > 1 {
-            let mut chars = self.markdown_buf.chars();
-            let first = chars.next().unwrap();
-            let second = chars.next().unwrap();
-            
-            if first == '*' && second != '*' {
-                self.markdown_buf.remove(0);
-                self.flush_markdown_buf();
-                self.in_italic = !self.in_italic;
-                self.apply_style();
-            } else if first != '*' && first != '#' && first != '-' && first != '`' { // Don't flush if it could be a header, list, or code
-                self.flush_first_char();
-            }
-        }
-    }
-
-    fn flush_first_char(&mut self) {
-        if self.markdown_buf.is_empty() { return; }
-        if self.markdown_buf.starts_with("```") { return; }
-        let c = self.markdown_buf.remove(0);
-        let mut s = String::new();
-        s.push(c);
-        tui_print_with_indent(&s, "", self.indent, None);
-    }
-
-    fn flush_markdown_buf(&mut self) {
-        if !self.markdown_buf.is_empty() {
-            tui_print_with_indent(&self.markdown_buf, "", self.indent, None);
-            self.markdown_buf.clear();
-        }
-    }
-
-    fn apply_style(&mut self) {
-        let mut style = String::from(COLOR_RESET);
-        if self.in_bold { style.push_str(COLOR_BOLD); }
-        if self.in_italic { style.push_str("\x1b[3m"); }
-        if self.in_code { 
-            style.push_str(BG_CODE);
-            style.push_str(COLOR_GRAY_DIM); 
-        }
-        style.push_str(crate::config::COLOR_MEOW);
-        tui_print_with_indent("", "", self.indent, Some(&style));
-    }
-    
     pub fn finalize(&mut self) {
-        self.flush_markdown_buf();
-        match &mut self.state {
-            StreamState::BufferingJson { buffer, .. } => {
-                tui_print_with_indent(buffer, "", self.indent, None);
+        let to_flush = match &mut self.state {
+            StreamState::Text => {
+                if !self.line_buf.is_empty() {
+                    let s = self.line_buf.clone();
+                    self.line_buf.clear();
+                    s
+                } else {
+                    String::new()
+                }
             }
-            _ => {}
+            StreamState::BufferingPotentialTool { buffer } => {
+                let s = buffer.clone();
+                buffer.clear();
+                s
+            }
+            StreamState::BufferingJson { buffer, .. } => {
+                let s = buffer.clone();
+                buffer.clear();
+                s
+            }
+        };
+        if !to_flush.is_empty() {
+            tui_print_with_indent(&to_flush, "", self.indent, Some(COLOR_MEOW));
         }
         self.state = StreamState::Text;
         tui_print_with_indent("", "", self.indent, Some(COLOR_RESET));
@@ -246,6 +165,7 @@ impl StreamingRenderer {
 
 fn extract_tool_info(json: &str) -> Option<(String, String)> {
     let tool = extract_field_value(json, "tool")?;
+    if tool.is_empty() { return None; }
     
     let mut args = String::new();
     let fields = [
@@ -256,19 +176,14 @@ fn extract_tool_info(json: &str) -> Option<(String, String)> {
     
     for field in fields {
         if let Some(val) = extract_field_value(json, field) {
-            // Avoid including the tool name itself if it somehow matches a field name
             if field == "tool" || field == "command" { continue; }
-            
-            if !args.is_empty() {
-                args.push_str(", ");
-            }
+            if !args.is_empty() { args.push_str(", "); }
             args.push_str(field);
             args.push_str("=\"");
             args.push_str(&val);
             args.push_str("\"");
         }
     }
-    
     Some((tool, args))
 }
 
@@ -276,12 +191,10 @@ fn extract_field_value(json: &str, field: &str) -> Option<String> {
     let pattern = alloc::format!("\"{}\"", field);
     if let Some(pos) = json.find(&pattern) {
         let after = &json[pos + pattern.len()..];
-        // Find the colon after the key
         if let Some(colon_pos) = after.find(':') {
             let after_colon = after[colon_pos + 1..].trim_start();
             if after_colon.starts_with('"') {
                 let after_quote = &after_colon[1..];
-                // Find the closing quote, but respect escapes
                 let mut val = String::new();
                 let mut escape = false;
                 for c in after_quote.chars() {
@@ -293,23 +206,16 @@ fn extract_field_value(json: &str, field: &str) -> Option<String> {
                             _ => val.push(c),
                         }
                         escape = false;
-                    } else if c == '\\' {
-                        escape = true;
-                    } else if c == '"' {
-                        return Some(val);
-                    } else {
-                        val.push(c);
-                    }
+                    } else if c == '\\' { escape = true; }
+                    else if c == '"' { return Some(val); }
+                    else { val.push(c); }
                 }
             } else {
-                // Number, boolean, etc.
                 let end = after_colon.find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace())
                     .unwrap_or(after_colon.len());
                 if end > 0 {
                     let val = after_colon[..end].trim();
-                    if !val.is_empty() && val != "{" {
-                        return Some(String::from(val));
-                    }
+                    if !val.is_empty() && val != "{" { return Some(String::from(val)); }
                 }
             }
         }
@@ -319,7 +225,6 @@ fn extract_field_value(json: &str, field: &str) -> Option<String> {
 
 fn print_tool_notification(tool: &str, args: &str, indent: u16) {
     // We want to be at col 0 on a new line.
-    // Use indent=0 for the newline to ensure we go to the very start.
     tui_print_with_indent("\n", "", 0, None);
     
     let content = if args.is_empty() {
@@ -329,10 +234,9 @@ fn print_tool_notification(tool: &str, args: &str, indent: u16) {
     };
     
     // Print with 1 space indent as requested.
-    // prefix is empty, indent=1.
-    tui_print_with_indent(&content, "", 1, Some(COLOR_GRAY_DIM));
+    tui_print_with_indent(&content, "", 1, Some(crate::config::COLOR_GRAY_DIM));
     
     // Ensure the next content starts with the original assistant indentation.
-    tui_print_with_indent("", "", indent, None);
+    tui_print_with_indent("", "", indent, Some(crate::config::COLOR_MEOW));
 }
 
