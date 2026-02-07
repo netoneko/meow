@@ -203,6 +203,6 @@ fn extract_command_name(json: &str) -> Option<String> {
 }
 
 fn print_tool_notification(cmd: &str, indent: u16) {
-    let content = format!("\n     --- [TOOL CALL: {}] ---\n", cmd);
+    let content = format!("--- [TOOL CALL: {}] ---\n", cmd);
     tui_print_with_indent(&content, "", indent, Some(COLOR_GREEN_LIGHT));
 }
