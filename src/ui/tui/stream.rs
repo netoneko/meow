@@ -52,7 +52,6 @@ impl StreamingRenderer {
                         let trimmed = self.line_buf.trim_start();
                         
                         if trimmed.starts_with("```") {
-                            // Only switch if it could be a tool (has json tag or we're at start of block)
                             if trimmed.contains("json") || trimmed.len() <= 3 {
                                 next_state = Some(StreamState::BufferingPotentialTool {
                                     buffer: self.line_buf.clone(),
@@ -84,7 +83,6 @@ impl StreamingRenderer {
                             next_state = Some(StreamState::Text);
                             self.at_line_start = true;
                         } else {
-                            // Not a tool, flush it all
                             chars_to_flush = buffer.clone();
                             next_state = Some(StreamState::Text);
                             self.at_line_start = buffer.ends_with('\n');
@@ -232,11 +230,12 @@ fn extract_field_value(json: &str, field: &str) -> Option<String> {
 fn print_tool_notification(tool: &str, args: &str, indent: u16) {
     tui_print_with_indent("\n", "", 0, None);
     let content = if args.is_empty() {
-        format!(" ToolCalled: {}\n", tool)
+        format!("ToolCalled: {}\n", tool)
     } else {
-        format!(" ToolCalled: {} | Arguments {}\n", tool, args)
+        format!("ToolCalled: {} | Arguments {}\n", tool, args)
     };
-    tui_print_with_indent(&content, "", 0, Some(crate::config::COLOR_GRAY_DIM));
+    // Use the standard notification prefix and indentation
+    tui_print_with_indent(&content, "     --- ", 9, Some(crate::config::COLOR_GRAY_DIM));
     tui_print_with_indent("", "", indent, None);
 }
 
@@ -244,9 +243,9 @@ pub fn run_tests() -> i32 {
     libakuma::print("--- Meow StreamingRenderer Tests ---\n");
     let test_cases: [(&str, &str, &[&str]); 4] = [
         ("Normal text", "Hello nya~!\n", &["Hello nya~!\n"]),
-        ("Simple tool call", "```json\n{\n  \"command\": {\n    \"tool\": \"FileRead\",\n    \"args\": {\n      \"filename\": \"test.txt\"\n    }\n  }\n}\n```", &["\n", " ToolCalled: FileRead | Arguments filename=\"test.txt\"\n"]),
-        ("Tool with text before", "Sure! Here it is:\n\n```json\n{\n  \"command\": {\n    \"tool\": \"FileList\",\n    \"args\": {\"path\": \"/\"}\n  }\n}\n```", &["Sure! Here it is:\n", "\n", "\n", " ToolCalled: FileList | Arguments path=\"/\"\n"]),
-        ("Tool call without code block", "{\n  \"command\": {\n    \"tool\": \"Pwd\",\n    \"args\": {}\n  }\n}", &["\n", " ToolCalled: Pwd\n"])
+        ("Simple tool call", "```json\n{\n  \"command\": {\n    \"tool\": \"FileRead\",\n    \"args\": {\n      \"filename\": \"test.txt\"\n    }\n  }\n}\n```", &["\n", "ToolCalled: FileRead | Arguments filename=\"test.txt\"\n"]),
+        ("Tool with text before", "Sure! Here it is:\n\n```json\n{\n  \"command\": {\n    \"tool\": \"FileList\",\n    \"args\": {\"path\": \"/\"}\n  }\n}\n```", &["Sure! Here it is:\n", "\n", "\n", "ToolCalled: FileList | Arguments path=\"/\"\n"]),
+        ("Tool call without code block", "{\n  \"command\": {\n    \"tool\": \"Pwd\",\n    \"args\": {}\n  }\n}", &["\n", "ToolCalled: Pwd\n"])
     ];
     let mut passed = 0;
     for (name, input, expected) in test_cases {
