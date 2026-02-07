@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::format;
-use crate::config::{COLOR_BOLD, COLOR_RESET, COLOR_GRAY_DIM, COLOR_VIOLET, COLOR_YELLOW};
+use crate::config::{COLOR_BOLD, COLOR_RESET, COLOR_GRAY_DIM, COLOR_VIOLET, COLOR_YELLOW, BG_CODE};
 use super::render::tui_print_with_indent;
 
 pub struct MarkdownRenderer {
@@ -15,7 +15,6 @@ impl MarkdownRenderer {
 
     pub fn render(&self, markdown: &str) {
         let mut in_code_block = false;
-        const BG_CODE: &str = "\x1b[48;5;235m"; // Darker grey background for code blocks
         
         for line in markdown.lines() {
             let trimmed = line.trim();
@@ -25,14 +24,12 @@ impl MarkdownRenderer {
                 if !in_code_block {
                     // Entering code block
                     let lang = &trimmed[3..].trim();
+                    let style = format!("{}{}", BG_CODE, COLOR_YELLOW);
+                    tui_print_with_indent("  ", "", 0, Some(BG_CODE));
                     if !lang.is_empty() {
-                        let style = format!("{}{}", BG_CODE, COLOR_YELLOW);
-                        // Manually print padding for the language line to align it
-                        tui_print_with_indent("  ", "", 0, None);
                         tui_print_with_indent(format!("{}\n", lang).as_str(), "", self.indent + 2, Some(style.as_str()));
                     } else {
-                        // Just indent for content
-                        tui_print_with_indent("  ", "", 0, None);
+                        tui_print_with_indent("\n", "", self.indent + 2, Some(BG_CODE));
                     }
                     in_code_block = true;
                 } else {
@@ -117,7 +114,10 @@ impl MarkdownRenderer {
             if let Some(base) = base_style { s.push_str(base); }
             if bold { s.push_str(COLOR_BOLD); }
             if italic { s.push_str("\x1b[3m"); }
-            if code { s.push_str(COLOR_GRAY_DIM); }
+            if code { 
+                s.push_str(BG_CODE);
+                s.push_str(COLOR_GRAY_DIM); 
+            }
             s
         };
 

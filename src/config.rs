@@ -213,6 +213,7 @@ pub const COLOR_GREEN_LIGHT: &str = "\x1b[38;5;120m"; // Success / Light Green
 pub const COLOR_YELLOW: &str = "\x1b[38;5;215m"; // Metrics
 pub const COLOR_RESET: &str = "\x1b[0m";
 pub const COLOR_BOLD: &str = "\x1b[1m";
+pub const BG_CODE: &str = "\x1b[48;5;236m"; // Darker grey background for code blocks
 
 /// API type for the provider
 #[derive(Debug, Clone, PartialEq)]

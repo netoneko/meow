@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::format;
-use crate::config::{COLOR_GREEN_LIGHT, COLOR_RESET, COLOR_BOLD, COLOR_GRAY_DIM, COLOR_VIOLET, COLOR_YELLOW};
+use crate::config::{COLOR_GREEN_LIGHT, COLOR_RESET, COLOR_BOLD, COLOR_GRAY_DIM, COLOR_VIOLET, COLOR_YELLOW, BG_CODE};
 use super::render::{tui_print_with_indent, tui_print_assistant};
 
 pub enum StreamState {
@@ -107,18 +107,17 @@ impl StreamingRenderer {
             let buf = self.markdown_buf.clone();
             self.markdown_buf.clear();
             let trimmed = buf.trim();
-            const BG_CODE: &str = "\x1b[48;5;235m";
             
             if trimmed.starts_with("```") {
                 if !self.in_code_block {
                     self.in_code_block = true;
                     let lang = trimmed[3..].trim();
+                    let style = format!("{}{}", BG_CODE, COLOR_YELLOW);
+                    tui_print_with_indent("  ", "", 0, Some(BG_CODE));
                     if !lang.is_empty() {
-                        let style = format!("{}{}", BG_CODE, COLOR_YELLOW);
-                        tui_print_with_indent("  ", "", 0, None);
                         tui_print_with_indent(format!("{}\n", lang).as_str(), "", self.indent + 2, Some(style.as_str()));
                     } else {
-                        tui_print_with_indent("  ", "", 0, None);
+                        tui_print_with_indent("\n", "", self.indent + 2, Some(BG_CODE));
                     }
                     return;
                 } else {
@@ -205,7 +204,10 @@ impl StreamingRenderer {
         let mut style = String::from(COLOR_RESET);
         if self.in_bold { style.push_str(COLOR_BOLD); }
         if self.in_italic { style.push_str("\x1b[3m"); }
-        if self.in_code { style.push_str(COLOR_GRAY_DIM); }
+        if self.in_code { 
+            style.push_str(BG_CODE);
+            style.push_str(COLOR_GRAY_DIM); 
+        }
         style.push_str(crate::config::COLOR_MEOW);
         tui_print_with_indent("", "", self.indent, Some(&style));
     }
