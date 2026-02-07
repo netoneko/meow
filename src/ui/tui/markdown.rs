@@ -25,7 +25,13 @@ impl MarkdownRenderer {
                     // Entering code block
                     let lang = &trimmed[3..].trim();
                     if !lang.is_empty() {
-                        tui_print_with_indent(format!("{}\n", lang).as_str(), "", self.indent, Some(COLOR_YELLOW));
+                        let style = format!("{}{}", BG_CODE, COLOR_YELLOW);
+                        // Manually print padding for the language line to align it
+                        tui_print_with_indent("  ", "", 0, None);
+                        tui_print_with_indent(format!("{}\n", lang).as_str(), "", self.indent + 2, Some(style.as_str()));
+                    } else {
+                        // Just indent for content
+                        tui_print_with_indent("  ", "", 0, None);
                     }
                     in_code_block = true;
                 } else {
@@ -41,10 +47,10 @@ impl MarkdownRenderer {
                 let mut styled_line = String::from(BG_CODE);
                 styled_line.push_str(COLOR_GRAY_DIM);
                 styled_line.push_str(line);
-                // Fill the rest of the line with background color? 
-                // TUI usually renders line by line. Let's just apply it to the text.
+                
                 tui_print_with_indent(&styled_line, "", self.indent + 2, None);
-                tui_print_with_indent(format!("{}\n", COLOR_RESET).as_str(), "", 0, None);
+                // Reset color at end of line and prepare indentation for next line
+                tui_print_with_indent(format!("{}\n", COLOR_RESET).as_str(), "", self.indent + 2, None);
                 continue;
             }
 

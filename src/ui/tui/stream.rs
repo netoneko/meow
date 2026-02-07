@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::format;
-use crate::config::{COLOR_GREEN_LIGHT, COLOR_RESET, COLOR_BOLD, COLOR_GRAY_DIM, COLOR_VIOLET};
+use crate::config::{COLOR_GREEN_LIGHT, COLOR_RESET, COLOR_BOLD, COLOR_GRAY_DIM, COLOR_VIOLET, COLOR_YELLOW};
 use super::render::{tui_print_with_indent, tui_print_assistant};
 
 pub enum StreamState {
@@ -20,6 +20,7 @@ pub struct StreamingRenderer {
     in_bold: bool,
     in_italic: bool,
     in_code: bool,
+    in_code_block: bool,
     markdown_buf: String,
 }
 
@@ -31,6 +32,7 @@ impl StreamingRenderer {
             in_bold: false,
             in_italic: false,
             in_code: false,
+            in_code_block: false,
             markdown_buf: String::new(),
         }
     }
@@ -105,6 +107,38 @@ impl StreamingRenderer {
             let buf = self.markdown_buf.clone();
             self.markdown_buf.clear();
             let trimmed = buf.trim();
+            const BG_CODE: &str = "\x1b[48;5;235m";
+            
+            if trimmed.starts_with("```") {
+                if !self.in_code_block {
+                    self.in_code_block = true;
+                    let lang = trimmed[3..].trim();
+                    if !lang.is_empty() {
+                        let style = format!("{}{}", BG_CODE, COLOR_YELLOW);
+                        tui_print_with_indent("  ", "", 0, None);
+                        tui_print_with_indent(format!("{}\n", lang).as_str(), "", self.indent + 2, Some(style.as_str()));
+                    } else {
+                        tui_print_with_indent("  ", "", 0, None);
+                    }
+                    return;
+                } else {
+                    self.in_code_block = false;
+                    tui_print_with_indent(COLOR_RESET, "", 0, None);
+                    tui_print_with_indent("\n", "", self.indent, None);
+                    return;
+                }
+            }
+
+            if self.in_code_block {
+                let content = &buf[..buf.len().saturating_sub(1)]; // Remove newline
+                let mut styled = String::from(BG_CODE);
+                styled.push_str(COLOR_GRAY_DIM);
+                styled.push_str(content);
+                
+                tui_print_with_indent(&styled, "", self.indent + 2, None);
+                tui_print_with_indent(format!("{}\n", COLOR_RESET).as_str(), "", self.indent + 2, None);
+                return;
+            }
             
             if trimmed.starts_with('#') {
                 let level = trimmed.chars().take_while(|&c| c == '#').count();
