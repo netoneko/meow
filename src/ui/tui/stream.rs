@@ -45,49 +45,79 @@ impl StreamingRenderer {
                         chars_to_flush.push('\n');
                         self.line_buf.clear();
                         self.at_line_start = true;
-                    } else if self.at_line_start && c.is_whitespace() {
-                        self.line_buf.push(c);
-                    } else {
-                        self.line_buf.push(c);
-                        let trimmed = self.line_buf.trim_start();
-                        
-                        if trimmed.starts_with("```") {
-                            if trimmed.contains("json") || trimmed.len() <= 3 {
+                    } else if self.at_line_start {
+                        if c.is_whitespace() {
+                            self.line_buf.push(c);
+                        } else {
+                            self.line_buf.push(c);
+                            let trimmed = self.line_buf.trim_start();
+                            if trimmed == "```" {
                                 next_state = Some(StreamState::BufferingPotentialTool {
                                     buffer: self.line_buf.clone(),
                                 });
                                 self.line_buf.clear();
+                            } else if trimmed == "{" {
+                                next_state = Some(StreamState::BufferingJson {
+                                    buffer: self.line_buf.clone(),
+                                    depth: 1,
+                                    in_string: false,
+                                    escape: false,
+                                });
+                                self.line_buf.clear();
+                            } else if ! "```".starts_with(trimmed) && ! "{".starts_with(trimmed) {
+                                // Clearly not a tool, flush line_buf and disable line-start buffering
+                                chars_to_flush = self.line_buf.clone();
+                                self.line_buf.clear();
+                                self.at_line_start = false;
                             }
-                        } else if trimmed.starts_with("{") {
-                            next_state = Some(StreamState::BufferingJson {
-                                buffer: self.line_buf.clone(),
-                                depth: 1,
-                                in_string: false,
-                                escape: false,
-                            });
-                            self.line_buf.clear();
-                        } else if self.line_buf.len() > 256 {
-                            chars_to_flush = self.line_buf.clone();
-                            self.line_buf.clear();
-                            self.at_line_start = false;
-                        } else {
-                            self.at_line_start = false;
+                        }
+                    } else {
+                        // Fluent streaming for non-line-start text
+                        chars_to_flush.push(c);
+                        if c == '\n' {
+                            self.at_line_start = true;
                         }
                     }
                 }
                 StreamState::BufferingPotentialTool { buffer } => {
                     buffer.push(c);
-                    if buffer.ends_with("```") && buffer.len() > 10 {
+                    let trimmed = buffer.trim_start();
+                    
+                    // Logic to see if we should ABORT buffering because it's clearly not a tool
+                    if next_state.is_none() && trimmed.len() > 3 {
+                        let after_bt = &trimmed[3..];
+                        if let Some(nl) = after_bt.find('\n') {
+                            let tag = after_bt[..nl].trim();
+                            if !tag.is_empty() && tag != "json" {
+                                // It's like ```rust\n... flush it
+                                chars_to_flush = buffer.clone();
+                                next_state = Some(StreamState::Text);
+                                self.at_line_start = buffer.ends_with('\n');
+                            }
+                        } else {
+                            // No newline yet, check if we are still typing "json"
+                            if ! "json".starts_with(after_bt) {
+                                chars_to_flush = buffer.clone();
+                                next_state = Some(StreamState::Text);
+                                self.at_line_start = buffer.ends_with('\n');
+                            }
+                        }
+                    }
+                    
+                    // Check if block is complete
+                    if next_state.is_none() && buffer.ends_with("```") && buffer.len() > 10 {
                         if let Some((tool, args)) = extract_tool_info(buffer) {
                             print_tool_notification(&tool, &args, self.indent);
                             next_state = Some(StreamState::Text);
                             self.at_line_start = true;
                         } else {
+                            // Not a tool call, flush the whole markdown block
                             chars_to_flush = buffer.clone();
                             next_state = Some(StreamState::Text);
                             self.at_line_start = buffer.ends_with('\n');
                         }
-                    } else if buffer.len() > 16384 {
+                    } else if next_state.is_none() && buffer.len() > 16384 {
+                        // Safety fallback
                         chars_to_flush = buffer.clone();
                         next_state = Some(StreamState::Text);
                         self.at_line_start = buffer.ends_with('\n');
@@ -234,7 +264,6 @@ fn print_tool_notification(tool: &str, args: &str, indent: u16) {
     } else {
         format!("ToolCalled: {} | Arguments {}\n", tool, args)
     };
-    // Use the standard notification prefix and indentation
     tui_print_with_indent(&content, "     --- ", 9, Some(crate::config::COLOR_GRAY_DIM));
     tui_print_with_indent("", "", indent, None);
 }
@@ -244,7 +273,7 @@ pub fn run_tests() -> i32 {
     let test_cases: [(&str, &str, &[&str]); 4] = [
         ("Normal text", "Hello nya~!\n", &["Hello nya~!\n"]),
         ("Simple tool call", "```json\n{\n  \"command\": {\n    \"tool\": \"FileRead\",\n    \"args\": {\n      \"filename\": \"test.txt\"\n    }\n  }\n}\n```", &["\n", "ToolCalled: FileRead | Arguments filename=\"test.txt\"\n"]),
-        ("Tool with text before", "Sure! Here it is:\n\n```json\n{\n  \"command\": {\n    \"tool\": \"FileList\",\n    \"args\": {\"path\": \"/\"}\n  }\n}\n```", &["Sure! Here it is:\n", "\n", "\n", "ToolCalled: FileList | Arguments path=\"/\"\n"]),
+        ("Tool with text before", "Sure! Here it is:\n\n```json\n{\n  \"command\": {\n    \"tool\": \"FileList\",\n    \"args\": {\"path\": \"/\"}\n  }\n}\n```", &["Sure! Here it is:\n\n", "\n", "ToolCalled: FileList | Arguments path=\"/\"\n"]),
         ("Tool call without code block", "{\n  \"command\": {\n    \"tool\": \"Pwd\",\n    \"args\": {}\n  }\n}", &["\n", "ToolCalled: Pwd\n"])
     ];
     let mut passed = 0;
@@ -252,7 +281,7 @@ pub fn run_tests() -> i32 {
         libakuma::print(&format!("[*] Testing: {}\n", name));
         unsafe { super::render::TEST_CAPTURE = Some(alloc::vec::Vec::new()); }
         let mut renderer = StreamingRenderer::new(9);
-        for chunk in input.as_bytes().chunks(4) {
+        for chunk in input.as_bytes().chunks(1) {
             if let Ok(s) = core::str::from_utf8(chunk) { renderer.process_chunk(s); }
         }
         renderer.finalize();
