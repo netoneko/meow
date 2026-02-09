@@ -80,7 +80,7 @@ pub fn tool_http_fetch(url: &str) -> ToolResult {
                 }
                 Err(e) => {
                     if e.kind == libakuma::net::ErrorKind::WouldBlock {
-                        libakuma::sleep_ms(10);
+                        libakuma::sleep_ms(1);
                         continue;
                     }
                     break;

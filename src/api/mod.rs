@@ -46,7 +46,7 @@ fn read_response(stream: &TcpStream) -> Result<String, ProviderError> {
                 {
                     retries += 1;
                     if retries > 100 { break; }
-                    libakuma::sleep_ms(10);
+                    libakuma::sleep_ms(1);
                     continue;
                 }
                 break;

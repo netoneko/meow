@@ -283,7 +283,7 @@ fn read_streaming_with_http_stream_tls(
                     pending_lines.drain(..newline_pos + 1);
                 }
             }
-                                    StreamResult::WouldBlock => { libakuma::sleep_ms(10); }
+                                    StreamResult::WouldBlock => { libakuma::sleep_ms(1); }
                                     StreamResult::Done => {
                                         let remaining = pending_lines.trim();
                                         if !remaining.is_empty() {
@@ -457,7 +457,7 @@ fn read_streaming_response_with_progress(
                     read_attempts += 1;
                     if read_attempts % 50 == 0 && !first_token_received && !is_tui { libakuma::print("."); dots_printed += 1; }
                     if read_attempts > 6000 { return Err("Timeout waiting for response"); }
-                    libakuma::sleep_ms(10);
+                    libakuma::sleep_ms(1);
                     continue;
                 }
                 return Err("Network error");
