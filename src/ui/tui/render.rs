@@ -239,20 +239,17 @@ pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
             for _ in 0..layout.status_dots { let _ = write!(stdout, "."); }
             for _ in layout.status_dots..5 { let _ = write!(stdout, " "); }
 
-            let now = libakuma::uptime();
-            let elapsed_us = now.saturating_sub(layout.status_start_us);
-            let rms = elapsed_us / 1000;
+            let ms = if let Some(ms) = layout.status_time_ms { 
+                Some(ms) 
+            } else if layout.status_start_us > 0 && !layout.status_text.contains("awaiting") { 
+                Some((libakuma::uptime() - layout.status_start_us) / 1000) 
+            } else { 
+                None 
+            };
 
-            if let Some(ms) = layout.status_time_ms { 
+            if let Some(ms) = ms { 
                 if ms < 1000 { let _ = write!(stdout, "~(=^‥^)ノ [{}ms]", ms); } 
                 else { let _ = write!(stdout, "~(=^‥^)ノ [{}.{}s]", ms / 1000, (ms % 1000) / 100); }
-                
-                if rms > ms + 100 { 
-                    let _ = write!(stdout, " ({}ms)", rms);
-                }
-            } else if !layout.status_text.contains("awaiting") {
-                if rms < 1000 { let _ = write!(stdout, "~(=^‥^)ノ [{}ms]", rms); } 
-                else { let _ = write!(stdout, "~(=^‥^)ノ [{}.{}s]", rms / 1000, (rms % 1000) / 100); }
             }
             let _ = write!(stdout, "{}", COLOR_RESET);
         }
