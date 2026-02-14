@@ -20,8 +20,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use config::{Config, Provider, DEFAULT_CONTEXT_WINDOW, SYSTEM_PROMPT_BASE};
-use libakuma::{arg, argc, exit};
+use config::{Config, Provider, DEFAULT_CONTEXT_WINDOW, PERSONALITIES, COMMON_TOOLS};
+use libakuma::{arg, argc, exit, open, close, read_fd, fstat, open_flags};
 use app::Message;
 
 #[no_mangle]
@@ -34,6 +34,7 @@ fn main() -> i32 {
     let mut app_config = Config::load();
     let mut model_override: Option<String> = None;
     let mut provider_override: Option<String> = None;
+    let mut personality_override: Option<String> = None;
     let mut one_shot_message: Option<String> = None;
     let mut use_tui = true;
 
@@ -59,6 +60,10 @@ fn main() -> i32 {
                 i += 1;
                 if let Some(p) = arg(i) { provider_override = Some(String::from(p)); }
                 else { libakuma::print("meow: --provider requires a provider name\n"); return 1; }
+            } else if arg_str == "-P" || arg_str == "--personality" {
+                i += 1;
+                if let Some(p) = arg(i) { personality_override = Some(String::from(p)); }
+                else { libakuma::print("meow: -P requires a personality name\n"); return 1; }
             } else if arg_str == "--tui" {
                 use_tui = true;
             } else if arg_str == "-h" || arg_str == "--help" {
@@ -85,13 +90,38 @@ fn main() -> i32 {
         app_config.current_model = m.clone();
     }
 
+    if let Some(ref p) = personality_override {
+        app_config.current_personality = p.clone();
+    }
+
     let current_provider = app_config
         .get_current_provider()
         .cloned()
         .unwrap_or_else(Provider::ollama_default);
 
     let model = app_config.current_model.clone();
-    let mut system_prompt = String::from(SYSTEM_PROMPT_BASE);
+
+    // Assemble system prompt
+    let mut system_prompt = String::new();
+
+    // Check for local MEOW.md in current working directory
+    let local_prompt = load_local_prompt();
+    if let Some(prompt) = local_prompt {
+        system_prompt.push_str(&prompt);
+    } else {
+        // Find personality in registry
+        let persona = PERSONALITIES.iter().find(|p| p.name == app_config.current_personality);
+        if let Some(p) = persona {
+            system_prompt.push_str(p.description);
+        } else {
+            // Fallback to Meow if not found
+            system_prompt.push_str(PERSONALITIES[0].description);
+        }
+    }
+
+    system_prompt.push_str("\n\n");
+    system_prompt.push_str(COMMON_TOOLS);
+
     if tools::chainlink_available() {
         system_prompt.push_str(tools::chainlink::CHAINLINK_TOOLS_SECTION);
     }
@@ -108,7 +138,13 @@ fn main() -> i32 {
             format!("[System Context] Your current working directory is: {}\nSandbox root: {} (you cannot access paths outside this directory)\nUse relative paths like 'docs/' instead of absolute paths like '/docs/'.", initial_cwd, sandbox_root)
         };
         history.push(Message::new("user", &cwd_context));
-        history.push(Message::new("assistant", "Understood nya~! I'll use relative paths for file operations within the current directory. Ready to help! (=^・ω・^=)"));
+        
+        let ack_msg = if app_config.current_personality == "Jaffar" {
+            "Understood. I shall utilize relative paths for my machinations within this directory. The throne awaits!"
+        } else {
+            "Understood nya~! I'll use relative paths for file operations within the current directory. Ready to help! (=^・ω・^=)"
+        };
+        history.push(Message::new("assistant", ack_msg));
 
         let context_window = match api::query_model_info(&model, &current_provider) {
             Some(ctx) => ctx,
@@ -136,19 +172,52 @@ fn main() -> i32 {
             format!("[System Context] Current working directory: {}\nSandbox root: {} - use relative paths.", initial_cwd, sandbox_root)
         };
         history.push(Message::new("user", &cwd_context));
-        history.push(Message::new("assistant", "Understood nya~!"));
+        
+        let ack_msg = if app_config.current_personality == "Jaffar" { "Understood." } else { "Understood nya~!" };
+        history.push(Message::new("assistant", ack_msg));
         
         return match app::chat_once(&model, &current_provider, &msg, &mut history, None, &system_prompt) {
             Ok(_) => { libakuma::print("\n"); 0 }
-            Err(e) => { libakuma::print(&format!("～ Nyaa~! {} (=ＴェＴ=) ～\n", e)); 1 }
+            Err(e) => {
+                let err_msg = if app_config.current_personality == "Jaffar" {
+                    format!("Error: {}\n", e)
+                } else {
+                    format!("～ Nyaa~! {} (=ＴェＴ=) ～\n", e)
+                };
+                libakuma::print(&err_msg); 1
+            }
         };
     }
 
     0
 }
 
+fn load_local_prompt() -> Option<String> {
+    let fd = open("MEOW.md", open_flags::O_RDONLY);
+    if fd < 0 { return None; }
+
+    let stat = match fstat(fd) {
+        Ok(s) => s,
+        Err(_) => { close(fd); return None; }
+    };
+
+    let size = stat.st_size as usize;
+    if size == 0 || size > 64 * 1024 { close(fd); return None; }
+
+    let mut buf = alloc::vec![0u8; size];
+    let bytes_read = read_fd(fd, &mut buf);
+    close(fd);
+
+    if bytes_read <= 0 { return None; }
+
+    match String::from_utf8(buf) {
+        Ok(s) => Some(s),
+        Err(_) => None,
+    }
+}
+
 fn print_usage() {
-    libakuma::print("  /\\_/\\\n ( o.o )  ～ MEOW-CHAN PROTOCOL ～\n  > ^ <   Cyberpunk Neko AI Assistant\n\nUsage: meow [OPTIONS] [MESSAGE]\n       meow init              # Configure providers\n\nOptions:\n  -m, --model <NAME>      Neural link override\n  -p, --provider <NAME>   Use specific provider\n  --tui                   Interactive TUI (default)\n  -h, --help              Display this transmission\n\nInteractive Commands:\n  /clear              Wipe memory banks nya~\n  /model [NAME]       Check/switch/list neural links\n  /provider [NAME]    Check/switch providers\n  /tokens             Show current token usage\n  /help               Command protocol\n  /quit               Jack out\n");
+    libakuma::print("  /\\_/\\\n ( o.o )  ～ MEOW-CHAN PROTOCOL ～\n  > ^ <   Cyberpunk Neko AI Assistant\n\nUsage: meow [OPTIONS] [MESSAGE]\n       meow init              # Configure providers\n\nOptions:\n  -m, --model <NAME>      Neural link override\n  -p, --provider <NAME>   Use specific provider\n  -P, --personality <NAM> Switch persona (Meow, Jaffar)\n  --tui                   Interactive TUI (default)\n  -h, --help              Display this transmission\n\nInteractive Commands:\n  /clear              Wipe memory banks nya~\n  /model [NAME]       Check/switch/list neural links\n  /provider [NAME]    Check/switch providers\n  /personality [NAME] Check/switch personality\n  /tokens             Show current token usage\n  /help               Command protocol\n  /quit               Jack out\n");
 }
 
 fn run_init(config: &mut Config) -> i32 {
@@ -176,6 +245,6 @@ fn run_init(config: &mut Config) -> i32 {
             libakuma::print(&format!("  - {} [{}]: {}{}\n", p.name, api_type, p.base_url, current));
         }
     }
-    libakuma::print(&format!("\n  Current model: {}\n  Config file: /etc/meow/config\n\n～ To add a provider, edit /etc/meow/config manually ～\n   Format:\n   [provider:name]\n   base_url=http://host:port\n   api_type=ollama|openai\n   api_key=your-key-here (optional)\n\n", config.current_model));
+    libakuma::print(&format!("\n  Current model: {}\n  Current personality: {}\n  Config file: /etc/meow/config\n\n～ To add a provider, edit /etc/meow/config manually ～\n   Format:\n   [provider:name]\n   base_url=http://host:port\n   api_type=ollama|openai\n   api_key=your-key-here (optional)\n\n", config.current_model, config.current_personality));
     0
 }

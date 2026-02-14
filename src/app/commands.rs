@@ -108,6 +108,30 @@ pub fn handle_command(
             (CommandResult::Continue, Some(format!("～ Current token usage: {} / {} 
   Tip: Ask Meow to 'compact the context' when tokens are high nya~!", current, TOKEN_LIMIT_FOR_COMPACTION)))
         }
+        "/personality" => {
+            match arg {
+                Some("list") | Some("?") => {
+                    let mut output = String::from("～ Available personalities: ～\n");
+                    for p in crate::config::PERSONALITIES {
+                        let current_marker = if p.name == config.current_personality { " (current)" } else { "" };
+                        output.push_str(&format!("  - {}{}\n", p.name, current_marker));
+                    }
+                    (CommandResult::Continue, Some(output))
+                }
+                Some(new_p) => {
+                    if crate::config::PERSONALITIES.iter().any(|p| p.name == new_p) {
+                        config.current_personality = String::from(new_p);
+                        let _ = config.save();
+                        (CommandResult::Continue, Some(format!("～ Personality set to {}. (Restart or /clear to apply fully) ～", new_p)))
+                    } else {
+                        (CommandResult::Continue, Some(format!("～ Unknown personality: {}. Use '/personality list' to see available ones. ～", new_p)))
+                    }
+                }
+                None => {
+                    (CommandResult::Continue, Some(format!("～ Current personality: {} ～", config.current_personality)))
+                }
+            }
+        }
         "/markdown" => {
             config.render_markdown = !config.render_markdown;
             crate::app::state::set_render_markdown(config.render_markdown);
@@ -140,6 +164,7 @@ pub fn handle_command(
 * `/model list`: List available models
 * `/provider`: Check/switch provider
 * `/provider list`: List configured providers
+* `/personality [NAME]`: Check/switch personality
 * `/tokens`: Show current token usage
 * `/markdown`: Toggle Markdown rendering nya~
 * `/hotkeys`: Show input shortcuts
