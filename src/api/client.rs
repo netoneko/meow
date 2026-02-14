@@ -467,6 +467,9 @@ fn read_streaming_response_with_progress(
             }
             Err(e) => {
                 if e.kind == libakuma::net::ErrorKind::WouldBlock || e.kind == libakuma::net::ErrorKind::TimedOut {
+                    if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+                        crate::ui::tui::render::render_footer(current_tokens, token_limit, mem_kb);
+                    }
                     read_attempts += 1;
                     if read_attempts % 50 == 0 && !first_token_received && !is_tui { libakuma::print("."); dots_printed += 1; }
                     if read_attempts > 6000 { return Err("Timeout waiting for response"); }
