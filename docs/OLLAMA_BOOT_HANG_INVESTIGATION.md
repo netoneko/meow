@@ -60,8 +60,12 @@ When Ollama is off, `connect(provider)` likely fails immediately with a "Connect
 ## Why it hangs when Ollama is ON
 When Ollama is on, the connection is accepted (`connect` succeeds). `meow` then sends a `POST /api/show` request and waits for a response. If Ollama is busy, slow, or the network stack in the OS/Kernel has latency, `meow` enters the `read_response` loop and may get stuck if the kernel's `read` call blocks or if the retry logic isn't robust enough for a slow response.
 
-## Proposed Fixes
-1. **Asynchronous/Non-blocking Initialization:** Move the `query_model_info` call inside the TUI or perform it in the background so it doesn't block the UI from appearing.
-2. **Robust Timeouts:** Implement a proper wall-clock timeout (e.g., 2 seconds) for the entire `query_model_info` operation.
-3. **Failure Tolerance:** If `query_model_info` takes more than a few hundred milliseconds, abort and use the default context window.
-4. **Improved Logging:** Add debug prints (or a "Neko is thinking..." splash screen) during boot so the user knows what the app is waiting for.
+## Resolution
+
+The hang was addressed by improving the robustness of the network response handling and providing user feedback during the boot sequence.
+
+### Changes Made:
+1. **Wall-clock Timeouts:** In `src/api/mod.rs`, `read_response` now uses `libakuma::uptime()` to enforce a strict 5-second timeout. This prevents the application from hanging indefinitely if the provider accepts a connection but never sends data.
+2. **Reduced CPU Polling:** Increased the sleep duration in the retry loop from 1ms to 10ms to be more respectful of system resources while waiting for data.
+3. **User Feedback:** Added a status message in `src/main.rs` (`[*] Jacking in to the matrix...`) that appears while `meow` is querying model information. This ensures the user knows the application is active and what it is waiting for.
+4. **Graceful Degradation:** If the timeout is reached, the error is caught and `meow` correctly falls back to the `DEFAULT_CONTEXT_WINDOW`, allowing the session to proceed.

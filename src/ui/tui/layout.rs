@@ -97,7 +97,7 @@ impl PaneLayout {
     }
 
     pub fn update_status(&mut self, text: &str, dots: u8, time_ms: Option<u64>) {
-        if self.status_text != text {
+        if self.status_text != text || self.status_start_us == 0 {
             self.status_text = String::from(text);
             self.status_dots = if dots > 0 { dots } else { 1 };
             self.status_start_us = libakuma::uptime();

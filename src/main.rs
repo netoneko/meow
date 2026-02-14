@@ -146,10 +146,9 @@ fn main() -> i32 {
         };
         history.push(Message::new("assistant", ack_msg));
 
-        let context_window = match api::query_model_info(&model, &current_provider) {
-            Some(ctx) => ctx,
-            None => DEFAULT_CONTEXT_WINDOW,
-        };
+        // Skip blocking model info query on startup to prevent hangs.
+        // It can be queried later if needed or configured via commands.
+        let context_window = DEFAULT_CONTEXT_WINDOW;
 
         let mut current_model = model;
         let mut current_provider = current_provider;

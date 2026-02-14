@@ -88,6 +88,9 @@ pub fn send_with_retry(
         };
 
         tui_app::update_streaming_status("[MEOW] waiting", 0, None);
+        if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+            crate::ui::tui::render::render_footer(current_tokens, token_limit, mem_kb);
+        }
         if !is_tui { libakuma::print("."); }
 
         let (path, request_body) = build_chat_request(model, provider, history_json);
@@ -243,6 +246,9 @@ fn read_streaming_with_http_stream_tls(
 
     loop {
         tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
+        if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+            crate::ui::tui::render::render_footer(current_tokens, token_limit, mem_kb);
+        }
         if tui_app::tui_is_cancelled() { return Err("Request cancelled"); }
         match stream.read_chunk() {
             StreamResult::Data(data) => {
@@ -283,7 +289,12 @@ fn read_streaming_with_http_stream_tls(
                     pending_lines.drain(..newline_pos + 1);
                 }
             }
-                                    StreamResult::WouldBlock => { libakuma::sleep_ms(1); }
+                                    StreamResult::WouldBlock => { 
+                                        if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+                                            crate::ui::tui::render::render_footer(current_tokens, token_limit, mem_kb);
+                                        }
+                                        libakuma::sleep_ms(1); 
+                                    }
                                     StreamResult::Done => {
                                         let remaining = pending_lines.trim();
                                         if !remaining.is_empty() {
@@ -293,10 +304,9 @@ fn read_streaming_with_http_stream_tls(
                                                         first_token_received = true;
                                                         let now = libakuma::uptime();
                                                         ttft_us = now - start_time;
-                                                        stream_start_us = now;
-                                                        tui_app::update_streaming_status("[MEOW] streaming", 0, Some(ttft_us / 1000));
-                                                        if !is_tui {
-                                                            libakuma::print(" ");
+                                                                                            stream_start_us = now;
+                                                                                            tui_app::update_streaming_status("[MEOW] streaming", 0, None);
+                                                                                            if !is_tui {                                                            libakuma::print(" ");
                                                             print_elapsed(ttft_us / 1000);
                                                             libakuma::print("\n");
                                                         } else {
@@ -357,6 +367,9 @@ fn read_streaming_response_with_progress(
 
     loop {
         tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
+        if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+            crate::ui::tui::render::render_footer(current_tokens, token_limit, mem_kb);
+        }
         if tui_app::tui_is_cancelled() { return Err("Request cancelled"); }
         match stream.read(&mut buf) {
             Ok(0) => {
@@ -579,5 +592,11 @@ fn print_elapsed(ms: u64) {
 
 fn poll_sleep(ms: u64, current_tokens: usize, token_limit: usize, mem_kb: usize) {
     let end = libakuma::uptime() + ms * 1000;
-    while libakuma::uptime() < end { tui_app::tui_handle_input(current_tokens, token_limit, mem_kb); libakuma::sleep_ms(10); }
+    while libakuma::uptime() < end { 
+        tui_app::tui_handle_input(current_tokens, token_limit, mem_kb); 
+        if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+            crate::ui::tui::render::render_footer(current_tokens, token_limit, mem_kb);
+        }
+        libakuma::sleep_ms(10); 
+    }
 }

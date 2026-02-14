@@ -30,23 +30,25 @@ fn connect(provider: &Provider) -> Result<TcpStream, ProviderError> {
 fn read_response(stream: &TcpStream) -> Result<String, ProviderError> {
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
-    let mut retries = 0;
+    let start_time = libakuma::uptime();
+    let timeout_us = 5_000_000; // 5 seconds timeout for metadata queries
 
     loop {
+        if libakuma::uptime() - start_time > timeout_us {
+            return Err(ProviderError::RequestFailed(String::from("Read timeout")));
+        }
+
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 response.extend_from_slice(&buf[..n]);
-                retries = 0;
                 if response.len() > 256 * 1024 { break; }
             }
             Err(e) => {
                 if e.kind == libakuma::net::ErrorKind::WouldBlock
                     || e.kind == libakuma::net::ErrorKind::TimedOut
                 {
-                    retries += 1;
-                    if retries > 100 { break; }
-                    libakuma::sleep_ms(1);
+                    libakuma::sleep_ms(10);
                     continue;
                 }
                 break;
