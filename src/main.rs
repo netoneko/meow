@@ -25,12 +25,7 @@ use libakuma::{arg, argc, exit, open, close, read_fd, fstat, open_flags};
 use app::Message;
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let code = main();
-    exit(code);
-}
-
-fn main() -> i32 {
+pub extern "C" fn main() {
     let mut app_config = Config::load();
     let mut model_override: Option<String> = None;
     let mut provider_override: Option<String> = None;
@@ -42,10 +37,10 @@ fn main() -> i32 {
     if argc() > 1 {
         if let Some(first_arg) = arg(1) {
             if first_arg == "init" {
-                return run_init(&mut app_config);
+                exit(run_init(&mut app_config));
             }
             if first_arg == "test_stream" {
-                return crate::ui::tui::stream::run_tests();
+                exit(crate::ui::tui::stream::run_tests());
             }
         }
     }
@@ -55,20 +50,20 @@ fn main() -> i32 {
             if arg_str == "-m" || arg_str == "--model" {
                 i += 1;
                 if let Some(m) = arg(i) { model_override = Some(String::from(m)); }
-                else { libakuma::print("meow: -m requires a model name\n"); return 1; }
+                else { libakuma::print("meow: -m requires a model name\n"); exit(1); }
             } else if arg_str == "-p" || arg_str == "--provider" {
                 i += 1;
                 if let Some(p) = arg(i) { provider_override = Some(String::from(p)); }
-                else { libakuma::print("meow: --provider requires a provider name\n"); return 1; }
+                else { libakuma::print("meow: --provider requires a provider name\n"); exit(1); }
             } else if arg_str == "-P" || arg_str == "--personality" {
                 i += 1;
                 if let Some(p) = arg(i) { personality_override = Some(String::from(p)); }
-                else { libakuma::print("meow: -P requires a personality name\n"); return 1; }
+                else { libakuma::print("meow: -P requires a personality name\n"); exit(1); }
             } else if arg_str == "--tui" {
                 use_tui = true;
             } else if arg_str == "-h" || arg_str == "--help" {
                 print_usage();
-                return 0;
+                exit(0);
             } else if !arg_str.starts_with('-') {
                 one_shot_message = Some(String::from(arg_str));
                 use_tui = false;
@@ -82,7 +77,7 @@ fn main() -> i32 {
             app_config.current_provider = prov_name.clone();
         } else {
             libakuma::print(&format!("meow: unknown provider '{}'. Run 'meow init' to configure.\n", prov_name));
-            return 1;
+            exit(1);
         }
     }
 
@@ -155,9 +150,9 @@ fn main() -> i32 {
 
         if let Err(e) = tui_app::run_tui(&mut current_model, &mut current_provider, &mut app_config, &mut history, context_window, &system_prompt) {
             libakuma::print(&format!("TUI Error: {}\n", e));
-            return 1;
+            exit(1);
         }
-        return 0;
+        exit(0);
     }
 
     if let Some(msg) = one_shot_message {
@@ -175,20 +170,20 @@ fn main() -> i32 {
         let ack_msg = if app_config.current_personality == "Jaffar" { "Understood." } else { "Understood nya~!" };
         history.push(Message::new("assistant", ack_msg));
         
-        return match app::chat_once(&model, &current_provider, &msg, &mut history, None, &system_prompt) {
-            Ok(_) => { libakuma::print("\n"); 0 }
+        match app::chat_once(&model, &current_provider, &msg, &mut history, None, &system_prompt) {
+            Ok(_) => { libakuma::print("\n"); exit(0); }
             Err(e) => {
                 let err_msg = if app_config.current_personality == "Jaffar" {
                     format!("Error: {}\n", e)
                 } else {
                     format!("～ Nyaa~! {} (=ＴェＴ=) ～\n", e)
                 };
-                libakuma::print(&err_msg); 1
+                libakuma::print(&err_msg); exit(1);
             }
         };
     }
 
-    0
+    exit(0);
 }
 
 fn load_local_prompt() -> Option<String> {
