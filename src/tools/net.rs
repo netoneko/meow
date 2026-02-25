@@ -15,7 +15,7 @@ pub fn tool_http_fetch(url: &str) -> ToolResult {
     };
 
     if parsed.is_https {
-        match libakuma_tls::https_fetch(url, true) {
+        match libakuma_tls::https_fetch(url, true, Some(MAX_FETCH_SIZE)) {
             Ok(body) => {
                 match core::str::from_utf8(&body) {
                     Ok(text) => {

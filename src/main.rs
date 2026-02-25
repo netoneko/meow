@@ -218,7 +218,7 @@ pub extern "C" fn main() {
             }
             Err(e) => {
                 let persona = get_active_personality(&app_config);
-                let err_msg = format!(persona.error_format, e);
+                let err_msg = persona.error_format.replace("{}", e);
                 libakuma::print(&err_msg);
                 exit(1);
             }
@@ -228,7 +228,7 @@ pub extern "C" fn main() {
     exit(0);
 }
 
-fn get_active_personality<'a>(config: &Config) -> &'a Personality {
+fn get_active_personality<'a>(config: &Config) -> &'a crate::config::Personality {
     PERSONALITIES
         .iter()
         .find(|p| p.name == config.current_personality)
