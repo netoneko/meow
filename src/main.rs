@@ -21,7 +21,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use app::Message;
-use config::{COMMON_TOOLS, Config, DEFAULT_CONTEXT_WINDOW, PERSONALITIES, Provider};
+use config::{COMMON_TOOLS, Config, DEFAULT_CONTEXT_WINDOW, PERSONALITIES, Provider, Personality};
 use libakuma::{arg, argc, close, exit, fstat, open, open_flags, read_fd};
 
 #[no_mangle]
@@ -134,9 +134,9 @@ pub extern "C" fn main() {
     system_prompt.push_str("\n\n");
     system_prompt.push_str(COMMON_TOOLS);
 
-    if tools::chainlink_available() {
-        system_prompt.push_str(tools::chainlink::CHAINLINK_TOOLS_SECTION);
-    }
+    // if tools::chainlink_available() {
+    //     system_prompt.push_str(tools::chainlink::CHAINLINK_TOOLS_SECTION);
+    // }
 
     if use_tui || one_shot_message.is_none() {
         let mut history: Vec<Message> = Vec::new();
@@ -218,7 +218,7 @@ pub extern "C" fn main() {
             }
             Err(e) => {
                 let persona = get_active_personality(&app_config);
-                let err_msg = format!(persona.error_format, e);
+                let err_msg = format!("Error: {}", e);
                 libakuma::print(&err_msg);
                 exit(1);
             }
@@ -228,7 +228,7 @@ pub extern "C" fn main() {
     exit(0);
 }
 
-fn get_active_personality<'a>(config: &Config) -> &'a Personality {
+fn get_active_personality<'a>(config: &'a Config) -> &'a Personality {
     PERSONALITIES
         .iter()
         .find(|p| p.name == config.current_personality)

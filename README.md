@@ -7,14 +7,17 @@ Meow is an LLM chat client that runs inside the Akuma kernel guest. It connects 
 ## Usage
 
 ```bash
-meow                          # Interactive mode with default model
-meow -m llama3.2              # Use specific model
-meow "What is 2+2?"           # One-shot mode
-meow -h                       # Show help
+meow                                    # Interactive mode with default model
+meow -m gemma3:27b                      # Use specific model
+meow -P Rosie                           # Use a different personality
+meow -p ollama -m llama3.2              # Override provider and model
+meow "What is 2+2?"                     # One-shot mode
+meow -h                                 # Show help
 ```
 
 ## Features
 
+- **Multiple Personalities**: Switch between Meow, Jaffar, Rosie and custom MEOW.md personalities
 - **Streaming responses**: Displays LLM output token-by-token as it arrives
 - **Tool calling**: LLM can execute filesystem and network operations
 - **Progress indication**: Shows dots while waiting, elapsed time on first token
@@ -27,9 +30,34 @@ meow -h                       # Show help
 |---------|-------------|
 | `/help` | Show available commands |
 | `/clear` | Clear chat history |
-| `/model <name>` | Switch LLM model |
-| `/exit` | Exit the chat |
+| `/model [NAME]` | Switch/check LLM model |
+| `/model list` | List available models |
+| `/provider [NAME]` | Switch/check provider |
+| `/provider list` | List configured providers |
+| `/personality [NAME]` | Switch/check personality |
+| `/personality list` | List available personalities |
+| `/tokens` | Show current token usage |
+| `/markdown` | Toggle markdown rendering |
+| `/exit` or `/quit` | Exit the chat |
 | Ctrl+D | Exit on empty line |
+
+## Personalities
+
+Meow supports multiple AI personas. Available personalities:
+
+- **Meow** (default) - Cyberpunk anime cat assistant
+- **Jaffar** - Technical, analytical guide
+- **Rosie** - Friendly, creative companion
+- **Local MEOW.md** - Custom personality loaded from current working directory (takes precedence)
+
+**Switch personality:**
+```bash
+meow -P Jaffar                    # Use Jaffar personality
+/personality Rosie                # Switch in interactive mode
+```
+
+**Custom personality:**
+Create a `MEOW.md` file in your working directory with a custom system prompt. It will automatically load and take precedence over built-in personalities.
 
 ## Available Tools
 

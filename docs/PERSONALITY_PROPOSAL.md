@@ -19,40 +19,53 @@ To keep the codebase dry, the system prompt will be constructed at runtime by jo
 3. **Context**: Dynamic information like the current working directory and sandbox status.
 
 ### B. Personality Registry
-A new module (or addition to `config.rs`) will define the `Personality` struct and a static registry:
+The existing `config.rs` now defines a comprehensive `Personality` struct and a static registry containing all built‑in personas. Each entry also carries acknowledgement strings for the TUI/one‑shot modes and an error format string used when reporting failures.
 
 ```rust
 pub struct Personality {
     pub name: &'static str,
     pub description: &'static str,
+
+    pub ack_tui: &'static str,
+    pub ack_one_shot: &'static str,
+    pub error_format: &'static str, // use "{}" placeholder
 }
 
 pub const PERSONALITIES: &[Personality] = &[
     Personality {
         name: "Meow",
         description: MEOW_PERSONA,
+        ack_tui: "Understood nya~! I'll use relative paths for file operations within the current directory. Ready to help! (=^・ω・^=)",
+        ack_one_shot: "Understood nya~!",
+        error_format: "～ Nyaa~! {} (=ＴェＴ=) ～\n",
     },
     Personality {
         name: "Jaffar",
-        description: JAFAR_PERSONA,
+        description: JAFFAR_PERSONA,
+        ack_tui: "Understood. I shall utilize relative paths for my machinations within this directory. The throne awaits!",
+        ack_one_shot: "Understood.",
+        error_format: "Error: {}\n",
     },
+    // additional personas such as Rosie are also defined
 ];
 ```
 
 ### C. Configuration Updates
-The `Config` struct will be updated to include the current personality name:
+The `Config` struct already includes a `current_personality` field and the parsing/serialization routines handle it. The default is "Meow" when the config file is absent. The `run_init` helper prints the current personality along with provider/model information.
 
 ```rust
 pub struct Config {
-    pub current_personality: String, // Defaults to "Meow"
+    pub current_provider: String,
+    pub current_model: String,
+    pub current_personality: String,
     // ... other fields
 }
 ```
 
 ### D. CWD Loading (`MEOW.md`)
-At startup, `meow` will check for the existence of `MEOW.md` in the current working directory.
-- If it exists, its content will be loaded as a special "Local" personality.
-- This "Local" personality will take precedence if no other personality is explicitly requested.
+The `main.rs` binary now contains a `load_local_prompt()` helper that attempts to open `MEOW.md` in the current directory. If the file exists and is a reasonable size (<64 KB) its contents are returned and prepended to the system prompt. This local prompt overrides whatever personality is configured or provided via CLI.
+
+The helper is also used when assembling the system prompt for both TUI and one‑shot invocations.
 
 ## 4. Default Personalities
 
@@ -63,26 +76,29 @@ The classic cybernetically-enhanced catgirl persona with cyberpunk slang and cat
 A cunning and ambitious Grand Vizier persona, accompanied by the sarcastic sidekick Yager. 
 *Note: Akuma-specific kernel context will be removed for the general version.*
 
-## 5. Implementation Plan
+### 5. Implementation Summary
+All of the planned changes have been implemented and are shipping in the current codebase:
 
-1. **Refactor Constants**:
-    - Extract character descriptions from `SYSTEM_PROMPT_BASE` in `userspace/meow/src/config.rs`.
-    - Extract tool descriptions into a `COMMON_TOOLS` constant.
-2. **Implement Registry**:
-    - Add `Personality` struct and `PERSONALITIES` array to `config.rs`.
-    - Port the Jaffar persona from `tools/meow-local/src/main.rs`.
-3. **Update Config Logic**:
-    - Add `current_personality` to `Config` struct.
-    - Update `Config::parse` and `Config::serialize` to handle the new field.
-4. **CLI Enhancements**:
-    - Add support for `-P` / `--personality <name>` in `main.rs`.
-5. **CWD Loading**:
-    - Add logic in `main.rs` to detect and read `MEOW.md`.
-6. **Prompt Assembly**:
-    - Implement a helper to assemble the full system prompt at runtime.
-7. **TUI Update (Optional)**:
-    - Add a `/personality` command to list or switch personalities at runtime.
+1. **Constants refactored**
+    - Character descriptions live in `config.rs` as the various `*_PERSONA` constants.
+    - `COMMON_TOOLS` holds the shared tool documentation appended to every system prompt.
+2. **Registry complete**
+    - `Personality` struct is defined with additional metadata (acknowledgements and error format).
+    - Built‑in personalities include `Meow`, `Jaffar`, and `Rosie` (with room for more).
+3. **Config logic updated**
+    - `Config::parse`/`serialize` now read and write `current_personality`.
+    - Defaults to `Meow` and `run_init` prints the current personality.
+4. **CLI enhancements**
+    - `main.rs` processes `-P`/`--personality` to override the configuration.
+5. **CWD loading**
+    - `load_local_prompt()` reads `MEOW.md` and the result takes precedence when assembling the prompt.
+6. **Prompt assembly**
+    - `main.rs` builds the final `system_prompt` by selecting the active personality or local prompt, then appending `COMMON_TOOLS` and any Chainlink tools.
+    - Helper `get_active_personality()` returns the personality struct for use in TUI acknowledgement and error formatting.
+7. **Runtime support**
+    - The TUI already has `/personality` command to query or change the persona (unchanged by this proposal but tied into the new config field).
 
+With these changes in place the assistant behaves according to the original goals.
 ## 6. Verification
 - Run `meow -P Jaffar` and verify the persona change.
 - Create a `MEOW.md` with a custom prompt and verify it loads automatically.
