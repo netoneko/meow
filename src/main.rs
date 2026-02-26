@@ -134,10 +134,6 @@ pub extern "C" fn main() {
     system_prompt.push_str("\n\n");
     system_prompt.push_str(COMMON_TOOLS);
 
-    // if tools::chainlink_available() {
-    //     system_prompt.push_str(tools::chainlink::CHAINLINK_TOOLS_SECTION);
-    // }
-
     if use_tui || one_shot_message.is_none() {
         let mut history: Vec<Message> = Vec::new();
         history.push(Message::new("system", &system_prompt));
