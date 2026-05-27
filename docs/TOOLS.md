@@ -88,7 +88,7 @@ To support multiple commands per response:
 |------|-------------|------|
 | `HttpFetch` | HTTP/HTTPS GET request | `url` |
 
-### Git (via scratch)
+### Git
 
 | Tool | Description | Args |
 |------|-------------|------|

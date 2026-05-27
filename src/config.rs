@@ -237,7 +237,7 @@ You have access to filesystem tools! When you need to perform file operations, o
 12. **Pwd** - Print current working directory
     Args: `{}`
 
-### Git Tools (via scratch):
+### Git Tools:
 
 Note: Git tools operate in the current working directory (set via Cd).
 After cloning, use Cd to enter the repository before running other git commands.

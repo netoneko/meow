@@ -2,15 +2,14 @@
 
 ## Set up the repo
 
-`scratch` is a homebrew implementation of a subset of git features
-
 ```bash
 pkg install meow
-scratch clone https://github.com/netoneko/meow.git
+apk add git
+git clone https://github.com/netoneko/meow.git
 
 # switch to a new branch
 cd /meow
-scratch branch experimental
+git checkout -b experimental
 ```
 
 ## Running a single non-interactive promt test

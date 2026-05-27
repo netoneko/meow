@@ -9,7 +9,7 @@ This session focused on transforming the `meow` codebase from a few monolithic f
     - `fs.rs`: File system operations (read, write, append, list, etc.).
     - `net.rs`: HTTP/HTTPS fetch tools using `libakuma-tls`.
     - `shell.rs`: Process spawning and shell command execution.
-    - `git.rs`: Wrappers for Git operations via the `scratch` binary.
+    - `git.rs`: Wrappers for Git operations via `git`.
     - `chainlink.rs`: Integration with the Chainlink issue tracker.
     - `context.rs`: Atomic-backed management of the working directory and sandbox.
     - `helpers.rs`: Shared JSON parsing and string manipulation utilities.
