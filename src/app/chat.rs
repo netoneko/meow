@@ -4,7 +4,7 @@ use alloc::format;
 use core::sync::atomic::Ordering;
 
 use crate::config::{Provider, DEFAULT_CONTEXT_WINDOW, COLOR_PEARL, COLOR_GREEN_LIGHT, COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, TOKEN_LIMIT_FOR_COMPACTION};
-use crate::api::{self, StreamResponse};
+use crate::api::{self, StreamResponse, ToolCallData};
 use crate::tools;
 use crate::tui_app;
 use super::history::{Message, trim_history, compact_history, calculate_history_tokens};
@@ -18,6 +18,7 @@ pub fn chat_once(
     history: &mut Vec<Message>,
     context_window: Option<usize>,
     system_prompt: &str,
+    fake_tool_check: bool,
 ) -> Result<(), &'static str> {
     trim_history(history);
     history.push(Message::new("user", user_message));
@@ -50,8 +51,7 @@ pub fn chat_once(
             }
         };
         
-        let (assistant_response, mut stats) = match stream_result {
-            StreamResponse::Complete(response, stats) => (response, stats),
+        match stream_result {
             StreamResponse::Partial(partial, stats) => {
                 print_stats(&stats, &partial);
                 if !partial.is_empty() {
@@ -60,135 +60,233 @@ pub fn chat_once(
                 }
                 continue;
             }
-        };
 
-        let is_fake = assistant_response.contains("[Tool Result]");
-        if is_fake {
-            stats.fakes = 1;
-            total_fakes_detected += 1;
-        }
+            StreamResponse::CompleteWithTools(content, tool_calls, stats) => {
+                print_stats(&stats, &content);
 
-        print_stats(&stats, &assistant_response);
+                // Store assistant message with tool_calls for the history
+                let tc_json = serialize_tool_calls(&tool_calls);
+                let mut asst_msg = Message::new("assistant", &content);
+                asst_msg.tool_calls_json = Some(tc_json);
+                history.push(asst_msg);
 
-        if is_fake {
-            let intent_phrases = extract_intent_phrases(&assistant_response);
-            let mut self_check_msg = String::from("[System Notice] You outputted a fake '[Tool Result]'. You must NOT hallucinate tool results. \nIf you want to perform an action, you MUST use the precise tool for it.\n");
-            if !intent_phrases.is_empty() {
-                self_check_msg.push_str("\nBased on your stated intent: ");
-                for (i, intent) in intent_phrases.iter().enumerate() {
-                    if i > 0 { self_check_msg.push_str(", "); }
-                    self_check_msg.push_str(&format!("\"{}\"", intent));
-                }
-                self_check_msg.push_str("\nPlease call the appropriate tool.\n");
-            }
-            self_check_msg.push_str("\nAvailable tools:\n(Refer to the tool list provided in your system prompt)");
-            history.push(Message::new("user", &self_check_msg));
-            print_notification(COLOR_PEARL, "Fake Tool Result detected", 0);
-            print_msg(COLOR_RESET, "\n");
-            continue;
-        }
+                for tc in &tool_calls {
+                    total_tools_called += 1;
 
-        all_responses.push_str(&assistant_response);
-        all_responses.push('\n');
+                    if tc.name == "CompactContext" {
+                        let summary = extract_json_string(&tc.arguments, "summary").unwrap_or_default();
+                        if summary.is_empty() {
+                            let mut result_msg = Message::new("tool", "CompactContext requires a non-empty summary");
+                            result_msg.tool_call_id = Some(tc.id.clone());
+                            history.push(result_msg);
+                        } else {
+                            let tokens_before = calculate_history_tokens(history);
+                            history.clear();
+                            history.push(Message::new("system", system_prompt));
+                            let compact_msg = format!("[Previous Conversation Summary]\n{}\n[End Summary]\n\nThe conversation has been compacted. Continue from here.", summary);
+                            history.push(Message::new("user", &compact_msg));
+                            history.push(Message::new("assistant", "Context loaded. Ready to continue."));
+                            let tokens_after = calculate_history_tokens(history);
+                            print_msg(COLOR_GREEN_LIGHT, &format!("\n[*] Context compacted: {} -> {} tokens\n", tokens_before, tokens_after));
+                            return Ok(());
+                        }
+                        continue;
+                    }
 
-        if let Some(compact_result) = try_execute_compact_context(&assistant_response, history, system_prompt) {
-            if compact_result.success {
-                print_msg(COLOR_GREEN_LIGHT, "\n[*] Context compacted successfully nya~!\n");
-            } else {
-                print_msg(COLOR_PEARL, "\n[*] Failed to compact context nya...\n");
-            }
-            print_msg(COLOR_GRAY_BRIGHT, &compact_result.output);
-            print_msg(COLOR_RESET, "\n\n");
-            return Ok(());
-        }
+                    let tool_start = libakuma::uptime();
+                    let tool_result = tools::execute_tool_by_name(&tc.name, &tc.arguments)
+                        .unwrap_or_else(|| tools::ToolResult::err("Unknown or unsupported tool"));
+                    let tool_duration_us = libakuma::uptime() - tool_start;
 
-        let (mut current_llm_response_text, tool_calls) = tools::find_tool_calls(&assistant_response);
+                    let (color, status) = if tool_result.success { (COLOR_GREEN_LIGHT, "Success") } else { (COLOR_PEARL, "Failed") };
+                    let status_content = format!("Tool Status: {}", status);
 
-        if !tool_calls.is_empty() {
-            for tool_call in tool_calls {
-                total_tools_called += 1;
-                if !current_llm_response_text.is_empty() {
-                    history.push(Message::new("assistant", &current_llm_response_text));
-                    current_llm_response_text.clear();
-                }
+                    if tool_result.success {
+                        print_msg(COLOR_RESET, "\n");
+                        print_msg(COLOR_GRAY_BRIGHT, &tool_result.output);
+                        print_msg(COLOR_RESET, "\n\n");
+                        print_notification(color, &status_content, tool_duration_us);
+                        print_msg(COLOR_RESET, "\n");
+                    } else {
+                        print_notification(color, &status_content, tool_duration_us);
+                        print_msg(COLOR_RESET, "\n");
+                        print_msg(COLOR_GRAY_BRIGHT, &tool_result.output);
+                        print_msg(COLOR_RESET, "\n\n");
+                    }
 
-                let tool_start = libakuma::uptime();
-                let tool_result = if let Some(result) = tools::execute_tool_command(&tool_call.json) {
-                    result
-                } else {
-                    tools::ToolResult::err("Failed to parse or execute tool command")
-                };
-                let tool_duration_us = libakuma::uptime() - tool_start;
-                
-                let (color, status) = if tool_result.success { (COLOR_GREEN_LIGHT, "Success") } else { (COLOR_PEARL, "Failed") };
-                let status_content = format!("Tool Status: {}", status);
-
-                if tool_result.success {
-                    print_msg(COLOR_RESET, "\n");
-                    print_msg(COLOR_GRAY_BRIGHT, &tool_result.output);
-                    print_msg(COLOR_RESET, "\n\n");
-                    print_notification(color, &status_content, tool_duration_us);
-                    print_msg(COLOR_RESET, "\n");
-                } else {
-                    print_notification(color, &status_content, tool_duration_us);
-                    print_msg(COLOR_RESET, "\n");
-                    print_msg(COLOR_GRAY_BRIGHT, &tool_result.output);
-                    print_msg(COLOR_RESET, "\n\n");
+                    let current_cwd = tools::get_working_dir();
+                    let result_content = if tool_result.success {
+                        format!("{}\n[Current Directory: {}]", tool_result.output, current_cwd)
+                    } else {
+                        format!("Tool failed: {}\n[Current Directory: {}]\n\nPlease analyze the failure and try again.", tool_result.output, current_cwd)
+                    };
+                    let mut result_msg = Message::new("tool", &result_content);
+                    result_msg.tool_call_id = Some(tc.id.clone());
+                    history.push(result_msg);
                 }
 
-                let current_cwd = tools::get_working_dir();
-                let tool_result_msg = if tool_result.success {
-                    format!("[Tool Result]\n{}\n[End Tool Result]\n[Current Directory: {}]\n\nPlease continue your response based on this result.", tool_result.output, current_cwd)
-                } else {
-                    format!("[Tool Result]\nTool failed: {}\n[End Tool Result]\n[Current Directory: {}]\n\nPlease analyze the failure and try again with a corrected command or different approach.", tool_result.output, current_cwd)
-                };
-                history.push(Message::new("user", &tool_result_msg));
                 trim_history(history);
                 compact_history(history);
+                continue;
             }
-            continue;
-        }
 
-        if !current_llm_response_text.is_empty() {
-            history.push(Message::new("assistant", &current_llm_response_text));
-            if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) && tool_calls.is_empty() {
-                // We've already printed it raw during streaming. 
-                // For now, let's just leave it. If the user wants a full re-render, 
-                // we'd need a way to clear the previous output.
-            }
-        }
-        
-        trim_history(history);
-        compact_history(history);
+            StreamResponse::Complete(assistant_response, mut stats) => {
+                let is_fake = fake_tool_check && assistant_response.contains("[Tool Result]");
+                if is_fake {
+                    stats.fakes = 1;
+                    total_fakes_detected += 1;
+                }
 
-        let intent_phrases = extract_intent_phrases(&all_responses);
-        let mismatch = !intent_phrases.is_empty() && total_tools_called == 0;
-        let has_fakes = total_fakes_detected > 0;
-        let intent_content = format!("Intent phrases: {} | Tools called: {} | Fakes: {}", intent_phrases.len(), total_tools_called, total_fakes_detected);
-        
-        if mismatch || has_fakes { print_notification(COLOR_PEARL, &intent_content, 0); }
-        else { print_notification(COLOR_GREEN_LIGHT, &intent_content, 0); }
+                print_stats(&stats, &assistant_response);
 
-        if mismatch {
-            print_notification(COLOR_PEARL, "Self check", 0);
-            print_msg(COLOR_RESET, "\n\n");
-            let mut intents_list = String::new();
-            for (i, intent) in intent_phrases.iter().enumerate() { intents_list.push_str(&format!("  {}. \"{}\"\n", i + 1, intent)); }
-            let self_check_msg = format!("[System Notice] You stated the following intention(s) but made 0 tool calls:\n{}\nDid you forget to output the tool call JSON? Please complete the actions you stated.", intents_list);
-            history.push(Message::new("user", &self_check_msg));
-            continue;
-        }
+                if is_fake {
+                    let intent_phrases = extract_intent_phrases(&assistant_response);
+                    let mut self_check_msg = String::from("[System Notice] You outputted a fake '[Tool Result]'. You must NOT hallucinate tool results. \nIf you want to perform an action, you MUST use the precise tool for it.\n");
+                    if !intent_phrases.is_empty() {
+                        self_check_msg.push_str("\nBased on your stated intent: ");
+                        for (i, intent) in intent_phrases.iter().enumerate() {
+                            if i > 0 { self_check_msg.push_str(", "); }
+                            self_check_msg.push_str(&format!("\"{}\"", intent));
+                        }
+                        self_check_msg.push_str("\nPlease call the appropriate tool.\n");
+                    }
+                    self_check_msg.push_str("\nAvailable tools:\n(Refer to the tool list provided in your system prompt)");
+                    history.push(Message::new("user", &self_check_msg));
+                    print_notification(COLOR_PEARL, "Fake Tool Result detected", 0);
+                    print_msg(COLOR_RESET, "\n");
+                    continue;
+                }
 
-        if let Some(ctx_window) = context_window {
-            let current_tokens = calculate_history_tokens(history);
-            if current_tokens > TOKEN_LIMIT_FOR_COMPACTION && current_tokens < ctx_window {
-                print_msg(COLOR_RESET, "\n[!] Token count is high - consider asking Meow-chan to compact context\n");
-            }
-        }
-        return Ok(());
-    }
+                all_responses.push_str(&assistant_response);
+                all_responses.push('\n');
+
+                if let Some(compact_result) = try_execute_compact_context(&assistant_response, history, system_prompt) {
+                    if compact_result.success {
+                        print_msg(COLOR_GREEN_LIGHT, "\n[*] Context compacted successfully nya~!\n");
+                    } else {
+                        print_msg(COLOR_PEARL, "\n[*] Failed to compact context nya...\n");
+                    }
+                    print_msg(COLOR_GRAY_BRIGHT, &compact_result.output);
+                    print_msg(COLOR_RESET, "\n\n");
+                    return Ok(());
+                }
+
+                let (mut current_llm_response_text, tool_calls) = tools::find_tool_calls(&assistant_response);
+
+                if !tool_calls.is_empty() {
+                    for tool_call in tool_calls {
+                        total_tools_called += 1;
+                        if !current_llm_response_text.is_empty() {
+                            history.push(Message::new("assistant", &current_llm_response_text));
+                            current_llm_response_text.clear();
+                        }
+
+                        let tool_start = libakuma::uptime();
+                        let tool_result = if let Some(result) = tools::execute_tool_command(&tool_call.json) {
+                            result
+                        } else {
+                            tools::ToolResult::err("Failed to parse or execute tool command")
+                        };
+                        let tool_duration_us = libakuma::uptime() - tool_start;
+
+                        let (color, status) = if tool_result.success { (COLOR_GREEN_LIGHT, "Success") } else { (COLOR_PEARL, "Failed") };
+                        let status_content = format!("Tool Status: {}", status);
+
+                        if tool_result.success {
+                            print_msg(COLOR_RESET, "\n");
+                            print_msg(COLOR_GRAY_BRIGHT, &tool_result.output);
+                            print_msg(COLOR_RESET, "\n\n");
+                            print_notification(color, &status_content, tool_duration_us);
+                            print_msg(COLOR_RESET, "\n");
+                        } else {
+                            print_notification(color, &status_content, tool_duration_us);
+                            print_msg(COLOR_RESET, "\n");
+                            print_msg(COLOR_GRAY_BRIGHT, &tool_result.output);
+                            print_msg(COLOR_RESET, "\n\n");
+                        }
+
+                        let current_cwd = tools::get_working_dir();
+                        let tool_result_msg = if tool_result.success {
+                            format!("[Tool Result]\n{}\n[End Tool Result]\n[Current Directory: {}]\n\nPlease continue your response based on this result.", tool_result.output, current_cwd)
+                        } else {
+                            format!("[Tool Result]\nTool failed: {}\n[End Tool Result]\n[Current Directory: {}]\n\nPlease analyze the failure and try again with a corrected command or different approach.", tool_result.output, current_cwd)
+                        };
+                        history.push(Message::new("user", &tool_result_msg));
+                        trim_history(history);
+                        compact_history(history);
+                    }
+                    continue;
+                }
+
+                if !current_llm_response_text.is_empty() {
+                    history.push(Message::new("assistant", &current_llm_response_text));
+                }
+
+                trim_history(history);
+                compact_history(history);
+
+                let intent_phrases = extract_intent_phrases(&all_responses);
+                let mismatch = !intent_phrases.is_empty() && total_tools_called == 0;
+                let has_fakes = total_fakes_detected > 0;
+                let intent_content = format!("Intent phrases: {} | Tools called: {} | Fakes: {}", intent_phrases.len(), total_tools_called, total_fakes_detected);
+
+                if mismatch || has_fakes { print_notification(COLOR_PEARL, &intent_content, 0); }
+                else { print_notification(COLOR_GREEN_LIGHT, &intent_content, 0); }
+
+                if mismatch {
+                    print_notification(COLOR_PEARL, "Self check", 0);
+                    print_msg(COLOR_RESET, "\n\n");
+                    let mut intents_list = String::new();
+                    for (i, intent) in intent_phrases.iter().enumerate() { intents_list.push_str(&format!("  {}. \"{}\"\n", i + 1, intent)); }
+                    let self_check_msg = format!("[System Notice] You stated the following intention(s) but made 0 tool calls:\n{}\nDid you forget to output the tool call JSON? Please complete the actions you stated.", intents_list);
+                    history.push(Message::new("user", &self_check_msg));
+                    continue;
+                }
+
+                if let Some(ctx_window) = context_window {
+                    let current_tokens = calculate_history_tokens(history);
+                    if current_tokens > TOKEN_LIMIT_FOR_COMPACTION && current_tokens < ctx_window {
+                        print_msg(COLOR_RESET, "\n[!] Token count is high - consider asking Meow-chan to compact context\n");
+                    }
+                }
+                return Ok(());
+            } // end StreamResponse::Complete
+        } // end match stream_result
+    } // end for iteration
     print_msg(COLOR_RESET, "\n[!] Max tool iterations reached\n");
     Ok(())
+}
+
+fn serialize_tool_calls(tool_calls: &[ToolCallData]) -> String {
+    let mut s = String::from("[");
+    for (i, tc) in tool_calls.iter().enumerate() {
+        if i > 0 { s.push(','); }
+        s.push_str("{\"id\":\"");
+        s.push_str(&tc.id);
+        s.push_str("\",\"type\":\"function\",\"function\":{\"name\":\"");
+        s.push_str(&tc.name);
+        s.push_str("\",\"arguments\":\"");
+        json_escape_to(&tc.arguments, &mut s);
+        s.push_str("\"}}");
+    }
+    s.push(']');
+    s
+}
+
+fn json_escape_to(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            _ => out.push(c),
+        }
+    }
 }
 
 fn print_msg(color: &str, s: &str) {

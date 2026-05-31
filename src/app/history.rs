@@ -6,6 +6,10 @@ use alloc::format;
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// JSON array string of tool calls, set on assistant messages that invoke tools
+    pub tool_calls_json: Option<String>,
+    /// Tool call ID, set on role:"tool" result messages
+    pub tool_call_id: Option<String>,
 }
 
 impl Message {
@@ -13,15 +17,32 @@ impl Message {
         Self {
             role: String::from(role),
             content: String::from(content),
+            tool_calls_json: None,
+            tool_call_id: None,
         }
     }
 
     pub fn write_json(&self, out: &mut String) {
         out.push_str("{\"role\":\"");
         out.push_str(&self.role);
-        out.push_str("\",\"content\":\"");
-        json_escape_to(&self.content, out);
-        out.push_str("\"}");
+        out.push('"');
+
+        if let Some(ref tc_json) = self.tool_calls_json {
+            out.push_str(",\"content\":null,\"tool_calls\":");
+            out.push_str(tc_json);
+        } else {
+            out.push_str(",\"content\":\"");
+            json_escape_to(&self.content, out);
+            out.push('"');
+        }
+
+        if let Some(ref tc_id) = self.tool_call_id {
+            out.push_str(",\"tool_call_id\":\"");
+            out.push_str(tc_id);
+            out.push('"');
+        }
+
+        out.push('}');
     }
 }
 
@@ -49,7 +70,10 @@ pub fn estimate_tokens(text: &str) -> usize {
 pub fn calculate_history_tokens(history: &[Message]) -> usize {
     history
         .iter()
-        .map(|msg| estimate_tokens(&msg.content) + estimate_tokens(&msg.role) + 4)
+        .map(|msg| {
+            let tc_tokens = msg.tool_calls_json.as_deref().map(estimate_tokens).unwrap_or(0);
+            estimate_tokens(&msg.content) + estimate_tokens(&msg.role) + tc_tokens + 4
+        })
         .sum()
 }
 

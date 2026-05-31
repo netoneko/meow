@@ -9,9 +9,10 @@ use crate::util::StackBuffer;
 use core::fmt::Write;
 use crate::ui::tui::layout::Stdout;
 
-use crate::config::{Provider, ApiType};
+use crate::config::{Provider, ApiType, OPENAI_TOOLS_JSON, OPENAI_CHAINLINK_TOOLS_JSON};
 use crate::tui_app;
-use super::types::{StreamResponse, StreamStats};
+use crate::tools::chainlink_available;
+use super::types::{StreamResponse, StreamStats, ToolCallData};
 
 const MAX_RETRIES: u32 = 10;
 const DEFAULT_MAX_TOKENS: usize = 16384;
@@ -201,6 +202,16 @@ fn send_post_request(stream: &TcpStream, path: &str, body: &str, provider: &Prov
     stream.write_all(request.as_bytes()).map_err(|_| "Failed to send request")
 }
 
+fn build_openai_tools_json(include_chainlink: bool) -> String {
+    if include_chainlink {
+        let core = &OPENAI_TOOLS_JSON[..OPENAI_TOOLS_JSON.len() - 1]; // strip trailing ]
+        let chainlink = &OPENAI_CHAINLINK_TOOLS_JSON[1..];              // strip leading [
+        format!("{},{}", core, chainlink)
+    } else {
+        String::from(OPENAI_TOOLS_JSON)
+    }
+}
+
 fn build_chat_request(model: &str, provider: &Provider, history_json: &str) -> (String, String) {
     match provider.api_type {
         ApiType::Ollama => {
@@ -211,9 +222,10 @@ fn build_chat_request(model: &str, provider: &Provider, history_json: &str) -> (
             (String::from("/api/chat"), body)
         }
         ApiType::OpenAI => {
+            let tools_json = build_openai_tools_json(chainlink_available());
             let body = format!(
-                "{{\"model\":\"{}\",\"messages\":{},\"stream\":true,\"max_tokens\":{}}}",
-                model, history_json, DEFAULT_MAX_TOKENS
+                "{{\"model\":\"{}\",\"messages\":{},\"stream\":true,\"max_tokens\":{},\"tools\":{},\"tool_choice\":\"auto\"}}",
+                model, history_json, DEFAULT_MAX_TOKENS, tools_json
             );
             let base = provider.base_path();
             let path = if base.is_empty() || base == "/" {
@@ -243,6 +255,7 @@ fn read_streaming_with_http_stream_tls(
     let mut stream_completed = false;
     let mut ttft_us = 0;
     let mut stream_start_us = 0;
+    let mut pending_tool_calls: Vec<ToolCallData> = Vec::new();
 
     loop {
         tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
@@ -256,6 +269,9 @@ fn read_streaming_with_http_stream_tls(
                 while let Some(newline_pos) = pending_lines.find('\n') {
                     let line = &pending_lines[..newline_pos];
                     if !line.is_empty() {
+                        if matches!(provider.api_type, ApiType::OpenAI) {
+                            accumulate_tool_call_delta(line, &mut pending_tool_calls);
+                        }
                         if let Some((content, done)) = parse_streaming_line(line, provider) {
                             if !content.is_empty() {
                                 if !first_token_received {
@@ -282,60 +298,74 @@ fn read_streaming_with_http_stream_tls(
                             if done {
                                 if is_tui { tui_app::finish_streaming(); }
                                 tui_app::clear_streaming_status();
-                                return Ok(StreamResponse::Complete(full_response.clone(), StreamStats { ttft_us, stream_us: libakuma::uptime() - stream_start_us, total_bytes: 0, fakes: 0 }));
+                                let stats = StreamStats { ttft_us, stream_us: libakuma::uptime() - stream_start_us, total_bytes: full_response.len(), fakes: 0 };
+                                if !pending_tool_calls.is_empty() {
+                                    return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
+                                }
+                                return Ok(StreamResponse::Complete(full_response, stats));
                             }
                         }
                     }
                     pending_lines.drain(..newline_pos + 1);
                 }
             }
-                                    StreamResult::WouldBlock => { 
-                                        if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
-                                            crate::ui::tui::render::render_footer(current_tokens, token_limit, mem_kb);
-                                        }
-                                        libakuma::sleep_ms(1); 
-                                    }
-                                    StreamResult::Done => {
-                                        let remaining = pending_lines.trim();
-                                        if !remaining.is_empty() {
-                                            if let Some((content, done)) = parse_streaming_line(remaining, provider) {
-                                                if !content.is_empty() {
-                                                    if !first_token_received {
-                                                        first_token_received = true;
-                                                        let now = libakuma::uptime();
-                                                        ttft_us = now - start_time;
-                                                                                            stream_start_us = now;
-                                                                                            tui_app::update_streaming_status("[MEOW] streaming", 0, None);
-                                                                                            if !is_tui {                                                            libakuma::print(" ");
-                                                            print_elapsed(ttft_us / 1000);
-                                                            libakuma::print("\n");
-                                                        } else {
-                                                            tui_app::start_streaming(9);
-                                                        }
-                                                    }
-                                                    if is_tui {
-                                                        tui_app::process_streaming_chunk(&content);
-                                                    } else {
-                                                        tui_app::tui_print(&content);
-                                                    }
-                                                    full_response.push_str(&content);
-                                                }
-                                                if done {
-                                                    if is_tui { tui_app::finish_streaming(); }
-                                                    stream_completed = true;
-                                                    tui_app::clear_streaming_status();
-                                                }
-                                            }
-                                        }
-                                        break;
-                                    }
-                                    StreamResult::Error(_) => { 
-                                        if is_tui { tui_app::finish_streaming(); }
-                                        return Err("Server returned error"); 
-                                    }
+            StreamResult::WouldBlock => {
+                if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+                    crate::ui::tui::render::render_footer(current_tokens, token_limit, mem_kb);
+                }
+                libakuma::sleep_ms(1);
+            }
+            StreamResult::Done => {
+                let remaining = String::from(pending_lines.trim());
+                if !remaining.is_empty() {
+                    if matches!(provider.api_type, ApiType::OpenAI) {
+                        accumulate_tool_call_delta(&remaining, &mut pending_tool_calls);
+                    }
+                    if let Some((content, done)) = parse_streaming_line(&remaining, provider) {
+                        if !content.is_empty() {
+                            if !first_token_received {
+                                first_token_received = true;
+                                let now = libakuma::uptime();
+                                ttft_us = now - start_time;
+                                stream_start_us = now;
+                                tui_app::update_streaming_status("[MEOW] streaming", 0, None);
+                                if !is_tui {
+                                    libakuma::print(" ");
+                                    print_elapsed(ttft_us / 1000);
+                                    libakuma::print("\n");
+                                } else {
+                                    tui_app::start_streaming(9);
                                 }
                             }
-                            let stats = StreamStats { ttft_us, stream_us: if first_token_received { libakuma::uptime() - stream_start_us } else { 0 }, total_bytes: full_response.len(), fakes: 0 };
+                            if is_tui {
+                                tui_app::process_streaming_chunk(&content);
+                            } else {
+                                tui_app::tui_print(&content);
+                            }
+                            full_response.push_str(&content);
+                        }
+                        if done {
+                            if is_tui { tui_app::finish_streaming(); }
+                            stream_completed = true;
+                            tui_app::clear_streaming_status();
+                        }
+                    }
+                }
+                break;
+            }
+            StreamResult::Error(_) => {
+                if is_tui { tui_app::finish_streaming(); }
+                return Err("Server returned error");
+            }
+        }
+    }
+    let stats = StreamStats { ttft_us, stream_us: if first_token_received { libakuma::uptime() - stream_start_us } else { 0 }, total_bytes: full_response.len(), fakes: 0 };
+    if !pending_tool_calls.is_empty() {
+        if is_tui { tui_app::finish_streaming(); }
+        tui_app::clear_streaming_status();
+        full_response.shrink_to_fit();
+        return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
+    }
     if !stream_completed && !full_response.is_empty() {
         full_response.shrink_to_fit();
         return Ok(StreamResponse::Partial(full_response, stats));
@@ -364,6 +394,7 @@ fn read_streaming_response_with_progress(
     let mut stream_completed = false;
     let mut ttft_us = 0;
     let mut stream_start_us = 0;
+    let mut pending_tool_calls: Vec<ToolCallData> = Vec::new();
 
     loop {
         tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
@@ -376,6 +407,9 @@ fn read_streaming_response_with_progress(
                 if !any_data_received { return Err("Connection closed by server"); }
                 if let Ok(remaining_str) = core::str::from_utf8(&pending_data) {
                     for line in remaining_str.trim().lines() {
+                        if matches!(provider.api_type, ApiType::OpenAI) {
+                            accumulate_tool_call_delta(line, &mut pending_tool_calls);
+                        }
                         if let Some((content, done)) = parse_streaming_line(line, provider) {
                             if !content.is_empty() {
                                 if !first_token_received {
@@ -399,10 +433,10 @@ fn read_streaming_response_with_progress(
                                 }
                                 full_response.push_str(&content);
                             }
-                            if done { 
+                            if done {
                                 if is_tui { tui_app::finish_streaming(); }
-                                stream_completed = true; 
-                                tui_app::clear_streaming_status(); 
+                                stream_completed = true;
+                                tui_app::clear_streaming_status();
                             }
                         }
                     }
@@ -428,6 +462,9 @@ fn read_streaming_response_with_progress(
                     let mut is_done = false;
                     for line in complete_part.lines() {
                         if line.is_empty() { continue; }
+                        if matches!(provider.api_type, ApiType::OpenAI) {
+                            accumulate_tool_call_delta(line, &mut pending_tool_calls);
+                        }
                         if let Some((content, done)) = parse_streaming_line(line, provider) {
                             if !content.is_empty() {
                                 if !first_token_received {
@@ -451,17 +488,21 @@ fn read_streaming_response_with_progress(
                                 }
                                 full_response.push_str(&content);
                             }
-                            if done { 
+                            if done {
                                 if is_tui { tui_app::finish_streaming(); }
-                                is_done = true; 
-                                tui_app::clear_streaming_status(); 
-                                break; 
+                                is_done = true;
+                                tui_app::clear_streaming_status();
+                                break;
                             }
                         }
                     }
                     if let Some(pos) = last_newline { pending_data.drain(..pos + 1); }
                     if is_done {
-                        return Ok(StreamResponse::Complete(full_response, StreamStats { ttft_us, stream_us: libakuma::uptime() - stream_start_us, total_bytes: 0, fakes: 0 }));
+                        let stats = StreamStats { ttft_us, stream_us: libakuma::uptime() - stream_start_us, total_bytes: full_response.len(), fakes: 0 };
+                        if !pending_tool_calls.is_empty() {
+                            return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
+                        }
+                        return Ok(StreamResponse::Complete(full_response, stats));
                     }
                 }
             }
@@ -481,6 +522,10 @@ fn read_streaming_response_with_progress(
         }
     }
     let stats = StreamStats { ttft_us, stream_us: if first_token_received { libakuma::uptime() - stream_start_us } else { 0 }, total_bytes: full_response.len(), fakes: 0 };
+    if !pending_tool_calls.is_empty() {
+        full_response.shrink_to_fit();
+        return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
+    }
     if !stream_completed && !full_response.is_empty() {
         full_response.shrink_to_fit();
         return Ok(StreamResponse::Partial(full_response, stats));
@@ -505,6 +550,38 @@ fn parse_streaming_line(line: &str, provider: &Provider) -> Option<(String, bool
             Some((extract_openai_delta_content(json).unwrap_or_default(), false))
         }
     }
+}
+
+/// Accumulate a tool_call delta from an OpenAI SSE line into the pending list.
+/// Returns true if the stream signals finish_reason "tool_calls".
+fn accumulate_tool_call_delta(line: &str, pending: &mut Vec<ToolCallData>) -> bool {
+    let line = line.trim();
+    if !line.starts_with("data:") { return false; }
+    let json = match line.strip_prefix("data:") { Some(j) => j.trim(), None => return false };
+    if json.is_empty() || json == "[DONE]" { return false; }
+
+    let is_finish = json.contains("\"finish_reason\":\"tool_calls\"");
+
+    if let Some(tc_pos) = json.find("\"tool_calls\"") {
+        let tc_json = &json[tc_pos..];
+
+        // A new tool call starts when an "id" appears inside tool_calls
+        if let Some(id) = extract_json_string(tc_json, "id") {
+            if !id.is_empty() {
+                pending.push(ToolCallData { id, name: String::new(), arguments: String::new() });
+            }
+        }
+        if let Some(name) = extract_json_string(tc_json, "name") {
+            if !name.is_empty() {
+                if let Some(last) = pending.last_mut() { last.name = name; }
+            }
+        }
+        if let Some(args_frag) = extract_json_string(tc_json, "arguments") {
+            if let Some(last) = pending.last_mut() { last.arguments.push_str(&args_frag); }
+        }
+    }
+
+    is_finish
 }
 
 fn extract_openai_delta_content(json: &str) -> Option<String> {

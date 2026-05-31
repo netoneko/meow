@@ -16,69 +16,68 @@ pub use context::{get_working_dir, get_sandbox_root};
 pub use chainlink::chainlink_available;
 use helpers::{extract_string_field, extract_number_field};
 
-/// Parse and execute a tool command from JSON
-pub fn execute_tool_command(json: &str) -> Option<ToolResult> {
-    let tool_name = extract_string_field(json, "tool")?;
-    
-    match tool_name.as_str() {
+/// Execute a tool by name with a JSON arguments object.
+/// Used by the structured tool calling path (OpenAI format).
+pub fn execute_tool_by_name(name: &str, args_json: &str) -> Option<ToolResult> {
+    match name {
         "FileRead" => {
-            let filename = extract_string_field(json, "filename")?;
+            let filename = extract_string_field(args_json, "filename")?;
             Some(fs::tool_file_read(&filename))
         }
         "FileWrite" => {
-            let filename = extract_string_field(json, "filename")?;
-            let content = extract_string_field(json, "content").unwrap_or_default();
+            let filename = extract_string_field(args_json, "filename")?;
+            let content = extract_string_field(args_json, "content").unwrap_or_default();
             Some(fs::tool_file_write(&filename, &content))
         }
         "FileAppend" => {
-            let filename = extract_string_field(json, "filename")?;
-            let content = extract_string_field(json, "content")?;
+            let filename = extract_string_field(args_json, "filename")?;
+            let content = extract_string_field(args_json, "content")?;
             Some(fs::tool_file_append(&filename, &content))
         }
         "FileExists" => {
-            let filename = extract_string_field(json, "filename")?;
+            let filename = extract_string_field(args_json, "filename")?;
             Some(fs::tool_file_exists(&filename))
         }
         "FileList" => {
-            let path = extract_string_field(json, "path").unwrap_or_else(|| String::from("/"));
+            let path = extract_string_field(args_json, "path").unwrap_or_else(|| String::from("/"));
             Some(fs::tool_file_list(&path))
         }
         "FileDelete" => {
-            let filename = extract_string_field(json, "filename")?;
+            let filename = extract_string_field(args_json, "filename")?;
             Some(fs::tool_file_delete(&filename))
         }
         "FolderCreate" => {
-            let path = extract_string_field(json, "path")?;
+            let path = extract_string_field(args_json, "path")?;
             Some(fs::tool_folder_create(&path))
         }
         "FileRename" => {
-            let source = extract_string_field(json, "source_filename")?;
-            let dest = extract_string_field(json, "destination_filename")?;
+            let source = extract_string_field(args_json, "source_filename")?;
+            let dest = extract_string_field(args_json, "destination_filename")?;
             Some(fs::tool_file_rename(&source, &dest))
         }
         "FileCopy" => {
-            let source = extract_string_field(json, "source")?;
-            let dest = extract_string_field(json, "destination")?;
+            let source = extract_string_field(args_json, "source")?;
+            let dest = extract_string_field(args_json, "destination")?;
             Some(fs::tool_file_copy(&source, &dest))
         }
         "FileMove" => {
-            let source = extract_string_field(json, "source")?;
-            let dest = extract_string_field(json, "destination")?;
+            let source = extract_string_field(args_json, "source")?;
+            let dest = extract_string_field(args_json, "destination")?;
             Some(fs::tool_file_move(&source, &dest))
         }
         "HttpFetch" => {
-            let url = extract_string_field(json, "url")?;
+            let url = extract_string_field(args_json, "url")?;
             Some(net::tool_http_fetch(&url))
         }
         "GitClone" => {
-            let url = extract_string_field(json, "url")?;
+            let url = extract_string_field(args_json, "url")?;
             Some(git::tool_git_clone(&url))
         }
         "GitPull" => {
             Some(git::tool_git_pull())
         }
         "GitPush" => {
-            let force = extract_string_field(json, "force")
+            let force = extract_string_field(args_json, "force")
                 .map(|s| s == "true")
                 .unwrap_or(false);
             Some(git::tool_git_push(force))
@@ -87,76 +86,76 @@ pub fn execute_tool_command(json: &str) -> Option<ToolResult> {
             Some(git::tool_git_status())
         }
         "GitBranch" => {
-            let name = extract_string_field(json, "name");
-            let delete = extract_string_field(json, "delete")
+            let branch_name = extract_string_field(args_json, "name");
+            let delete = extract_string_field(args_json, "delete")
                 .map(|s| s == "true")
                 .unwrap_or(false);
-            Some(git::tool_git_branch(name.as_deref(), delete))
+            Some(git::tool_git_branch(branch_name.as_deref(), delete))
         }
         "GitFetch" => {
             Some(git::tool_git_fetch())
         }
         "GitAdd" => {
-            let path = extract_string_field(json, "path").unwrap_or_else(|| String::from("."));
+            let path = extract_string_field(args_json, "path").unwrap_or_else(|| String::from("."));
             Some(git::tool_git_add(&path))
         }
         "GitCommit" => {
-            let message = extract_string_field(json, "message")?;
-            let amend = extract_string_field(json, "amend")
+            let message = extract_string_field(args_json, "message")?;
+            let amend = extract_string_field(args_json, "amend")
                 .map(|s| s == "true")
                 .unwrap_or(false);
             Some(git::tool_git_commit(&message, amend))
         }
         "GitCheckout" => {
-            let branch = extract_string_field(json, "branch")?;
+            let branch = extract_string_field(args_json, "branch")?;
             Some(git::tool_git_checkout(&branch))
         }
         "GitConfig" => {
-            let key = extract_string_field(json, "key")?;
-            let value = extract_string_field(json, "value");
+            let key = extract_string_field(args_json, "key")?;
+            let value = extract_string_field(args_json, "value");
             Some(git::tool_git_config(&key, value.as_deref()))
         }
         "GitLog" => {
-            let count = extract_number_field(json, "count");
-            let oneline = extract_string_field(json, "oneline")
+            let count = extract_number_field(args_json, "count");
+            let oneline = extract_string_field(args_json, "oneline")
                 .map(|s| s == "true")
                 .unwrap_or(false);
             Some(git::tool_git_log(count, oneline))
         }
         "GitTag" => {
-            let name = extract_string_field(json, "name");
-            let delete = extract_string_field(json, "delete")
+            let tag_name = extract_string_field(args_json, "name");
+            let delete = extract_string_field(args_json, "delete")
                 .map(|s| s == "true")
                 .unwrap_or(false);
-            Some(git::tool_git_tag(name.as_deref(), delete))
+            Some(git::tool_git_tag(tag_name.as_deref(), delete))
         }
         "GitReset" => {
             Some(git::tool_git_reset())
         }
         "FileReadLines" => {
-            let filename = extract_string_field(json, "filename")?;
-            let start = extract_number_field(json, "start").unwrap_or(1);
-            let end = extract_number_field(json, "end").unwrap_or(start + 50);
+            let filename = extract_string_field(args_json, "filename")?;
+            let start = extract_number_field(args_json, "start").unwrap_or(1);
+            let end = extract_number_field(args_json, "end").unwrap_or(start + 50);
             Some(fs::tool_file_read_lines(&filename, start, end))
         }
         "CodeSearch" => {
-            let pattern = extract_string_field(json, "pattern")?;
-            let path = extract_string_field(json, "path").unwrap_or_else(|| String::from("."));
-            let context = extract_number_field(json, "context").unwrap_or(2);
+            let pattern = extract_string_field(args_json, "pattern")?;
+            let path = extract_string_field(args_json, "path").unwrap_or_else(|| String::from("."));
+            let context = extract_number_field(args_json, "context").unwrap_or(2);
             Some(tool_code_search(&pattern, &path, context))
         }
         "FileEdit" => {
-            let filename = extract_string_field(json, "filename")?;
-            let old_text = extract_string_field(json, "old_text")?;
-            let new_text = extract_string_field(json, "new_text")?;
+            let filename = extract_string_field(args_json, "filename")?;
+            let old_text = extract_string_field(args_json, "old_text")?;
+            let new_text = extract_string_field(args_json, "new_text")?;
             Some(fs::tool_file_edit(&filename, &old_text, &new_text))
         }
         "Shell" => {
-            let cmd = extract_string_field(json, "cmd")?;
+            let cmd = extract_string_field(args_json, "cmd")?;
             Some(shell::tool_shell(&cmd))
         }
         "Cd" => {
-            let path = extract_string_field(json, "path")?;
+            let path = extract_string_field(args_json, "path")?;
             Some(fs::tool_cd(&path))
         }
         "Pwd" => {
@@ -172,57 +171,64 @@ pub fn execute_tool_command(json: &str) -> Option<ToolResult> {
             if !chainlink_available() {
                 return Some(ToolResult::err("chainlink not found in /bin"));
             }
-            let title = extract_string_field(json, "title")?;
-            let description = extract_string_field(json, "description");
-            let priority = extract_string_field(json, "priority");
+            let title = extract_string_field(args_json, "title")?;
+            let description = extract_string_field(args_json, "description");
+            let priority = extract_string_field(args_json, "priority");
             Some(chainlink::tool_chainlink_create(&title, description.as_deref(), priority.as_deref()))
         }
         "ChainlinkList" => {
             if !chainlink_available() {
                 return Some(ToolResult::err("chainlink not found in /bin"));
             }
-            let status = extract_string_field(json, "status");
+            let status = extract_string_field(args_json, "status");
             Some(chainlink::tool_chainlink_list(status.as_deref()))
         }
         "ChainlinkShow" => {
             if !chainlink_available() {
                 return Some(ToolResult::err("chainlink not found in /bin"));
             }
-            let id = extract_number_field(json, "id")?;
+            let id = extract_number_field(args_json, "id")?;
             Some(chainlink::tool_chainlink_show(id))
         }
         "ChainlinkClose" => {
             if !chainlink_available() {
                 return Some(ToolResult::err("chainlink not found in /bin"));
             }
-            let id = extract_number_field(json, "id")?;
+            let id = extract_number_field(args_json, "id")?;
             Some(chainlink::tool_chainlink_close(id))
         }
         "ChainlinkReopen" => {
             if !chainlink_available() {
                 return Some(ToolResult::err("chainlink not found in /bin"));
             }
-            let id = extract_number_field(json, "id")?;
+            let id = extract_number_field(args_json, "id")?;
             Some(chainlink::tool_chainlink_reopen(id))
         }
         "ChainlinkComment" => {
             if !chainlink_available() {
                 return Some(ToolResult::err("chainlink not found in /bin"));
             }
-            let id = extract_number_field(json, "id")?;
-            let text = extract_string_field(json, "text")?;
+            let id = extract_number_field(args_json, "id")?;
+            let text = extract_string_field(args_json, "text")?;
             Some(chainlink::tool_chainlink_comment(id, &text))
         }
         "ChainlinkLabel" => {
             if !chainlink_available() {
                 return Some(ToolResult::err("chainlink not found in /bin"));
             }
-            let id = extract_number_field(json, "id")?;
-            let label = extract_string_field(json, "label")?;
+            let id = extract_number_field(args_json, "id")?;
+            let label = extract_string_field(args_json, "label")?;
             Some(chainlink::tool_chainlink_label(id, &label))
         }
         _ => None,
     }
+}
+
+/// Parse and execute a tool command from the legacy text-format JSON blob.
+/// The json contains both a "tool" field and inline args fields.
+pub fn execute_tool_command(json: &str) -> Option<ToolResult> {
+    let tool_name = extract_string_field(json, "tool")?;
+    execute_tool_by_name(&tool_name, json)
 }
 
 fn tool_code_search(pattern: &str, path: &str, context: usize) -> ToolResult {

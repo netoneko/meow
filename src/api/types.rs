@@ -1,4 +1,5 @@
 use alloc::string::String;
+use alloc::vec::Vec;
 
 pub struct StreamStats {
     pub ttft_us: u64,
@@ -7,9 +8,17 @@ pub struct StreamStats {
     pub fakes: usize,
 }
 
+pub struct ToolCallData {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
 pub enum StreamResponse {
     /// Response completed normally (server sent done signal)
     Complete(String, StreamStats),
+    /// Response completed with structured tool calls (OpenAI tool calling)
+    CompleteWithTools(String, Vec<ToolCallData>, StreamStats),
     /// Response was interrupted mid-stream (connection closed before done signal)
     Partial(String, StreamStats),
 }

@@ -132,10 +132,12 @@ pub extern "C" fn main() {
     }
 
     system_prompt.push_str("\n\n");
-    system_prompt.push_str(COMMON_TOOLS);
 
-    if tools::chainlink_available() {
-        system_prompt.push_str(tools::chainlink::CHAINLINK_TOOLS_SECTION);
+    if !current_provider.uses_structured_tools() {
+        system_prompt.push_str(COMMON_TOOLS);
+        if tools::chainlink_available() {
+            system_prompt.push_str(tools::chainlink::CHAINLINK_TOOLS_SECTION);
+        }
     }
 
     if use_tui || one_shot_message.is_none() {
@@ -211,6 +213,7 @@ pub extern "C" fn main() {
             &mut history,
             None,
             &system_prompt,
+            app_config.fake_tool_check,
         ) {
             Ok(_) => {
                 libakuma::print("\n");

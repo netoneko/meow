@@ -346,6 +346,12 @@ CRITICAL: If you find yourself writing phrases like "the API returned..." or "ac
 - Default working directory is / (root) - no restrictions
 "#;
 
+/// OpenAI-compatible tool schema for all core tools. Used when provider.api_type == OpenAI.
+pub const OPENAI_TOOLS_JSON: &str = r#"[{"type":"function","function":{"name":"FileRead","description":"Read file contents","parameters":{"type":"object","properties":{"filename":{"type":"string"}},"required":["filename"]}}},{"type":"function","function":{"name":"FileWrite","description":"Create or overwrite a file","parameters":{"type":"object","properties":{"filename":{"type":"string"},"content":{"type":"string"}},"required":["filename","content"]}}},{"type":"function","function":{"name":"FileAppend","description":"Append content to a file","parameters":{"type":"object","properties":{"filename":{"type":"string"},"content":{"type":"string"}},"required":["filename","content"]}}},{"type":"function","function":{"name":"FileExists","description":"Check if a file exists","parameters":{"type":"object","properties":{"filename":{"type":"string"}},"required":["filename"]}}},{"type":"function","function":{"name":"FileList","description":"List directory contents","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}},{"type":"function","function":{"name":"FileDelete","description":"Delete a file","parameters":{"type":"object","properties":{"filename":{"type":"string"}},"required":["filename"]}}},{"type":"function","function":{"name":"FolderCreate","description":"Create a directory","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},{"type":"function","function":{"name":"FileRename","description":"Rename a file","parameters":{"type":"object","properties":{"source_filename":{"type":"string"},"destination_filename":{"type":"string"}},"required":["source_filename","destination_filename"]}}},{"type":"function","function":{"name":"FileCopy","description":"Copy a file","parameters":{"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"]}}},{"type":"function","function":{"name":"FileMove","description":"Move a file","parameters":{"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"]}}},{"type":"function","function":{"name":"FileReadLines","description":"Read a specific line range from a file","parameters":{"type":"object","properties":{"filename":{"type":"string"},"start":{"type":"integer"},"end":{"type":"integer"}},"required":["filename"]}}},{"type":"function","function":{"name":"FileEdit","description":"Precise search-and-replace edit in a file. old_text must be unique.","parameters":{"type":"object","properties":{"filename":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["filename","old_text","new_text"]}}},{"type":"function","function":{"name":"CodeSearch","description":"Search for a pattern in source files recursively","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"context":{"type":"integer"}},"required":["pattern"]}}},{"type":"function","function":{"name":"Shell","description":"Execute a shell command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}},{"type":"function","function":{"name":"Cd","description":"Change the current working directory","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},{"type":"function","function":{"name":"Pwd","description":"Print the current working directory","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"HttpFetch","description":"Fetch content from an HTTP or HTTPS URL","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},{"type":"function","function":{"name":"GitClone","description":"Clone a git repository","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},{"type":"function","function":{"name":"GitFetch","description":"Fetch updates from remote","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"GitPull","description":"Pull updates from remote (fetch + update)","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"GitPush","description":"Push changes to remote","parameters":{"type":"object","properties":{"force":{"type":"string","description":"Set to 'true' to force push (use with extreme caution)"}}}}},{"type":"function","function":{"name":"GitStatus","description":"Show current git status and HEAD","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"GitBranch","description":"List, create, or delete branches","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Branch name to create"},"delete":{"type":"string","description":"Set to 'true' to delete the named branch"}}}}},{"type":"function","function":{"name":"GitAdd","description":"Stage files for commit","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File or directory to stage; use '.' for all"}}}}},{"type":"function","function":{"name":"GitCommit","description":"Create a git commit from staged files","parameters":{"type":"object","properties":{"message":{"type":"string"},"amend":{"type":"string","description":"Set to 'true' to amend the last commit"}},"required":["message"]}}},{"type":"function","function":{"name":"GitCheckout","description":"Switch to a branch","parameters":{"type":"object","properties":{"branch":{"type":"string"}},"required":["branch"]}}},{"type":"function","function":{"name":"GitConfig","description":"Get or set a git config value","parameters":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"}},"required":["key"]}}},{"type":"function","function":{"name":"GitLog","description":"Show commit history","parameters":{"type":"object","properties":{"count":{"type":"integer"},"oneline":{"type":"string","description":"Set to 'true' for compact one-line format"}}}}},{"type":"function","function":{"name":"GitTag","description":"List, create, or delete tags","parameters":{"type":"object","properties":{"name":{"type":"string"},"delete":{"type":"string","description":"Set to 'true' to delete the named tag"}}}}},{"type":"function","function":{"name":"GitReset","description":"Unstage all staged files","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"CompactContext","description":"Compact conversation history by replacing it with a summary. Use when token count is high.","parameters":{"type":"object","properties":{"summary":{"type":"string","description":"Comprehensive summary capturing all important context, decisions, files, and ongoing work"}},"required":["summary"]}}}]"#;
+
+/// OpenAI-compatible tool schema for Chainlink tools. Merged with OPENAI_TOOLS_JSON when chainlink is available.
+pub const OPENAI_CHAINLINK_TOOLS_JSON: &str = r#"[{"type":"function","function":{"name":"ChainlinkInit","description":"Initialize the chainlink task tracker","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"ChainlinkCreate","description":"Create a new task","parameters":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"priority":{"type":"string"}},"required":["title"]}}},{"type":"function","function":{"name":"ChainlinkList","description":"List tasks","parameters":{"type":"object","properties":{"status":{"type":"string"}}}}},{"type":"function","function":{"name":"ChainlinkShow","description":"Show task details","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}},{"type":"function","function":{"name":"ChainlinkClose","description":"Close a task","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}},{"type":"function","function":{"name":"ChainlinkReopen","description":"Reopen a closed task","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}},{"type":"function","function":{"name":"ChainlinkComment","description":"Add a comment to a task","parameters":{"type":"object","properties":{"id":{"type":"integer"},"text":{"type":"string"}},"required":["id","text"]}}},{"type":"function","function":{"name":"ChainlinkLabel","description":"Add a label to a task","parameters":{"type":"object","properties":{"id":{"type":"integer"},"label":{"type":"string"}},"required":["id","label"]}}}]"#;
+
 // UI Colors (Cyber-Steel / Tokyo Night)
 pub const COLOR_VIOLET: &str = "\x1b[38;2;181;126;220m"; // Lavender (#B57EDC)
 pub const COLOR_BLUE: &str = "\x1b[38;5;111m";   // Meow (Cyan/Blue)
@@ -438,6 +444,11 @@ impl Provider {
         self.base_url.starts_with("https://")
     }
 
+    /// Whether this provider uses OpenAI-compatible structured tool calling
+    pub fn uses_structured_tools(&self) -> bool {
+        matches!(self.api_type, ApiType::OpenAI)
+    }
+
     /// Get the base path from the URL (e.g., "/openai/v1" from "https://api.groq.com/openai/v1")
     pub fn base_path(&self) -> &str {
         let url = self.base_url
@@ -461,6 +472,8 @@ pub struct Config {
     pub exit_on_escape: bool,
     /// Whether to render markdown or show raw text
     pub render_markdown: bool,
+    /// Whether to detect fake tool results in LLM responses (default: true)
+    pub fake_tool_check: bool,
 }
 
 impl Default for Config {
@@ -472,6 +485,7 @@ impl Default for Config {
             providers: alloc::vec![Provider::ollama_default()],
             exit_on_escape: false,
             render_markdown: false,
+            fake_tool_check: true,
         }
     }
 }
@@ -542,6 +556,7 @@ impl Config {
             providers: Vec::new(),
             exit_on_escape: false,
             render_markdown: true,
+            fake_tool_check: true,
         };
 
         let mut current_provider: Option<Provider> = None;
@@ -601,6 +616,9 @@ impl Config {
                         }
                         "render_markdown" => {
                             config.render_markdown = value.to_lowercase() != "false";
+                        }
+                        "fake_tool_check" => {
+                            config.fake_tool_check = value.to_lowercase() != "false";
                         }
                         _ => {}
                     }
@@ -666,6 +684,10 @@ impl Config {
 
         content.push_str("render_markdown=");
         content.push_str(if self.render_markdown { "true" } else { "false" });
+        content.push('\n');
+
+        content.push_str("fake_tool_check=");
+        content.push_str(if self.fake_tool_check { "true" } else { "false" });
         content.push_str("\n\n");
 
         // Providers
