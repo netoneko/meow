@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
 
-use crate::config::{Config, Provider, ApiType, TOKEN_LIMIT_FOR_COMPACTION};
+use crate::config::{Config, Provider, TOKEN_LIMIT_FOR_COMPACTION};
 use crate::api;
 use crate::tui_app;
 use super::history::{Message, calculate_history_tokens};
@@ -77,12 +77,8 @@ pub fn handle_command(
 ");
                     for (i, p) in config.providers.iter().enumerate() {
                         let current_marker = if p.name == provider.name { " (current)" } else { "" };
-                        let api_type = match p.api_type {
-                            ApiType::Ollama => "Ollama",
-                            ApiType::OpenAI => "OpenAI",
-                        };
-                        output.push_str(&format!("  {}. {} ({}) [{}]{}
-", i + 1, p.name, p.base_url, api_type, current_marker));
+                        output.push_str(&format!("  {}. {} ({}){}
+", i + 1, p.name, p.base_url, current_marker));
                     }
                     (CommandResult::Continue, Some(output))
                 }

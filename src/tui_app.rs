@@ -296,7 +296,7 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
                 state::STREAMING.store(true, Ordering::SeqCst);
                 layout.update_status("[MEOW] jacking in", 1, None);
                 tui_print("\n\n");
-                let _ = app::chat::chat_once(model, provider, &u_i, history, Some(context_window), system_prompt, config.fake_tool_check);
+                let _ = app::chat::chat_once(model, provider, &u_i, history, Some(context_window), system_prompt);
                 state::STREAMING.store(false, Ordering::SeqCst); state::CANCELLED.store(false, Ordering::SeqCst);
                 layout.clear_status();
                 let _ = write!(stdout, "{}\n", COLOR_RESET);

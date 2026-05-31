@@ -9,7 +9,7 @@ use crate::util::StackBuffer;
 use core::fmt::Write;
 use crate::ui::tui::layout::Stdout;
 
-use crate::config::{Provider, ApiType, OPENAI_TOOLS_JSON};
+use crate::config::{Provider, OPENAI_TOOLS_JSON};
 use crate::tui_app;
 use super::types::{StreamResponse, StreamStats, ToolCallData};
 
@@ -132,7 +132,7 @@ pub fn send_with_retry(
                 libakuma::print("] waiting");
             }
             
-            match read_streaming_with_http_stream_tls(&mut http_stream, start_time, provider, current_tokens, token_limit, mem_kb, is_tui) {
+            match read_streaming_with_http_stream_tls(&mut http_stream, start_time, current_tokens, token_limit, mem_kb, is_tui) {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     if e == "Request cancelled" { return Err(e); }
@@ -157,7 +157,7 @@ pub fn send_with_retry(
                 libakuma::print("] waiting");
             }
 
-            match read_streaming_response_with_progress(&stream, start_time, provider, current_tokens, token_limit, mem_kb, is_tui) {
+            match read_streaming_response_with_progress(&stream, start_time, current_tokens, token_limit, mem_kb, is_tui) {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     if e == "Request cancelled" { return Err(e); }
@@ -202,36 +202,24 @@ fn send_post_request(stream: &TcpStream, path: &str, body: &str, provider: &Prov
 }
 
 fn build_chat_request(model: &str, provider: &Provider, history_json: &str) -> (String, String) {
-    match provider.api_type {
-        ApiType::Ollama => {
-            let body = format!(
-                "{{\"model\":\"{}\",\"messages\":{},\"stream\":true,\"options\":{{\"num_predict\":{}}}}}",
-                model, history_json, DEFAULT_MAX_TOKENS
-            );
-            (String::from("/api/chat"), body)
-        }
-        ApiType::OpenAI => {
-            let body = format!(
-                "{{\"model\":\"{}\",\"messages\":{},\"stream\":true,\"max_tokens\":{},\"tools\":{},\"tool_choice\":\"auto\"}}",
-                model, history_json, DEFAULT_MAX_TOKENS, OPENAI_TOOLS_JSON
-            );
-            let base = provider.base_path();
-            let path = if base.is_empty() || base == "/" {
-                String::from("/v1/chat/completions")
-            } else if base.ends_with("/v1") {
-                format!("{}/chat/completions", base)
-            } else {
-                format!("{}/chat/completions", base.trim_end_matches('/'))
-            };
-            (path, body)
-        }
-    }
+    let body = format!(
+        "{{\"model\":\"{}\",\"messages\":{},\"stream\":true,\"max_tokens\":{},\"tools\":{},\"tool_choice\":\"auto\"}}",
+        model, history_json, DEFAULT_MAX_TOKENS, OPENAI_TOOLS_JSON
+    );
+    let base = provider.base_path();
+    let path = if base.is_empty() || base == "/" {
+        String::from("/v1/chat/completions")
+    } else if base.ends_with("/v1") {
+        format!("{}/chat/completions", base)
+    } else {
+        format!("{}/chat/completions", base.trim_end_matches('/'))
+    };
+    (path, body)
 }
 
 fn read_streaming_with_http_stream_tls(
     stream: &mut HttpStreamTls<'_>,
     start_time: u64,
-    provider: &Provider,
     current_tokens: usize,
     token_limit: usize,
     mem_kb: usize,
@@ -257,10 +245,8 @@ fn read_streaming_with_http_stream_tls(
                 while let Some(newline_pos) = pending_lines.find('\n') {
                     let line = &pending_lines[..newline_pos];
                     if !line.is_empty() {
-                        if matches!(provider.api_type, ApiType::OpenAI) {
-                            accumulate_tool_call_delta(line, &mut pending_tool_calls);
-                        }
-                        if let Some((content, done)) = parse_streaming_line(line, provider) {
+                        accumulate_tool_call_delta(line, &mut pending_tool_calls);
+                        if let Some((content, done)) = parse_streaming_line(line) {
                             if !content.is_empty() {
                                 if !first_token_received {
                                     first_token_received = true;
@@ -306,10 +292,8 @@ fn read_streaming_with_http_stream_tls(
             StreamResult::Done => {
                 let remaining = String::from(pending_lines.trim());
                 if !remaining.is_empty() {
-                    if matches!(provider.api_type, ApiType::OpenAI) {
-                        accumulate_tool_call_delta(&remaining, &mut pending_tool_calls);
-                    }
-                    if let Some((content, done)) = parse_streaming_line(&remaining, provider) {
+                    accumulate_tool_call_delta(&remaining, &mut pending_tool_calls);
+                    if let Some((content, done)) = parse_streaming_line(&remaining) {
                         if !content.is_empty() {
                             if !first_token_received {
                                 first_token_received = true;
@@ -365,7 +349,6 @@ fn read_streaming_with_http_stream_tls(
 fn read_streaming_response_with_progress(
     stream: &TcpStream,
     start_time: u64,
-    provider: &Provider,
     current_tokens: usize,
     token_limit: usize,
     mem_kb: usize,
@@ -395,10 +378,8 @@ fn read_streaming_response_with_progress(
                 if !any_data_received { return Err("Connection closed by server"); }
                 if let Ok(remaining_str) = core::str::from_utf8(&pending_data) {
                     for line in remaining_str.trim().lines() {
-                        if matches!(provider.api_type, ApiType::OpenAI) {
-                            accumulate_tool_call_delta(line, &mut pending_tool_calls);
-                        }
-                        if let Some((content, done)) = parse_streaming_line(line, provider) {
+                        accumulate_tool_call_delta(line, &mut pending_tool_calls);
+                        if let Some((content, done)) = parse_streaming_line(line) {
                             if !content.is_empty() {
                                 if !first_token_received {
                                     first_token_received = true;
@@ -450,10 +431,8 @@ fn read_streaming_response_with_progress(
                     let mut is_done = false;
                     for line in complete_part.lines() {
                         if line.is_empty() { continue; }
-                        if matches!(provider.api_type, ApiType::OpenAI) {
-                            accumulate_tool_call_delta(line, &mut pending_tool_calls);
-                        }
-                        if let Some((content, done)) = parse_streaming_line(line, provider) {
+                        accumulate_tool_call_delta(line, &mut pending_tool_calls);
+                        if let Some((content, done)) = parse_streaming_line(line) {
                             if !content.is_empty() {
                                 if !first_token_received {
                                     first_token_received = true;
@@ -522,22 +501,13 @@ fn read_streaming_response_with_progress(
     Ok(StreamResponse::Complete(full_response, stats))
 }
 
-fn parse_streaming_line(line: &str, provider: &Provider) -> Option<(String, bool)> {
-    match provider.api_type {
-        ApiType::Ollama => {
-            let done = line.contains("\"done\":true") || line.contains("\"done\": true");
-            let content = extract_json_string(line, "content").unwrap_or_default();
-            Some((content, done))
-        }
-        ApiType::OpenAI => {
-            let line = line.trim();
-            if line == "data: [DONE]" { return Some((String::new(), true)); }
-            if !line.starts_with("data:") { return Some((String::new(), false)); }
-            let json = line.strip_prefix("data:")?.trim();
-            if json.is_empty() || json == "[DONE]" { return Some((String::new(), json == "[DONE]")); }
-            Some((extract_openai_delta_content(json).unwrap_or_default(), false))
-        }
-    }
+fn parse_streaming_line(line: &str) -> Option<(String, bool)> {
+    let line = line.trim();
+    if line == "data: [DONE]" { return Some((String::new(), true)); }
+    if !line.starts_with("data:") { return Some((String::new(), false)); }
+    let json = line.strip_prefix("data:")?.trim();
+    if json.is_empty() || json == "[DONE]" { return Some((String::new(), json == "[DONE]")); }
+    Some((extract_openai_delta_content(json).unwrap_or_default(), false))
 }
 
 /// Accumulate a tool_call delta from an OpenAI SSE line into the pending list.

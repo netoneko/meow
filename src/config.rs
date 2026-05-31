@@ -181,172 +181,9 @@ pub const PERSONALITIES: &[Personality] = &[
     },
 ];
 
-pub const COMMON_TOOLS: &str = r#"## Available Tools
 
-You have access to filesystem tools! When you need to perform file operations, output a JSON command block like this:
 
-```json
-{
-  "command": {
-    "tool": "ToolName",
-    "args": { ... }
-  }
-}
-```
-
-### Tool List:
-
-1. **FileRead** - Read file contents
-   Args: `{"filename": "path/to/file"}`
-
-2. **FileWrite** - Create or overwrite a file
-   Args: `{"filename": "path/to/file", "content": "file contents"}`
-
-3. **FileAppend** - Append to a file
-   Args: `{"filename": "path/to/file", "content": "content to append"}`
-
-4. **FileExists** - Check if file exists
-   Args: `{"filename": "path/to/file"}`
-
-5. **FileList** - List directory contents
-   Args: `{"path": "/directory/path"}`
-
-6. **FolderCreate** - Create a directory
-   Args: `{"path": "/new/directory/path"}`
-
-7. **FileCopy** - Copy a file
-   Args: `{"source": "path/from", "destination": "path/to"}`
-
-8. **FileMove** - Move a file
-   Args: `{"source": "path/from", "destination": "path/to"}`
-
-9. **FileRename** - Rename a file
-   Args: `{"source_filename": "old_name", "destination_filename": "new_name"}`
-
-10. **HttpFetch** - Fetch content from HTTP or HTTPS URLs
-    Args: `{"url": "http(s)://host[:port]/path"}`
-    Note: Supports both http:// and https://. Max 64KB response. HTTPS uses TLS 1.3.
-
-### Directory Navigation:
-
-11. **Cd** - Change working directory (for git operations)
-    Args: `{"path": "/path/to/directory"}`
-    Note: All git and file commands operate in this directory. Use after cloning a repo.
-    Caveat: quickjs does not respect cwd as of now.
-
-12. **Pwd** - Print current working directory
-    Args: `{}`
-
-### Git Tools:
-
-Note: Git tools operate in the current working directory (set via Cd).
-After cloning, use Cd to enter the repository before running other git commands.
-
-13. **GitClone** - Clone a Git repository from GitHub
-    Args: `{"url": "https://github.com/owner/repo"}`
-    Note: Creates repo directory and checks out files.
-
-14. **GitFetch** - Fetch updates from remote
-    Args: `{}`
-    Note: Must cd into a cloned repository first.
-
-15. **GitPull** - Pull updates from remote (fetch + update)
-    Args: `{}`
-    Note: Fetches and updates local refs.
-
-16. **GitPush** - Push changes to remote
-    Args: `{}`
-    WARNING: Force push is PERMANENTLY DISABLED. Never set force: true.
-
-17. **GitStatus** - Show current HEAD and branch
-    Args: `{}`
-
-18. **GitBranch** - List, create, or delete branches
-    Args: `{}` - list all branches
-    Args: `{"name": "branch-name"}` - create a new branch
-    Args: `{"name": "branch-name", "delete": "true"}` - delete a branch
-
-19. **GitAdd** - Stage files for commit
-    Args: `{"path": "file_or_directory"}` - stage specific path
-    Args: `{"path": "."}` - stage all changes
-    Note: Must be in a git repository.
-
-20. **GitCommit** - Create a commit with staged changes
-    Args: `{"message": "commit message"}`
-    Args: `{"message": "new message", "amend": "true"}` - amend last commit
-    Note: Requires files to be staged first with GitAdd.
-
-21. **GitCheckout** - Switch to a branch
-    Args: `{"branch": "branch-name"}`
-    Note: Switches HEAD to the specified branch.
-
-22. **GitConfig** - Get or set git config values
-    Args: `{"key": "user.name"}` - get config value
-    Args: `{"key": "user.name", "value": "Your Name"}` - set config value
-    Keys: user.name, user.email, credential.token
-
-23. **GitLog** - Show commit history
-    Args: `{}`
-    Args: `{"count": 5}` - limit to N commits
-    Args: `{"oneline": "true"}` - one line per commit
-    Note: Shows commit log with SHA, author, date, and message.
-
-24. **GitTag** - List, create, or delete tags
-    Args: `{}` - list all tags
-    Args: `{"name": "v1.0"}` - create a new tag
-    Args: `{"name": "v1.0", "delete": "true"}` - delete a tag
-
-25. **GitReset** - Unstage all files (clear the staging area)
-    Args: `{}`
-    Note: Removes all files from the staging area without deleting them.
-
-### Code Editing Tools:
-
-26. **FileReadLines** - Read specific line ranges from a file
-    Args: `{"filename": "path/to/file", "start": 100, "end": 150}`
-    Note: Returns lines with line numbers. Great for navigating large files.
-
-27. **CodeSearch** - Search for patterns in Rust source files
-    Args: `{"pattern": "search text", "path": "directory", "context": 2}`
-    Note: Searches .rs files recursively. Returns matches with context lines.
-
-28. **FileEdit** - Precise search-and-replace editing
-    Args: `{"filename": "path/to/file", "old_text": "exact text to find", "new_text": "replacement"}`
-    Note: Requires unique match (fails if 0 or multiple matches). Returns diff output.
-
-29. **Shell** - Execute a shell command
-    Args: `{"cmd": "your command here"}`
-    Note: Runs the specified binary. Use for build commands, git operations, etc.
-
-30. **CompactContext** - Compact conversation history by summarizing it
-    Args: `{"summary": "A comprehensive summary of the conversation so far..."}`
-    Note: Use this when the token count displayed in the prompt approaches the limit.
-          Provide a detailed summary that captures all important context, decisions made,
-          files discussed, and any ongoing work. The summary replaces the conversation history.
-
-### Important Notes:
-- Output the JSON command in a ```json code block
-- After outputting a command, STOP and wait for the result
-- The system will execute the command and provide the result
-- Then you can continue your response based on the result
-- You can use multiple tools in sequence by waiting for each result
-
-CRITICAL
-- Do NOT simulate or make up tool results. Do NOT write what you think the output would be.
-- ONLY output the function call format above, nothing else.
-- Every tool call should be a separate JSON command block in a separate response
-- If you state an intent to use the tool, you should actually check if you called the tool, your output should contain the tool call (if you intend to read a file, you should call the FileRead tool and so on)
-
-CRITICAL: If you find yourself writing phrases like "the API returned..." or "according to the tool..." STOP IMMEDIATELY - you are hallucinating tool results. Output the actual function call instead.
-
-### Sandbox:
-- All file operations are sandboxed to the current working directory (set via Cd)
-- Files outside the working directory cannot be accessed
-- After cloning a repo, use Cd to enter it before making changes
-- Default working directory is / (root) - no restrictions
-"#;
-
-/// OpenAI-compatible tool schema for all core tools. Used when provider.api_type == OpenAI.
+/// OpenAI-compatible tool schema for all tools.
 pub const OPENAI_TOOLS_JSON: &str = r#"[{"type":"function","function":{"name":"FileRead","description":"Read file contents","parameters":{"type":"object","properties":{"filename":{"type":"string"}},"required":["filename"]}}},{"type":"function","function":{"name":"FileWrite","description":"Create or overwrite a file","parameters":{"type":"object","properties":{"filename":{"type":"string"},"content":{"type":"string"}},"required":["filename","content"]}}},{"type":"function","function":{"name":"FileAppend","description":"Append content to a file","parameters":{"type":"object","properties":{"filename":{"type":"string"},"content":{"type":"string"}},"required":["filename","content"]}}},{"type":"function","function":{"name":"FileExists","description":"Check if a file exists","parameters":{"type":"object","properties":{"filename":{"type":"string"}},"required":["filename"]}}},{"type":"function","function":{"name":"FileList","description":"List directory contents","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}},{"type":"function","function":{"name":"FileDelete","description":"Delete a file","parameters":{"type":"object","properties":{"filename":{"type":"string"}},"required":["filename"]}}},{"type":"function","function":{"name":"FolderCreate","description":"Create a directory","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},{"type":"function","function":{"name":"FileRename","description":"Rename a file","parameters":{"type":"object","properties":{"source_filename":{"type":"string"},"destination_filename":{"type":"string"}},"required":["source_filename","destination_filename"]}}},{"type":"function","function":{"name":"FileCopy","description":"Copy a file","parameters":{"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"]}}},{"type":"function","function":{"name":"FileMove","description":"Move a file","parameters":{"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"]}}},{"type":"function","function":{"name":"FileReadLines","description":"Read a specific line range from a file","parameters":{"type":"object","properties":{"filename":{"type":"string"},"start":{"type":"integer"},"end":{"type":"integer"}},"required":["filename"]}}},{"type":"function","function":{"name":"FileEdit","description":"Precise search-and-replace edit in a file. old_text must be unique.","parameters":{"type":"object","properties":{"filename":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["filename","old_text","new_text"]}}},{"type":"function","function":{"name":"CodeSearch","description":"Search for a pattern in source files recursively","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"context":{"type":"integer"}},"required":["pattern"]}}},{"type":"function","function":{"name":"Shell","description":"Execute a shell command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}},{"type":"function","function":{"name":"Cd","description":"Change the current working directory","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},{"type":"function","function":{"name":"Pwd","description":"Print the current working directory","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"HttpFetch","description":"Fetch content from an HTTP or HTTPS URL","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},{"type":"function","function":{"name":"GitClone","description":"Clone a git repository","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},{"type":"function","function":{"name":"GitFetch","description":"Fetch updates from remote","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"GitPull","description":"Pull updates from remote (fetch + update)","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"GitPush","description":"Push changes to remote","parameters":{"type":"object","properties":{"force":{"type":"string","description":"Set to 'true' to force push (use with extreme caution)"}}}}},{"type":"function","function":{"name":"GitStatus","description":"Show current git status and HEAD","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"GitBranch","description":"List, create, or delete branches","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Branch name to create"},"delete":{"type":"string","description":"Set to 'true' to delete the named branch"}}}}},{"type":"function","function":{"name":"GitAdd","description":"Stage files for commit","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File or directory to stage; use '.' for all"}}}}},{"type":"function","function":{"name":"GitCommit","description":"Create a git commit from staged files","parameters":{"type":"object","properties":{"message":{"type":"string"},"amend":{"type":"string","description":"Set to 'true' to amend the last commit"}},"required":["message"]}}},{"type":"function","function":{"name":"GitCheckout","description":"Switch to a branch","parameters":{"type":"object","properties":{"branch":{"type":"string"}},"required":["branch"]}}},{"type":"function","function":{"name":"GitConfig","description":"Get or set a git config value","parameters":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"}},"required":["key"]}}},{"type":"function","function":{"name":"GitLog","description":"Show commit history","parameters":{"type":"object","properties":{"count":{"type":"integer"},"oneline":{"type":"string","description":"Set to 'true' for compact one-line format"}}}}},{"type":"function","function":{"name":"GitTag","description":"List, create, or delete tags","parameters":{"type":"object","properties":{"name":{"type":"string"},"delete":{"type":"string","description":"Set to 'true' to delete the named tag"}}}}},{"type":"function","function":{"name":"GitReset","description":"Unstage all staged files","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"CompactContext","description":"Compact conversation history by replacing it with a summary. Use when token count is high.","parameters":{"type":"object","properties":{"summary":{"type":"string","description":"Comprehensive summary capturing all important context, decisions, files, and ongoing work"}},"required":["summary"]}}}]"#;
 
 // UI Colors (Cyber-Steel / Tokyo Night)
@@ -363,52 +200,20 @@ pub const COLOR_RESET: &str = "\x1b[0m";
 pub const COLOR_BOLD: &str = "\x1b[1m";
 pub const BG_CODE: &str = "\x1b[48;5;236m"; // Darker grey background for code blocks
 
-/// API type for the provider
-#[derive(Debug, Clone, PartialEq)]
-pub enum ApiType {
-    Ollama,
-    OpenAI,
-}
-
-impl ApiType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ApiType::Ollama => "ollama",
-            ApiType::OpenAI => "openai",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.trim().to_lowercase().as_str() {
-            "ollama" => Some(ApiType::Ollama),
-            "openai" => Some(ApiType::OpenAI),
-            _ => None,
-        }
-    }
-}
-
-impl Default for ApiType {
-    fn default() -> Self {
-        ApiType::Ollama
-    }
-}
 
 /// A configured AI provider
 #[derive(Debug, Clone)]
 pub struct Provider {
     pub name: String,
     pub base_url: String,
-    pub api_type: ApiType,
     pub api_key: Option<String>,
 }
 
 impl Provider {
-    /// Create a new Ollama provider with default settings
-    pub fn ollama_default() -> Self {
+    pub fn default_provider() -> Self {
         Provider {
             name: String::from("ollama"),
             base_url: String::from("http://10.0.2.2:11434"),
-            api_type: ApiType::Ollama,
             api_key: None,
         }
     }
@@ -441,11 +246,6 @@ impl Provider {
         self.base_url.starts_with("https://")
     }
 
-    /// Whether this provider uses OpenAI-compatible structured tool calling
-    pub fn uses_structured_tools(&self) -> bool {
-        matches!(self.api_type, ApiType::OpenAI)
-    }
-
     /// Get the base path from the URL (e.g., "/openai/v1" from "https://api.groq.com/openai/v1")
     pub fn base_path(&self) -> &str {
         let url = self.base_url
@@ -469,8 +269,6 @@ pub struct Config {
     pub exit_on_escape: bool,
     /// Whether to render markdown or show raw text
     pub render_markdown: bool,
-    /// Whether to detect fake tool results in LLM responses (default: true)
-    pub fake_tool_check: bool,
 }
 
 impl Default for Config {
@@ -479,10 +277,9 @@ impl Default for Config {
             current_provider: String::from("ollama"),
             current_model: String::from("gemma3:27b"),
             current_personality: String::from("Meow"),
-            providers: alloc::vec![Provider::ollama_default()],
+            providers: alloc::vec![Provider::default_provider()],
             exit_on_escape: false,
             render_markdown: false,
-            fake_tool_check: true,
         }
     }
 }
@@ -553,7 +350,6 @@ impl Config {
             providers: Vec::new(),
             exit_on_escape: false,
             render_markdown: true,
-            fake_tool_check: true,
         };
 
         let mut current_provider: Option<Provider> = None;
@@ -575,7 +371,6 @@ impl Config {
                 current_provider = Some(Provider {
                     name: String::from(name),
                     base_url: String::new(),
-                    api_type: ApiType::Ollama,
                     api_key: None,
                 });
                 continue;
@@ -590,11 +385,6 @@ impl Config {
                     // Inside a provider section
                     match key {
                         "base_url" => p.base_url = String::from(value),
-                        "api_type" => {
-                            if let Some(t) = ApiType::from_str(value) {
-                                p.api_type = t;
-                            }
-                        }
                         "api_key" => {
                             if !value.is_empty() {
                                 p.api_key = Some(String::from(value));
@@ -614,9 +404,6 @@ impl Config {
                         "render_markdown" => {
                             config.render_markdown = value.to_lowercase() != "false";
                         }
-                        "fake_tool_check" => {
-                            config.fake_tool_check = value.to_lowercase() != "false";
-                        }
                         _ => {}
                     }
                 }
@@ -630,7 +417,7 @@ impl Config {
 
         // Ensure we have at least the default provider
         if config.providers.is_empty() {
-            config.providers.push(Provider::ollama_default());
+            config.providers.push(Provider::default_provider());
         }
 
         config
@@ -683,9 +470,7 @@ impl Config {
         content.push_str(if self.render_markdown { "true" } else { "false" });
         content.push('\n');
 
-        content.push_str("fake_tool_check=");
-        content.push_str(if self.fake_tool_check { "true" } else { "false" });
-        content.push_str("\n\n");
+        content.push_str("\n");
 
         // Providers
         for p in &self.providers {
@@ -695,10 +480,6 @@ impl Config {
 
             content.push_str("base_url=");
             content.push_str(&p.base_url);
-            content.push('\n');
-
-            content.push_str("api_type=");
-            content.push_str(p.api_type.as_str());
             content.push('\n');
 
             if let Some(ref key) = p.api_key {

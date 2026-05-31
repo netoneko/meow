@@ -82,6 +82,3 @@ Note: You can use `FileReadLines` to read specific parts of the saved output or 
     }
 }
 
-pub struct ToolCall {
-    pub json: String,
-}

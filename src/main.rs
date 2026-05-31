@@ -21,7 +21,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use app::Message;
-use config::{COMMON_TOOLS, Config, DEFAULT_CONTEXT_WINDOW, PERSONALITIES, Provider};
+use config::{Config, DEFAULT_CONTEXT_WINDOW, PERSONALITIES, Provider};
 use libakuma::{arg, argc, close, exit, fstat, open, open_flags, read_fd};
 
 #[no_mangle]
@@ -107,7 +107,7 @@ pub extern "C" fn main() {
     let current_provider = app_config
         .get_current_provider()
         .cloned()
-        .unwrap_or_else(Provider::ollama_default);
+        .unwrap_or_else(Provider::default_provider);
 
     let model = app_config.current_model.clone();
 
@@ -133,9 +133,6 @@ pub extern "C" fn main() {
 
     system_prompt.push_str("\n\n");
 
-    if !current_provider.uses_structured_tools() {
-        system_prompt.push_str(COMMON_TOOLS);
-    }
 
     if use_tui || one_shot_message.is_none() {
         let mut history: Vec<Message> = Vec::new();
@@ -210,7 +207,6 @@ pub extern "C" fn main() {
             &mut history,
             None,
             &system_prompt,
-            app_config.fake_tool_check,
         ) {
             Ok(_) => {
                 libakuma::print("\n");
@@ -302,13 +298,9 @@ fn run_init(config: &mut Config) -> i32 {
             } else {
                 ""
             };
-            let api_type = match p.api_type {
-                config::ApiType::Ollama => "Ollama",
-                config::ApiType::OpenAI => "OpenAI",
-            };
             libakuma::print(&format!(
-                "  - {} [{}]: {}{}\n",
-                p.name, api_type, p.base_url, current
+                "  - {}: {}{}\n",
+                p.name, p.base_url, current
             ));
         }
     }

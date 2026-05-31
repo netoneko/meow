@@ -6,11 +6,10 @@ pub mod shell;
 pub mod helpers;
 pub mod mod_types;
 
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
+use alloc::string::String;
 use alloc::format;
 
-pub use mod_types::{ToolResult, ToolCall};
+pub use mod_types::ToolResult;
 pub use context::{get_working_dir, get_sandbox_root};
 use helpers::{extract_string_field, extract_number_field};
 
@@ -163,13 +162,6 @@ pub fn execute_tool_by_name(name: &str, args_json: &str) -> Option<ToolResult> {
     }
 }
 
-/// Parse and execute a tool command from the legacy text-format JSON blob.
-/// The json contains both a "tool" field and inline args fields.
-pub fn execute_tool_command(json: &str) -> Option<ToolResult> {
-    let tool_name = extract_string_field(json, "tool")?;
-    execute_tool_by_name(&tool_name, json)
-}
-
 fn tool_code_search(pattern: &str, path: &str, context: usize) -> ToolResult {
     let resolved = match context::resolve_path(path) {
         Some(p) => p,
@@ -178,103 +170,8 @@ fn tool_code_search(pattern: &str, path: &str, context: usize) -> ToolResult {
             path, context::get_working_dir()
         )),
     };
-    
     match crate::code_search::search_to_string(pattern, &resolved, context) {
         Ok(results) => ToolResult::ok(results),
         Err(e) => ToolResult::err(&format!("Search failed: {}", e)),
     }
-}
-
-/// Try to find all tool command JSON blocks in the LLM's response.
-pub fn find_tool_calls(response: &str) -> (String, Vec<ToolCall>) {
-    let mut tool_calls = Vec::new();
-    let mut current_response = String::from(response);
-
-    loop {
-        let mut found_match = false;
-        
-        if let Some((json_block, start_offset, end_offset)) = find_code_block(&current_response) {
-            if json_block.contains("\"command\"") && json_block.contains("\"tool\"") {
-                tool_calls.push(ToolCall { json: json_block.to_string() });
-                current_response.replace_range(start_offset..end_offset, "");
-                found_match = true;
-            }
-        }
-        
-        if !found_match {
-            if let Some((json_block, start_offset, end_offset)) = find_inline_json(&current_response) {
-                if json_block.contains("\"command\"") && json_block.contains("\"tool\"") {
-                    tool_calls.push(ToolCall { json: json_block.to_string() });
-                    current_response.replace_range(start_offset..end_offset, "");
-                    found_match = true;
-                }
-            }
-        }
-        
-        if !found_match {
-            break;
-        }
-    }
-    
-    (current_response.trim().to_string(), tool_calls)
-}
-
-fn find_code_block(text: &str) -> Option<(&str, usize, usize)> {
-    let start = text.find("```json")?;
-    let after_start = &text[start + 7..];
-    let end_offset_in_after_start = after_start.find("\n```")
-        .map(|p| p + 1)
-        .or_else(|| after_start.find("```"))?;
-    
-    let json_block = after_start[..end_offset_in_after_start].trim();
-    Some((json_block, start, start + 7 + end_offset_in_after_start + 3))
-}
-
-fn find_inline_json(text: &str) -> Option<(&str, usize, usize)> {
-    let mut search_start = 0;
-    
-    while search_start < text.len() {
-        let brace_pos = text[search_start..].find('{')?;
-        let abs_brace_pos = search_start + brace_pos;
-        
-        let after_brace = &text[abs_brace_pos + 1..];
-        let trimmed = after_brace.trim_start();
-        
-        if trimmed.starts_with("\"command\"") {
-            if let Some(json_end) = find_matching_brace(&text[abs_brace_pos..]) {
-                let json_block = &text[abs_brace_pos..abs_brace_pos + json_end + 1];
-                return Some((json_block, abs_brace_pos, abs_brace_pos + json_end + 1));
-            }
-        }
-        search_start = abs_brace_pos + 1;
-    }
-    None
-}
-
-fn find_matching_brace(s: &str) -> Option<usize> {
-    let mut depth = 0;
-    let mut in_string = false;
-    let mut escape_next = false;
-    
-    for (i, c) in s.chars().enumerate() {
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-        
-        match c {
-            '\\' if in_string => escape_next = true,
-            '"' => in_string = !in_string,
-            '{' if !in_string => depth += 1,
-            '}' if !in_string => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    
-    None
 }
