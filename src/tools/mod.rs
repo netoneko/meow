@@ -1,7 +1,6 @@
 pub mod context;
 pub mod fs;
 pub mod git;
-pub mod chainlink;
 pub mod net;
 pub mod shell;
 pub mod helpers;
@@ -13,7 +12,6 @@ use alloc::format;
 
 pub use mod_types::{ToolResult, ToolCall};
 pub use context::{get_working_dir, get_sandbox_root};
-pub use chainlink::chainlink_available;
 use helpers::{extract_string_field, extract_number_field};
 
 /// Execute a tool by name with a JSON arguments object.
@@ -160,65 +158,6 @@ pub fn execute_tool_by_name(name: &str, args_json: &str) -> Option<ToolResult> {
         }
         "Pwd" => {
             Some(fs::tool_pwd())
-        }
-        "ChainlinkInit" => {
-            if !chainlink_available() {
-                return Some(ToolResult::err("chainlink not found in /bin"));
-            }
-            Some(chainlink::tool_chainlink_init())
-        }
-        "ChainlinkCreate" => {
-            if !chainlink_available() {
-                return Some(ToolResult::err("chainlink not found in /bin"));
-            }
-            let title = extract_string_field(args_json, "title")?;
-            let description = extract_string_field(args_json, "description");
-            let priority = extract_string_field(args_json, "priority");
-            Some(chainlink::tool_chainlink_create(&title, description.as_deref(), priority.as_deref()))
-        }
-        "ChainlinkList" => {
-            if !chainlink_available() {
-                return Some(ToolResult::err("chainlink not found in /bin"));
-            }
-            let status = extract_string_field(args_json, "status");
-            Some(chainlink::tool_chainlink_list(status.as_deref()))
-        }
-        "ChainlinkShow" => {
-            if !chainlink_available() {
-                return Some(ToolResult::err("chainlink not found in /bin"));
-            }
-            let id = extract_number_field(args_json, "id")?;
-            Some(chainlink::tool_chainlink_show(id))
-        }
-        "ChainlinkClose" => {
-            if !chainlink_available() {
-                return Some(ToolResult::err("chainlink not found in /bin"));
-            }
-            let id = extract_number_field(args_json, "id")?;
-            Some(chainlink::tool_chainlink_close(id))
-        }
-        "ChainlinkReopen" => {
-            if !chainlink_available() {
-                return Some(ToolResult::err("chainlink not found in /bin"));
-            }
-            let id = extract_number_field(args_json, "id")?;
-            Some(chainlink::tool_chainlink_reopen(id))
-        }
-        "ChainlinkComment" => {
-            if !chainlink_available() {
-                return Some(ToolResult::err("chainlink not found in /bin"));
-            }
-            let id = extract_number_field(args_json, "id")?;
-            let text = extract_string_field(args_json, "text")?;
-            Some(chainlink::tool_chainlink_comment(id, &text))
-        }
-        "ChainlinkLabel" => {
-            if !chainlink_available() {
-                return Some(ToolResult::err("chainlink not found in /bin"));
-            }
-            let id = extract_number_field(args_json, "id")?;
-            let label = extract_string_field(args_json, "label")?;
-            Some(chainlink::tool_chainlink_label(id, &label))
         }
         _ => None,
     }

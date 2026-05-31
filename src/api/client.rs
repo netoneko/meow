@@ -9,9 +9,8 @@ use crate::util::StackBuffer;
 use core::fmt::Write;
 use crate::ui::tui::layout::Stdout;
 
-use crate::config::{Provider, ApiType, OPENAI_TOOLS_JSON, OPENAI_CHAINLINK_TOOLS_JSON};
+use crate::config::{Provider, ApiType, OPENAI_TOOLS_JSON};
 use crate::tui_app;
-use crate::tools::chainlink_available;
 use super::types::{StreamResponse, StreamStats, ToolCallData};
 
 const MAX_RETRIES: u32 = 10;
@@ -202,16 +201,6 @@ fn send_post_request(stream: &TcpStream, path: &str, body: &str, provider: &Prov
     stream.write_all(request.as_bytes()).map_err(|_| "Failed to send request")
 }
 
-fn build_openai_tools_json(include_chainlink: bool) -> String {
-    if include_chainlink {
-        let core = &OPENAI_TOOLS_JSON[..OPENAI_TOOLS_JSON.len() - 1]; // strip trailing ]
-        let chainlink = &OPENAI_CHAINLINK_TOOLS_JSON[1..];              // strip leading [
-        format!("{},{}", core, chainlink)
-    } else {
-        String::from(OPENAI_TOOLS_JSON)
-    }
-}
-
 fn build_chat_request(model: &str, provider: &Provider, history_json: &str) -> (String, String) {
     match provider.api_type {
         ApiType::Ollama => {
@@ -222,10 +211,9 @@ fn build_chat_request(model: &str, provider: &Provider, history_json: &str) -> (
             (String::from("/api/chat"), body)
         }
         ApiType::OpenAI => {
-            let tools_json = build_openai_tools_json(chainlink_available());
             let body = format!(
                 "{{\"model\":\"{}\",\"messages\":{},\"stream\":true,\"max_tokens\":{},\"tools\":{},\"tool_choice\":\"auto\"}}",
-                model, history_json, DEFAULT_MAX_TOKENS, tools_json
+                model, history_json, DEFAULT_MAX_TOKENS, OPENAI_TOOLS_JSON
             );
             let base = provider.base_path();
             let path = if base.is_empty() || base == "/" {

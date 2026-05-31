@@ -135,9 +135,6 @@ pub extern "C" fn main() {
 
     if !current_provider.uses_structured_tools() {
         system_prompt.push_str(COMMON_TOOLS);
-        if tools::chainlink_available() {
-            system_prompt.push_str(tools::chainlink::CHAINLINK_TOOLS_SECTION);
-        }
     }
 
     if use_tui || one_shot_message.is_none() {
