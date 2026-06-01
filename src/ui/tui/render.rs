@@ -43,6 +43,15 @@ pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&
             }
         }
     }
+    // In non-TUI mode, just print directly without cursor positioning
+    if !crate::tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+        if s.is_empty() && prefix.is_empty() { return; }
+        if let Some(c) = color { akuma_write(fd::STDOUT, c.as_bytes()); }
+        if !prefix.is_empty() { akuma_write(fd::STDOUT, prefix.as_bytes()); }
+        if !s.is_empty() { akuma_write(fd::STDOUT, s.as_bytes()); }
+        if color.is_some() { akuma_write(fd::STDOUT, COLOR_RESET.as_bytes()); }
+        return;
+    }
     if s.is_empty() && prefix.is_empty() { return; }
     let w = TERM_WIDTH.load(Ordering::SeqCst);
     let h = TERM_HEIGHT.load(Ordering::SeqCst);
@@ -190,7 +199,7 @@ pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
 
     let mut prompt_prefix_buf_data = [0u8; 128]; // Choose a size that's large enough
     let mut prompt_prefix_buf = StackBuffer::new(&mut prompt_prefix_buf_data);
-    let _ = write!(prompt_prefix_buf, "  {}[{}/{}|{}{}{}] {}(=^･ω･^=) > ", COLOR_YELLOW, t_disp, l_disp, m_disp, hist_disp, COLOR_YELLOW, q_disp);
+    let _ = write!(prompt_prefix_buf, "  {}[{}/{}|{}{}{}]{} > ", COLOR_YELLOW, t_disp, l_disp, m_disp, hist_disp, COLOR_YELLOW, q_disp);
     let prompt_prefix = prompt_prefix_buf.as_str();
     let p_len = input::visual_length(&prompt_prefix);
     INPUT_LEN.store(p_len as u16, Ordering::SeqCst);
@@ -247,9 +256,9 @@ pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
                 None 
             };
 
-            if let Some(ms) = ms { 
-                if ms < 1000 { let _ = write!(stdout, "~(=^‥^)ノ [{}ms]", ms); } 
-                else { let _ = write!(stdout, "~(=^‥^)ノ [{}.{}s]", ms / 1000, (ms % 1000) / 100); }
+            if let Some(ms) = ms {
+                if ms < 1000 { let _ = write!(stdout, "[{}ms]", ms); }
+                else { let _ = write!(stdout, "[{}.{}s]", ms / 1000, (ms % 1000) / 100); }
             }
             let _ = write!(stdout, "{}", COLOR_RESET);
         }
@@ -292,5 +301,5 @@ pub fn print_greeting() {
     use core::fmt::Write;
     let _ = write!(stdout, "\n{}\x1b[38;5;236m", COLOR_RESET);
     let _ = write!(stdout, "{}", CAT_ASCII);
-    let _ = write!(stdout, "{}\n  {}MEOW!{} ~(=^‥^)ノ\n\n", COLOR_RESET, COLOR_BOLD, COLOR_RESET);
+    let _ = write!(stdout, "{}\n  {}meow{}\n\n", COLOR_RESET, COLOR_BOLD, COLOR_RESET);
 }

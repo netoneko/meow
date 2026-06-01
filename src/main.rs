@@ -39,8 +39,8 @@ pub extern "C" fn main() {
             if first_arg == "init" {
                 exit(run_init(&mut app_config));
             }
-            if first_arg == "test_stream" {
-                exit(crate::ui::tui::stream::run_tests());
+            if first_arg == "test" || first_arg == "test_stream" {
+                exit(run_all_tests());
             }
         }
     }
@@ -71,12 +71,24 @@ pub extern "C" fn main() {
                     libakuma::print("meow: -P requires a personality name\n");
                     exit(1);
                 }
+            } else if arg_str == "-c" || arg_str == "--command" {
+                i += 1;
+                if let Some(msg) = arg(i) {
+                    one_shot_message = Some(String::from(msg));
+                    use_tui = false;
+                } else {
+                    libakuma::print("meow: -c requires a message\n");
+                    exit(1);
+                }
             } else if arg_str == "--tui" {
                 use_tui = true;
+            } else if arg_str == "--no-tui" {
+                use_tui = false;
             } else if arg_str == "-h" || arg_str == "--help" {
                 print_usage();
                 exit(0);
             } else if !arg_str.starts_with('-') {
+                // Positional argument: non-interactive message (legacy form)
                 one_shot_message = Some(String::from(arg_str));
                 use_tui = false;
             }
@@ -267,14 +279,27 @@ fn load_local_prompt() -> Option<String> {
 
 fn print_usage() {
     libakuma::print(
-        "  /\\_/\\\n ( o.o )  ～ MEOW-CHAN PROTOCOL ～\n  > ^ <   Cyberpunk Neko AI Assistant\n\nUsage: meow [OPTIONS] [MESSAGE]\n       meow init              # Configure providers\n\nOptions:\n  -m, --model <NAME>      Neural link override\n  -p, --provider <NAME>   Use specific provider\n  -P, --personality <NAM> Switch persona (Meow, Jaffar, Rosie)\n  --tui                   Interactive TUI (default)\n  -h, --help              Display this transmission\n\nInteractive Commands:\n  /clear              Wipe memory banks nya~\n  /model [NAME]       Check/switch/list neural links\n  /provider [NAME]    Check/switch providers\n  /personality [NAME] Check/switch personality\n  /tokens             Show current token usage\n  /help               Command protocol\n  /quit               Jack out\n",
+        "meow - AI assistant\n\nUsage:\n  meow                        Interactive TUI mode (default)\n  meow -c \"message\"           Non-interactive: send message and exit\n  meow init                   Configure providers\n  meow test                   Run built-in tests\n\nOptions:\n  -c, --command <MSG>     Non-interactive: send MSG and print response to stdout\n  -m, --model <NAME>      Override the active model\n  -p, --provider <NAME>   Override the active provider\n  -P, --personality <NAM> Switch persona (Meow, Jaffar, Rosie)\n  --tui                   Force interactive TUI mode\n  --no-tui                Force non-interactive mode (no repainting)\n  -h, --help              Show this help\n\nNon-interactive mode (-c) prints streaming output directly to stdout with\nANSI color codes but without cursor repositioning or the 3-pane layout.\nSuitable for scripting, pipes, and low-memory environments.\n\nInteractive Commands (TUI mode):\n  /clear              Wipe memory banks\n  /model [NAME]       Check/switch/list models\n  /provider [NAME]    Check/switch providers\n  /personality [NAME] Check/switch personality\n  /tokens             Show current token usage\n  /help               Command list\n  /quit               Quit\n",
     );
 }
 
+fn run_all_tests() -> i32 {
+    libakuma::print("=== Meow Test Suite ===\n");
+    let mut failures = 0i32;
+    failures += app::history::run_tests();
+    failures += Config::run_tests();
+    failures += app::chat::run_tests();
+    failures += crate::ui::tui::stream::run_tests();
+    if failures == 0 {
+        libakuma::print("=== All tests passed ===\n");
+    } else {
+        libakuma::print(&format!("=== {} test suite(s) failed ===\n", failures));
+    }
+    if failures == 0 { 0 } else { 1 }
+}
+
 fn run_init(config: &mut Config) -> i32 {
-    libakuma::print(
-        "\n  /\\_/\\  ╔══════════════════════════════════════╗\n ( o.o ) ║  M E O W - C H A N   I N I T         ║\n  > ^ <  ║  ～ Provider Configuration ～        ║\n /|   |\\ ╚══════════════════════════════════════╝\n\n～ Current providers: ～\n",
-    );
+    libakuma::print("meow init - Provider Configuration\n\nCurrent providers:\n");
 
     // Try to create the config file if it's missing
     let fd = libakuma::open("/etc/meow/config", libakuma::open_flags::O_RDONLY);
@@ -305,7 +330,7 @@ fn run_init(config: &mut Config) -> i32 {
         }
     }
     libakuma::print(&format!(
-        "\n  Current model: {}\n  Current personality: {}\n  Config file: /etc/meow/config\n\n～ To add a provider, edit /etc/meow/config manually ～\n   Format:\n   [provider:name]\n   base_url=http://host:port\n   api_type=ollama|openai\n   api_key=your-key-here (optional)\n\n",
+        "\n  Current model: {}\n  Current personality: {}\n  Config file: /etc/meow/config\n\nTo add a provider, edit /etc/meow/config:\n   [provider:name]\n   base_url=http://host:port\n   api_key=your-key-here (optional)\n\n",
         config.current_model, config.current_personality
     ));
     0

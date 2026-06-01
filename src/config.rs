@@ -342,7 +342,7 @@ impl Config {
     }
 
     /// Parse config from string content
-    fn parse(content: &str) -> Self {
+    pub(crate) fn parse(content: &str) -> Self {
         let mut config = Config {
             current_provider: String::from("ollama"),
             current_model: String::from("gemma3:27b"),
@@ -512,6 +512,65 @@ impl Config {
         } else {
             self.providers.push(provider);
         }
+    }
+
+    pub fn run_tests() -> i32 {
+        use alloc::format;
+        let mut passed = 0usize;
+        let mut total = 0usize;
+        libakuma::print("--- config tests ---\n");
+
+        // Basic key=value parsing
+        total += 1;
+        {
+            let c = Config::parse("current_model=llama3\ncurrent_provider=ollama\n");
+            if c.current_model == "llama3" && c.current_provider == "ollama" { passed += 1; }
+            else { libakuma::print(&format!("  [!] basic parse: model={:?} provider={:?}\n", c.current_model, c.current_provider)); }
+        }
+
+        // Provider section
+        total += 1;
+        {
+            let c = Config::parse("[provider:myhost]\nbase_url=http://localhost:11434\n");
+            if c.providers.len() == 1 && c.providers[0].name == "myhost" && c.providers[0].base_url == "http://localhost:11434" { passed += 1; }
+            else { libakuma::print(&format!("  [!] provider parse: {:?} providers\n", c.providers.len())); }
+        }
+
+        // api_key
+        total += 1;
+        {
+            let c = Config::parse("[provider:openai]\nbase_url=https://api.openai.com\napi_key=sk-test123\n");
+            let key = c.providers.get(0).and_then(|p| p.api_key.as_deref());
+            if key == Some("sk-test123") { passed += 1; }
+            else { libakuma::print(&format!("  [!] api_key parse: {:?}\n", key)); }
+        }
+
+        // Boolean flags
+        total += 1;
+        {
+            let c = Config::parse("exit_on_escape=true\nrender_markdown=false\n");
+            if c.exit_on_escape && !c.render_markdown { passed += 1; }
+            else { libakuma::print(&format!("  [!] booleans: esc={} md={}\n", c.exit_on_escape, c.render_markdown)); }
+        }
+
+        // Comments and blank lines ignored
+        total += 1;
+        {
+            let c = Config::parse("# comment\ncurrent_model=testmodel\n\n# another comment\n");
+            if c.current_model == "testmodel" { passed += 1; }
+            else { libakuma::print(&format!("  [!] comments: model={:?}\n", c.current_model)); }
+        }
+
+        // Empty config gets default provider
+        total += 1;
+        {
+            let c = Config::parse("");
+            if !c.providers.is_empty() { passed += 1; }
+            else { libakuma::print("  [!] empty config: no default provider\n"); }
+        }
+
+        libakuma::print(&format!("  result: {}/{}\n", passed, total));
+        if passed == total { 0 } else { 1 }
     }
 
     /// Remove a provider by name

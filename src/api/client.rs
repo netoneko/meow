@@ -619,11 +619,11 @@ fn print_elapsed(ms: u64) {
     let mut buf_data = [0u8; 32];
     let mut buf = StackBuffer::new(&mut buf_data);
     let mut stdout = Stdout;
-    if ms < 1000 { 
-        let _ = write!(buf, "~(=^‥^)ノ [{}ms]", ms); 
+    if ms < 1000 {
+        let _ = write!(buf, "[{}ms]", ms);
         let _ = write!(stdout, "{}", buf.as_str());
-    } else { 
-        let _ = write!(buf, "~(=^‥^)ノ [{}.{}s]", ms / 1000, (ms % 1000) / 100); 
+    } else {
+        let _ = write!(buf, "[{}.{}s]", ms / 1000, (ms % 1000) / 100);
         let _ = write!(stdout, "{}", buf.as_str());
     }
 }

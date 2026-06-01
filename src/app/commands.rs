@@ -26,34 +26,32 @@ pub fn handle_command(
 
     match command {
         "/quit" | "/exit" | "/q" => {
-            (CommandResult::Quit, Some(String::from("～ Meow-chan is jacking out... Stay preem, choom! ฅ^•ﻌ•^ฅ ～")))
+            (CommandResult::Quit, Some(String::from("Goodbye.")))
         }
         "/clear" | "/reset" => {
             history.clear();
             history.push(Message::new("system", system_prompt));
-            (CommandResult::Continue, Some(String::from("～ *swishes tail* Memory wiped nya~! Fresh start! (=^・ω・^=)")))
+            (CommandResult::Continue, Some(String::from("History cleared.")))
         }
         "/model" => {
             match arg {
                 Some("?") | Some("list") => {
-                    let mut output = String::from("～ Available neural links: ～
-");
+                    let mut output = String::from("Available models:\n");
                     match api::list_models(provider) {
                         Ok(models) => {
                             if models.is_empty() {
-                                (CommandResult::Continue, Some(String::from("～ No models found nya...")))
+                                (CommandResult::Continue, Some(String::from("No models found.")))
                             } else {
                                 for (i, m) in models.iter().enumerate() {
                                     let current_marker = if m.name == *model { " (current)" } else { "" };
                                     let size_info = m._parameter_size.as_ref().map(|s| format!(" [{}]", s)).unwrap_or_default();
-                                    output.push_str(&format!("  {}. {}{}{}
-", i + 1, m.name, size_info, current_marker));
+                                    output.push_str(&format!("  {}. {}{}{}\n", i + 1, m.name, size_info, current_marker));
                                 }
                                 (CommandResult::Continue, Some(output))
                             }
                         }
                         Err(e) => {
-                            (CommandResult::Continue, Some(format!("～ Failed to fetch models: {:?}", e)))
+                            (CommandResult::Continue, Some(format!("Failed to fetch models: {:?}", e)))
                         }
                     }
                 }
@@ -62,23 +60,20 @@ pub fn handle_command(
                     config.current_model = String::from(new_model);
                     let _ = config.save();
                     tui_app::set_model_and_provider(model, &provider.name);
-                    (CommandResult::Continue, Some(format!("～ *ears twitch* Neural link reconfigured to: {} nya~!", new_model)))
+                    (CommandResult::Continue, Some(format!("Model set to: {}", new_model)))
                 }
                 None => {
-                    (CommandResult::Continue, Some(format!("～ Current neural link: {}
-  Tip: Use '/model list' to see available models nya~!", model)))
+                    (CommandResult::Continue, Some(format!("Current model: {}\n  Use '/model list' to see available models.", model)))
                 }
             }
         }
         "/provider" => {
             match arg {
                 Some("?") | Some("list") => {
-                    let mut output = String::from("～ Configured providers: ～
-");
+                    let mut output = String::from("Configured providers:\n");
                     for (i, p) in config.providers.iter().enumerate() {
                         let current_marker = if p.name == provider.name { " (current)" } else { "" };
-                        output.push_str(&format!("  {}. {} ({}){}
-", i + 1, p.name, p.base_url, current_marker));
+                        output.push_str(&format!("  {}. {} ({}){}\n", i + 1, p.name, p.base_url, current_marker));
                     }
                     (CommandResult::Continue, Some(output))
                 }
@@ -88,26 +83,24 @@ pub fn handle_command(
                         config.current_provider = String::from(prov_name);
                         let _ = config.save();
                         tui_app::set_model_and_provider(model, &provider.name);
-                        (CommandResult::Continue, Some(format!("～ *ears twitch* Switched to provider: {} nya~!", prov_name)))
+                        (CommandResult::Continue, Some(format!("Switched to provider: {}", prov_name)))
                     } else {
-                        (CommandResult::Continue, Some(format!("～ Unknown provider: {} ...Run 'meow init' to add it nya~", prov_name)))
+                        (CommandResult::Continue, Some(format!("Unknown provider: {}. Run 'meow init' to add it.", prov_name)))
                     }
                 }
                 None => {
-                    (CommandResult::Continue, Some(format!("～ Current provider: {} ({})
-  Tip: Use '/provider list' to see configured providers nya~!", provider.name, provider.base_url)))
+                    (CommandResult::Continue, Some(format!("Current provider: {} ({})\n  Use '/provider list' to see configured providers.", provider.name, provider.base_url)))
                 }
             }
         }
         "/tokens" => {
             let current = calculate_history_tokens(history);
-            (CommandResult::Continue, Some(format!("～ Current token usage: {} / {} 
-  Tip: Ask Meow to 'compact the context' when tokens are high nya~!", current, TOKEN_LIMIT_FOR_COMPACTION)))
+            (CommandResult::Continue, Some(format!("Current token usage: {} / {}\n  Ask the AI to 'compact the context' when tokens are high.", current, TOKEN_LIMIT_FOR_COMPACTION)))
         }
         "/personality" => {
             match arg {
                 Some("list") | Some("?") => {
-                    let mut output = String::from("～ Available personalities: ～\n");
+                    let mut output = String::from("Available personalities:\n");
                     for p in crate::config::PERSONALITIES {
                         let current_marker = if p.name == config.current_personality { " (current)" } else { "" };
                         output.push_str(&format!("  - {}{}\n", p.name, current_marker));
@@ -118,13 +111,13 @@ pub fn handle_command(
                     if crate::config::PERSONALITIES.iter().any(|p| p.name == new_p) {
                         config.current_personality = String::from(new_p);
                         let _ = config.save();
-                        (CommandResult::Continue, Some(format!("～ Personality set to {}. (Restart or /clear to apply fully) ～", new_p)))
+                        (CommandResult::Continue, Some(format!("Personality set to {}. (Use /clear to apply)", new_p)))
                     } else {
-                        (CommandResult::Continue, Some(format!("～ Unknown personality: {}. Use '/personality list' to see available ones. ～", new_p)))
+                        (CommandResult::Continue, Some(format!("Unknown personality: {}. Use '/personality list' to see available ones.", new_p)))
                     }
                 }
                 None => {
-                    (CommandResult::Continue, Some(format!("～ Current personality: {} ～", config.current_personality)))
+                    (CommandResult::Continue, Some(format!("Current personality: {}", config.current_personality)))
                 }
             }
         }
@@ -133,10 +126,10 @@ pub fn handle_command(
             crate::app::state::set_render_markdown(config.render_markdown);
             let _ = config.save();
             let status = if config.render_markdown { "enabled" } else { "disabled" };
-            (CommandResult::Continue, Some(format!("～ *tail swishes* Markdown rendering {} nya~!", status)))
+            (CommandResult::Continue, Some(format!("Markdown rendering {}", status)))
         }
         "/hotkeys" | "/shortcuts" => {
-            let output = String::from("# Meow's Input Shortcuts
+            let output = String::from("# Input Shortcuts
 
 * **Shift+Enter** / **Ctrl+J**: Insert newline
 * **Ctrl+A** / **Home**: Move to start of line
@@ -153,36 +146,39 @@ pub fn handle_command(
             (CommandResult::Continue, Some(output))
         }
         "/help" | "/?" => {
-            let output = String::from("# Meow's Command Protocol
+            let output = String::from("# Commands
 
-* `/clear`: Wipe memory banks nya~
-* `/model [NAME]`: Check/switch neural link
+* `/clear`: Clear history
+* `/model [NAME]`: Check/switch model
 * `/model list`: List available models
 * `/provider`: Check/switch provider
 * `/provider list`: List configured providers
 * `/personality [NAME]`: Check/switch personality
 * `/tokens`: Show current token usage
-* `/markdown`: Toggle Markdown rendering nya~
+* `/markdown`: Toggle Markdown rendering
 * `/hotkeys`: Show input shortcuts
-* `/test_stream`: Run internal renderer tests
-* `/quit`: Jack out of the matrix
+* `/test`: Run built-in tests
+* `/quit`: Quit
 * `/help`: This help screen
 
-**Context compaction**: When token count is high, ask Meow to compact the context to free up memory nya~!
+**Context compaction**: When token count is high, ask the AI to compact the context to free up memory.
 ");
             (CommandResult::Continue, Some(output))
         }
-        "/test_stream" => {
-            let res = crate::ui::tui::stream::run_tests();
+        "/test" | "/test_stream" => {
+            let res = crate::app::history::run_tests()
+                + crate::config::Config::run_tests()
+                + crate::app::chat::run_tests()
+                + crate::ui::tui::stream::run_tests();
             let msg = if res == 0 {
-                String::from("～ Renderer tests passed nya~! (=^・ω・^=)")
+                String::from("All tests passed.")
             } else {
-                String::from("～ Renderer tests failed nya... check console output (=｀ω´=)")
+                format!("{} test suite(s) failed. Check output above.", res)
             };
             (CommandResult::Continue, Some(msg))
         }
         _ => {
-            (CommandResult::Continue, Some(format!("～ Nyaa? Unknown command: {} ...Meow-chan is confused (=｀ω´=)", command)))
+            (CommandResult::Continue, Some(format!("Unknown command: {}. Type /help for a list.", command)))
         }
     }
 }

@@ -42,25 +42,16 @@ fn handle_output_overflow(full_output: String) -> ToolResult {
         let _ = write_fd(fd, full_output.as_bytes());
         close(fd);
         
-        let mut truncated = String::from("[!] Output truncated due to memory limits nya~!
-");
-        truncated.push_str(&format!("Full output saved to: {}
+        let mut truncated = String::from("[!] Output truncated due to memory limits.\n");
+        truncated.push_str(&format!("Full output saved to: {}\n\n", filename));
+        truncated.push_str("Preview:\n---\n");
 
-", filename));
-        truncated.push_str("Preview:
----
-");
-        
         let preview_len = core::cmp::min(full_output.len(), 4096);
         truncated.push_str(&full_output[..preview_len]);
         if full_output.len() > preview_len {
-            truncated.push_str("
-...");
+            truncated.push_str("\n...");
         }
-        truncated.push_str("
----
-
-Note: You can use `FileReadLines` to read specific parts of the saved output or `CodeSearch` for targeted investigation nya~!");
+        truncated.push_str("\n---\n\nNote: You can use `FileReadLines` to read specific parts of the saved output or `CodeSearch` for targeted investigation.");
         
         ToolResult {
             success: true,

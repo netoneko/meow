@@ -205,6 +205,72 @@ fn json_escape_to(s: &str, out: &mut String) {
     }
 }
 
+pub fn run_tests() -> i32 {
+    use alloc::format;
+    let mut passed = 0usize;
+    let mut total = 0usize;
+    libakuma::print("--- chat tests ---\n");
+
+    // extract_json_string: basic
+    total += 1;
+    {
+        let got = extract_json_string("{\"summary\":\"hello world\"}", "summary");
+        if got.as_deref() == Some("hello world") { passed += 1; }
+        else { libakuma::print(&format!("  [!] extract_json_string basic: {:?}\n", got)); }
+    }
+
+    // extract_json_string: with escape sequences
+    total += 1;
+    {
+        let got = extract_json_string("{\"summary\":\"line1\\nline2\"}", "summary");
+        if got.as_deref() == Some("line1\nline2") { passed += 1; }
+        else { libakuma::print(&format!("  [!] extract_json_string escape: {:?}\n", got)); }
+    }
+
+    // extract_json_string: missing key returns None
+    total += 1;
+    {
+        let got = extract_json_string("{\"other\":\"value\"}", "summary");
+        if got.is_none() { passed += 1; }
+        else { libakuma::print(&format!("  [!] extract_json_string missing: got {:?}\n", got)); }
+    }
+
+    // json_escape_to: basic special chars
+    total += 1;
+    {
+        let mut out = String::new();
+        json_escape_to("a\nb\tc\"d\\e", &mut out);
+        let want = "a\\nb\\tc\\\"d\\\\e";
+        if out == want { passed += 1; }
+        else { libakuma::print(&format!("  [!] json_escape_to: got {:?} want {:?}\n", out, want)); }
+    }
+
+    // json_escape_to: no-op for clean ASCII
+    total += 1;
+    {
+        let mut out = String::new();
+        json_escape_to("hello world", &mut out);
+        if out == "hello world" { passed += 1; }
+        else { libakuma::print(&format!("  [!] json_escape_to clean: {:?}\n", out)); }
+    }
+
+    // serialize_tool_calls: single call
+    total += 1;
+    {
+        let calls = alloc::vec![crate::api::ToolCallData {
+            id: String::from("call1"),
+            name: String::from("Shell"),
+            arguments: String::from("{\"cmd\":\"ls\"}"),
+        }];
+        let json = serialize_tool_calls(&calls);
+        if json.contains("\"id\":\"call1\"") && json.contains("\"name\":\"Shell\"") { passed += 1; }
+        else { libakuma::print(&format!("  [!] serialize_tool_calls: {:?}\n", json)); }
+    }
+
+    libakuma::print(&format!("  result: {}/{}\n", passed, total));
+    if passed == total { 0 } else { 1 }
+}
+
 fn print_msg(color: &str, s: &str) {
     if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
         crate::tui_app::tui_print_with_indent(s, "", 9, Some(color));

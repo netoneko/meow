@@ -77,6 +77,69 @@ pub fn calculate_history_tokens(history: &[Message]) -> usize {
         .sum()
 }
 
+pub fn run_tests() -> i32 {
+    use alloc::format;
+    let mut passed = 0usize;
+    let mut total = 0usize;
+    libakuma::print("--- history tests ---\n");
+
+    // estimate_tokens
+    let token_cases: &[(&str, usize)] = &[
+        ("", 0), ("abcd", 1), ("abcde", 2), ("hello world!", 3),
+    ];
+    for (input, expected) in token_cases {
+        total += 1;
+        let got = estimate_tokens(input);
+        if got == *expected { passed += 1; }
+        else { libakuma::print(&format!("  [!] estimate_tokens({:?}): got {} want {}\n", input, got, expected)); }
+    }
+
+    // trim_history: keeps system + up to MAX_HISTORY_SIZE
+    total += 1;
+    {
+        let mut h: Vec<Message> = Vec::new();
+        h.push(Message::new("system", "sys"));
+        for i in 0..20 { h.push(Message::new("user", &format!("msg{}", i))); }
+        trim_history(&mut h);
+        if h.len() <= MAX_HISTORY_SIZE + 1 { passed += 1; }
+        else { libakuma::print(&format!("  [!] trim_history len {} > {}\n", h.len(), MAX_HISTORY_SIZE + 1)); }
+    }
+
+    // write_json basic
+    total += 1;
+    {
+        let msg = Message::new("user", "hello");
+        let mut out = String::new();
+        msg.write_json(&mut out);
+        let want = "{\"role\":\"user\",\"content\":\"hello\"}";
+        if out == want { passed += 1; }
+        else { libakuma::print(&format!("  [!] write_json: got {:?}\n", out)); }
+    }
+
+    // write_json with escape sequences
+    total += 1;
+    {
+        let msg = Message::new("assistant", "line1\nline2\ttab\"quote");
+        let mut out = String::new();
+        msg.write_json(&mut out);
+        let want = "{\"role\":\"assistant\",\"content\":\"line1\\nline2\\ttab\\\"quote\"}";
+        if out == want { passed += 1; }
+        else { libakuma::print(&format!("  [!] write_json escape: got {:?}\n", out)); }
+    }
+
+    // calculate_history_tokens returns > 0 for non-empty history
+    total += 1;
+    {
+        let h = alloc::vec![Message::new("user", "hello world")];
+        let tokens = calculate_history_tokens(&h);
+        if tokens > 0 { passed += 1; }
+        else { libakuma::print("  [!] calculate_history_tokens returned 0\n"); }
+    }
+
+    libakuma::print(&format!("  result: {}/{}\n", passed, total));
+    if passed == total { 0 } else { 1 }
+}
+
 fn json_escape_to(s: &str, out: &mut String) {
     for c in s.chars() {
         match c {
