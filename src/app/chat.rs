@@ -4,6 +4,7 @@ use alloc::format;
 use core::sync::atomic::Ordering;
 
 use crate::config::{Provider, DEFAULT_CONTEXT_WINDOW, COLOR_PEARL, COLOR_GREEN_LIGHT, COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, TOKEN_LIMIT_FOR_COMPACTION};
+use crate::util::json_escape_to;
 use crate::api::{self, StreamResponse, ToolCallData};
 use crate::tools;
 use crate::tui_app;
@@ -183,22 +184,6 @@ fn serialize_tool_calls(tool_calls: &[ToolCallData]) -> String {
     }
     s.push(']');
     s
-}
-
-fn json_escape_to(s: &str, out: &mut String) {
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            _ => out.push(c),
-        }
-    }
 }
 
 pub fn run_tests() -> i32 {

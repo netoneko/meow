@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::format;
+use crate::util::json_escape_to;
 
 #[derive(Clone)]
 pub struct Message {
@@ -140,19 +140,3 @@ pub fn run_tests() -> i32 {
     if passed == total { 0 } else { 1 }
 }
 
-fn json_escape_to(s: &str, out: &mut String) {
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                let code = c as u32;
-                out.push_str(&format!("\\u{:04x}", code));
-            }
-            _ => out.push(c),
-        }
-    }
-}

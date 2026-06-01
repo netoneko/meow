@@ -1,4 +1,20 @@
+use alloc::string::String;
+use alloc::format;
 use core::fmt::{self, Write};
+
+pub fn json_escape_to(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '"'  => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            _    => out.push(c),
+        }
+    }
+}
 
 pub struct StackBuffer<'a> {
     buffer: &'a mut [u8],

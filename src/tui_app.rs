@@ -163,29 +163,37 @@ fn handle_input_event(event: InputEvent, input: &mut String, redraw: &mut bool, 
     }
 }
 
+/// Drain the raw input queue, dispatching events. Returns `(redraw, quit)`.
+fn drain_queue(exit_on_escape: bool, break_on_enter: bool) -> (bool, bool) {
+    let q = input::get_raw_input_queue();
+    let mut inp = state::get_global_input();
+    let (mut redraw, mut quit) = (false, false);
+    while !q.is_empty() {
+        let mut t_b = [0u8; 16]; let n_c = q.len().min(16);
+        for i in 0..n_c { t_b[i] = q[i]; }
+        let (event, n) = input::parse_input(&t_b[..n_c]);
+        if n == 0 { break; }
+        for _ in 0..n { q.pop_front(); }
+        handle_input_event(event, &mut inp, &mut redraw, &mut quit, exit_on_escape);
+        if break_on_enter && event == InputEvent::Enter { break; }
+    }
+    if redraw { state::set_global_input(inp); }
+    (redraw, quit)
+}
+
 pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize) {
     if !TUI_ACTIVE.load(Ordering::SeqCst) { return; }
     let mut e_b = [0u8; 16];
     let b_r = poll_input_event(0, &mut e_b);
     let q = input::get_raw_input_queue();
     if b_r > 0 { for &b in e_b.iter().take(b_r as usize) { q.push_back(b); } input::update_last_input_time(); }
-    
+
     if q.is_empty() {
         if state::STREAMING.load(Ordering::SeqCst) { render::render_footer(current_tokens, token_limit, mem_kb); }
         return;
     }
 
-    let mut input = state::get_global_input();
-    let (mut redraw, mut quit) = (false, false);
-    while !q.is_empty() {
-        let mut t_b = [0u8; 16]; let n_c = core::cmp::min(q.len(), 16);
-        for i in 0..n_c { t_b[i] = q[i]; }
-        let (event, n) = input::parse_input(&t_b[..n_c]);
-        if n == 0 { break; }
-        for _ in 0..n { q.pop_front(); }
-        handle_input_event(event, &mut input, &mut redraw, &mut quit, false);
-    }
-    if redraw { state::set_global_input(input); }
+    let (redraw, _) = drain_queue(false, false);
     if redraw || state::STREAMING.load(Ordering::SeqCst) { render::render_footer(current_tokens, token_limit, mem_kb); }
 }
 
@@ -248,19 +256,8 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
         if b_r > 0 { for &b in e_b.iter().take(b_r as usize) { q.push_back(b); } input::update_last_input_time(); }
 
         if !q.is_empty() {
-            let mut inp = state::get_global_input();
-            let (mut q_l, mut red) = (false, false);
-            while !q.is_empty() {
-                let mut t_b = [0u8; 16]; let n_c = core::cmp::min(q.len(), 16);
-                for i in 0..n_c { t_b[i] = q[i]; }
-                let (ev, n) = input::parse_input(&t_b[..n_c]);
-                if n == 0 { break; }
-                for _ in 0..n { q.pop_front(); }
-                handle_input_event(ev, &mut inp, &mut red, &mut q_l, config.exit_on_escape);
-                if ev == InputEvent::Enter { break; }
-            }
-            if red { state::set_global_input(inp); }
-            if q_l { break; }
+            let (_, quit) = drain_queue(config.exit_on_escape, true);
+            if quit { break; }
         }
 
         if let Some(u_i) = state::pop_message() {
