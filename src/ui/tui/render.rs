@@ -106,7 +106,7 @@ pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&
     while let Some(c) = chars.next() {
         if in_esc {
             esc_buf.push(c);
-            if c != '[' && c >= '@' && c <= '~' {
+            if c != '[' && ('@'..='~').contains(&c) {
                 for ec in esc_buf.iter() {
                     let mut buf = [0u8; 4];
                     akuma_write(fd::STDOUT, ec.encode_utf8(&mut buf).as_bytes());
@@ -201,7 +201,7 @@ pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
     let mut prompt_prefix_buf = StackBuffer::new(&mut prompt_prefix_buf_data);
     let _ = write!(prompt_prefix_buf, "  {}[{}/{}|{}{}{}]{} > ", COLOR_YELLOW, t_disp, l_disp, m_disp, hist_disp, COLOR_YELLOW, q_disp);
     let prompt_prefix = prompt_prefix_buf.as_str();
-    let p_len = input::visual_length(&prompt_prefix);
+    let p_len = input::visual_length(prompt_prefix);
     INPUT_LEN.store(p_len as u16, Ordering::SeqCst);
     layout.input_prefix_len = p_len as u16;
 

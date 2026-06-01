@@ -7,12 +7,11 @@ use crate::tui_app::CUR_COL;
 
 pub struct MarkdownRenderer {
     indent: u16,
-    base_style: Option<&'static str>, // Store base style
 }
 
 impl MarkdownRenderer {
-    pub fn new(indent: u16, _prefix: &str, base_style: Option<&'static str>) -> Self {
-        Self { indent, base_style }
+    pub fn new(indent: u16, _prefix: &str, _base_style: Option<&'static str>) -> Self {
+        Self { indent }
     }
 
     pub fn render(&self, markdown: &str) {
@@ -22,10 +21,10 @@ impl MarkdownRenderer {
             let trimmed = line.trim();
             
             // Handle Code Blocks
-            if trimmed.starts_with("```") {
+            if let Some(after_fence) = trimmed.strip_prefix("```") {
                 if !in_code_block {
                     // Entering code block
-                    let lang = &trimmed[3..].trim();
+                    let lang = &after_fence.trim();
                     let style = format!("{}{}", BG_CODE, COLOR_YELLOW);
                     tui_print_with_indent("  ", "", 0, Some(BG_CODE));
                     if !lang.is_empty() {

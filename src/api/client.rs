@@ -120,7 +120,7 @@ pub fn send_with_retry(
                 headers.bearer_auth(key);
             }
             
-            if let Err(_) = http_stream.post(&host, &path, &request_body, &headers) {
+            if http_stream.post(&host, &path, &request_body, &headers).is_err() {
                 if attempt == MAX_RETRIES - 1 {
                     if !is_tui { libakuma::print("] "); }
                     return Err("Failed to send request");
@@ -272,7 +272,7 @@ fn read_streaming_with_http_stream_tls(
                             if done {
                                 if is_tui { tui_app::finish_streaming(); }
                                 tui_app::clear_streaming_status();
-                                let stats = StreamStats { ttft_us, stream_us: libakuma::uptime() - stream_start_us, total_bytes: full_response.len(), fakes: 0 };
+                                let stats = StreamStats { ttft_us, stream_us: libakuma::uptime() - stream_start_us, total_bytes: full_response.len() };
                                 if !pending_tool_calls.is_empty() {
                                     return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
                                 }
@@ -331,7 +331,7 @@ fn read_streaming_with_http_stream_tls(
             }
         }
     }
-    let stats = StreamStats { ttft_us, stream_us: if first_token_received { libakuma::uptime() - stream_start_us } else { 0 }, total_bytes: full_response.len(), fakes: 0 };
+    let stats = StreamStats { ttft_us, stream_us: if first_token_received { libakuma::uptime() - stream_start_us } else { 0 }, total_bytes: full_response.len() };
     if !pending_tool_calls.is_empty() {
         if is_tui { tui_app::finish_streaming(); }
         tui_app::clear_streaming_status();
@@ -465,7 +465,7 @@ fn read_streaming_response_with_progress(
                     }
                     if let Some(pos) = last_newline { pending_data.drain(..pos + 1); }
                     if is_done {
-                        let stats = StreamStats { ttft_us, stream_us: libakuma::uptime() - stream_start_us, total_bytes: full_response.len(), fakes: 0 };
+                        let stats = StreamStats { ttft_us, stream_us: libakuma::uptime() - stream_start_us, total_bytes: full_response.len() };
                         if !pending_tool_calls.is_empty() {
                             return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
                         }
@@ -479,7 +479,7 @@ fn read_streaming_response_with_progress(
                         crate::ui::tui::render::render_footer(current_tokens, token_limit, mem_kb);
                     }
                     read_attempts += 1;
-                    if read_attempts % 50 == 0 && !first_token_received && !is_tui { libakuma::print("."); dots_printed += 1; }
+                    if read_attempts.is_multiple_of(50) && !first_token_received && !is_tui { libakuma::print("."); dots_printed += 1; }
                     if read_attempts > 6000 { return Err("Timeout waiting for response"); }
                     libakuma::sleep_ms(1);
                     continue;
@@ -488,7 +488,7 @@ fn read_streaming_response_with_progress(
             }
         }
     }
-    let stats = StreamStats { ttft_us, stream_us: if first_token_received { libakuma::uptime() - stream_start_us } else { 0 }, total_bytes: full_response.len(), fakes: 0 };
+    let stats = StreamStats { ttft_us, stream_us: if first_token_received { libakuma::uptime() - stream_start_us } else { 0 }, total_bytes: full_response.len() };
     if !pending_tool_calls.is_empty() {
         full_response.shrink_to_fit();
         return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));

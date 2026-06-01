@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::format;
-use crate::config::{COLOR_MEOW, COLOR_RESET};
+use crate::config::COLOR_MEOW;
 use super::render::tui_print_with_indent;
 
 pub enum StreamState {
@@ -207,7 +207,7 @@ fn extract_tool_info(json: &str) -> Option<(String, String)> {
             args.push_str(field);
             args.push_str("=\"");
             args.push_str(&val);
-            args.push_str("\"");
+            args.push('"');
         }
     }
     Some((tool, args))
@@ -310,7 +310,7 @@ pub fn run_tests() -> i32 {
 
         renderer.finalize();
 
-        let captured = unsafe { super::render::TEST_CAPTURE.take().unwrap_or_default() };
+        let captured = unsafe { (*core::ptr::addr_of_mut!(super::render::TEST_CAPTURE)).take().unwrap_or_default() };
 
         let filtered: alloc::vec::Vec<_> = captured.into_iter().filter(|s| !s.is_empty()).collect();
 

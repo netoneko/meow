@@ -22,8 +22,6 @@ pub fn chat_once(
     trim_history(history);
     history.push(Message::new("user", user_message));
 
-    let mut total_tools_called: usize = 0;
-
     for iteration in 0..MAX_TOOL_ITERATIONS {
         let current_tokens = calculate_history_tokens(history);
         let mem_kb = libakuma::memory_usage() / 1024;
@@ -68,8 +66,6 @@ pub fn chat_once(
                 history.push(asst_msg);
 
                 for tc in &tool_calls {
-                    total_tools_called += 1;
-
                     if tc.name == "CompactContext" {
                         let summary = extract_json_string(&tc.arguments, "summary").unwrap_or_default();
                         if summary.is_empty() {
@@ -309,15 +305,13 @@ fn format_duration(us: u64) -> String {
 }
 
 fn print_stats(stats: &api::StreamStats, full_response: &str) {
-    let tokens = (stats.total_bytes + 3) / 4;
+    let tokens = stats.total_bytes.div_ceil(4);
     let tps = if stats.stream_us > 0 { (tokens as f64) / (stats.stream_us as f64 / 1_000_000.0) } else { 0.0 };
     if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
         if full_response.ends_with('\n') { tui_app::tui_print_with_indent("\n", "", 0, None); }
         else { tui_app::tui_print_with_indent("\n\n", "", 0, None); }
-    } else {
-        if full_response.ends_with('\n') { libakuma::print("\n"); }
-        else { libakuma::print("\n\n"); }
-    }
+    } else if full_response.ends_with('\n') { libakuma::print("\n"); }
+    else { libakuma::print("\n\n"); }
     let stats_content = format!("First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}", stats.ttft_us / 1000, stats.stream_us / 1000, stats.total_bytes as f64 / 1024.0, tps);
     print_notification(COLOR_YELLOW, &stats_content, stats.ttft_us + stats.stream_us);
 }

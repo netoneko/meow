@@ -29,7 +29,6 @@ pub struct Personality {
     pub description: &'static str,
 
     pub ack_tui: &'static str,
-    pub ack_one_shot: &'static str,
     pub error_format: &'static str, // use "{}" placeholder
 }
 
@@ -162,21 +161,18 @@ pub const PERSONALITIES: &[Personality] = &[
         name: "Meow",
         description: MEOW_PERSONA,
         ack_tui: "Understood nya~! I'll use relative paths for file operations within the current directory. Ready to help! (=^・ω・^=)",
-        ack_one_shot: "Understood nya~!",
         error_format: "～ Nyaa~! {} (=ＴェＴ=) ～\n",
     },
     Personality {
         name: "Jaffar",
         description: JAFFAR_PERSONA,
         ack_tui: "Understood. I shall utilize relative paths for my machinations within this directory. The throne awaits!",
-        ack_one_shot: "Understood.",
         error_format: "Error: {}\n",
     },
     Personality {
         name: "Rosie",
         description: ROSIE_PERSONA,
         ack_tui: "Heh. Alright, kid. I’ll stick to relative paths. Don’t get cute with absolutes.",
-        ack_one_shot: "Yeah, yeah. I got it, kid.",
         error_format: "Heh. That didn’t go so hot, kid: {}\n",
     },
 ];
@@ -470,7 +466,7 @@ impl Config {
         content.push_str(if self.render_markdown { "true" } else { "false" });
         content.push('\n');
 
-        content.push_str("\n");
+        content.push('\n');
 
         // Providers
         for p in &self.providers {
@@ -540,7 +536,7 @@ impl Config {
         total += 1;
         {
             let c = Config::parse("[provider:openai]\nbase_url=https://api.openai.com\napi_key=sk-test123\n");
-            let key = c.providers.get(0).and_then(|p| p.api_key.as_deref());
+            let key = c.providers.first().and_then(|p| p.api_key.as_deref());
             if key == Some("sk-test123") { passed += 1; }
             else { libakuma::print(&format!("  [!] api_key parse: {:?}\n", key)); }
         }

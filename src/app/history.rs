@@ -46,7 +46,7 @@ impl Message {
     }
 }
 
-pub const MAX_HISTORY_SIZE: usize = 10;
+pub const MAX_HISTORY_SIZE: usize = 100;
 
 pub fn trim_history(history: &mut Vec<Message>) {
     if history.len() > MAX_HISTORY_SIZE {
@@ -64,7 +64,7 @@ pub fn compact_history(history: &mut Vec<Message>) {
 }
 
 pub fn estimate_tokens(text: &str) -> usize {
-    (text.len() + 3) / 4
+    text.len().div_ceil(4)
 }
 
 pub fn calculate_history_tokens(history: &[Message]) -> usize {

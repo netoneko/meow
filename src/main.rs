@@ -271,10 +271,7 @@ fn load_local_prompt() -> Option<String> {
         return None;
     }
 
-    match String::from_utf8(buf) {
-        Ok(s) => Some(s),
-        Err(_) => None,
-    }
+    String::from_utf8(buf).ok()
 }
 
 fn print_usage() {

@@ -168,9 +168,9 @@ fn search_file(
             let end = (idx + context_lines + 1).min(lines.len());
 
             let mut context = Vec::new();
-            for i in start..end {
+            for (i, line) in lines.iter().enumerate().skip(start).take(end - start) {
                 let prefix = if i == idx { ">" } else { " " };
-                context.push(format!("{} {:>4}: {}", prefix, i + 1, lines[i]));
+                context.push(format!("{} {:>4}: {}", prefix, i + 1, line));
             }
 
             matches.push(Match {

@@ -55,6 +55,7 @@ impl AtomicAppState {
         }
     }
 
+    #[allow(clippy::mut_from_ref)]
     fn get_mut(&self) -> &mut AppState {
         self.ensure_init();
         unsafe { (*self.state.get()).as_mut().unwrap() }
@@ -120,5 +121,4 @@ where
 pub fn get_last_history_kb() -> usize { with_state(|s| s.last_history_kb) }
 pub fn set_last_history_kb(kb: usize) { with_state(|s| s.last_history_kb = kb); }
 
-pub fn get_render_markdown() -> bool { with_state(|s| s.render_markdown) }
 pub fn set_render_markdown(val: bool) { with_state(|s| s.render_markdown = val); }

@@ -105,15 +105,13 @@ pub fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
                                             }
                                         }
                                     }
-                                } else {
-                                    if let Ok(keycode_str) = core::str::from_utf8(seq) {
-                                        if let Ok(keycode) = keycode_str.parse::<u32>() {
-                                            match keycode {
-                                                27 => return (InputEvent::Esc, len),
-                                                13 => return (InputEvent::Enter, len),
-                                                127 => return (InputEvent::Backspace, len),
-                                                _ => {}
-                                            }
+                                } else if let Ok(keycode_str) = core::str::from_utf8(seq) {
+                                    if let Ok(keycode) = keycode_str.parse::<u32>() {
+                                        match keycode {
+                                            27 => return (InputEvent::Esc, len),
+                                            13 => return (InputEvent::Enter, len),
+                                            127 => return (InputEvent::Backspace, len),
+                                            _ => {}
                                         }
                                     }
                                 }
@@ -146,7 +144,7 @@ pub fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
             if buf[1] == b'\r' || buf[1] == b'\n' { return (InputEvent::ShiftEnter, 2); }
             if buf[1] == b'b' { return (InputEvent::AltLeft, 2); }
             if buf[1] == b'f' { return (InputEvent::AltRight, 2); }
-            return (InputEvent::Esc, 1);
+            (InputEvent::Esc, 1)
         }
         0x01 => (InputEvent::CtrlA, 1),
         0x05 => (InputEvent::CtrlE, 1),
@@ -154,7 +152,7 @@ pub fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
         0x0C => (InputEvent::CtrlL, 1),
         0x15 => (InputEvent::CtrlU, 1),
         0x17 => (InputEvent::CtrlW, 1),
-        c if c >= 0x20 && c <= 0x7E => (InputEvent::Char(c as char), 1),
+        c if (0x20..=0x7E).contains(&c) => (InputEvent::Char(c as char), 1),
         _ => (InputEvent::Unknown, 1),
     }
 }
@@ -214,7 +212,7 @@ pub fn count_wrapped_lines(input: &str, prompt_width: usize, width: usize) -> us
 pub fn visual_length(s: &str) -> usize {
     let (mut len, mut in_esc) = (0, false);
     for c in s.chars() {
-        if in_esc { if c != '[' && c >= '@' && c <= '~' { in_esc = false; } continue; }
+        if in_esc { if c != '[' && ('@'..='~').contains(&c) { in_esc = false; } continue; }
         if c == '\x1b' { in_esc = true; continue; }
         len += 1;
     }

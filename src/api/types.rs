@@ -5,7 +5,6 @@ pub struct StreamStats {
     pub ttft_us: u64,
     pub stream_us: u64,
     pub total_bytes: usize,
-    pub fakes: usize,
 }
 
 pub struct ToolCallData {

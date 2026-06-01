@@ -133,20 +133,20 @@ fn handle_input_event(event: InputEvent, input: &mut String, redraw: &mut bool, 
         InputEvent::CtrlU => { input.clear(); CURSOR_IDX.store(0, Ordering::SeqCst); *redraw = true; }
         InputEvent::CtrlW | InputEvent::AltLeft => {
             let mut new_idx = idx;
-            while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b == b' ') { new_idx -= 1; }
+            while new_idx > 0 && input.as_bytes().get(new_idx-1).is_some_and(|&b| b == b' ') { new_idx -= 1; }
             if event == InputEvent::CtrlW {
-                while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b != b' ' && b != b'\n') { new_idx -= 1; }
+                while new_idx > 0 && input.as_bytes().get(new_idx-1).is_some_and(|&b| b != b' ' && b != b'\n') { new_idx -= 1; }
                 for _ in 0..(idx - new_idx) { if new_idx < input.len() { input.remove(new_idx); } }
             } else {
-                while new_idx > 0 && input.as_bytes().get(new_idx-1).map_or(false, |&b| b != b' ') { new_idx -= 1; }
+                while new_idx > 0 && input.as_bytes().get(new_idx-1).is_some_and(|&b| b != b' ') { new_idx -= 1; }
             }
             CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst); *redraw = true;
         }
         InputEvent::AltRight => {
             let mut new_idx = idx;
             let len = input.chars().count();
-            while new_idx < len && input.as_bytes().get(new_idx).map_or(false, |&b| b == b' ') { new_idx += 1; }
-            while new_idx < len && input.as_bytes().get(new_idx).map_or(false, |&b| b != b' ') { new_idx += 1; }
+            while new_idx < len && input.as_bytes().get(new_idx).is_some_and(|&b| b == b' ') { new_idx += 1; }
+            while new_idx < len && input.as_bytes().get(new_idx).is_some_and(|&b| b != b' ') { new_idx += 1; }
             CURSOR_IDX.store(new_idx as u16, Ordering::SeqCst); *redraw = true;
         }
         InputEvent::CtrlL => {
@@ -168,7 +168,7 @@ pub fn tui_handle_input(current_tokens: usize, token_limit: usize, mem_kb: usize
     let mut e_b = [0u8; 16];
     let b_r = poll_input_event(0, &mut e_b);
     let q = input::get_raw_input_queue();
-    if b_r > 0 { for i in 0..b_r as usize { q.push_back(e_b[i]); } input::update_last_input_time(); }
+    if b_r > 0 { for &b in e_b.iter().take(b_r as usize) { q.push_back(b); } input::update_last_input_time(); }
     
     if q.is_empty() {
         if state::STREAMING.load(Ordering::SeqCst) { render::render_footer(current_tokens, token_limit, mem_kb); }
@@ -245,7 +245,7 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
         let mut e_b = [0u8; 16];
         let b_r = poll_input_event(50, &mut e_b);
         let q = input::get_raw_input_queue();
-        if b_r > 0 { for i in 0..b_r as usize { q.push_back(e_b[i]); } input::update_last_input_time(); }
+        if b_r > 0 { for &b in e_b.iter().take(b_r as usize) { q.push_back(b); } input::update_last_input_time(); }
 
         if !q.is_empty() {
             let mut inp = state::get_global_input();
@@ -299,7 +299,7 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
                 let _ = app::chat::chat_once(model, provider, &u_i, history, Some(context_window), system_prompt);
                 state::STREAMING.store(false, Ordering::SeqCst); state::CANCELLED.store(false, Ordering::SeqCst);
                 layout.clear_status();
-                let _ = write!(stdout, "{}\n", COLOR_RESET);
+                let _ = writeln!(stdout, "{}", COLOR_RESET);
                 compact_history(history);
             }
         }

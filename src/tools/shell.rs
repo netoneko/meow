@@ -69,7 +69,7 @@ pub fn tool_shell(command: &str) -> ToolResult {
             }
             output.extend_from_slice(&buf[..n as usize]);
             waited_ms = 0; // Reset timeout if we're making progress
-        } else if n < 0 && (n as i64) == EAGAIN_ERRNO as i64 {
+        } else if n < 0 && n == EAGAIN_ERRNO as isize {
             // EAGAIN: no data available right now, but process not exited.
         }
 

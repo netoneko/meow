@@ -7,57 +7,8 @@ pub use client::send_with_retry;
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
-use libakuma::net::{TcpStream, resolve};
 use libakuma_tls::{https_get, HttpHeaders};
 use crate::config::Provider;
-
-/// Connect to a provider (HTTP only)
-fn connect(provider: &Provider) -> Result<TcpStream, ProviderError> {
-    let (host, port) = provider.host_port()
-        .ok_or_else(|| ProviderError::ConnectionFailed(String::from("Invalid URL")))?;
-
-    let ip = resolve(&host).map_err(|_| {
-        ProviderError::ConnectionFailed(format!("DNS resolution failed for: {}", host))
-    })?;
-
-    let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port);
-
-    TcpStream::connect(&addr_str).map_err(|_| {
-        ProviderError::ConnectionFailed(format!("Connection failed to: {}", addr_str))
-    })
-}
-
-fn read_response(stream: &TcpStream) -> Result<String, ProviderError> {
-    let mut response = Vec::new();
-    let mut buf = [0u8; 4096];
-    let start_time = libakuma::uptime();
-    let timeout_us = 5_000_000; // 5 seconds timeout for metadata queries
-
-    loop {
-        if libakuma::uptime() - start_time > timeout_us {
-            return Err(ProviderError::RequestFailed(String::from("Read timeout")));
-        }
-
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                response.extend_from_slice(&buf[..n]);
-                if response.len() > 256 * 1024 { break; }
-            }
-            Err(e) => {
-                if e.kind == libakuma::net::ErrorKind::WouldBlock
-                    || e.kind == libakuma::net::ErrorKind::TimedOut
-                {
-                    libakuma::sleep_ms(10);
-                    continue;
-                }
-                break;
-            }
-        }
-    }
-
-    Ok(String::from_utf8_lossy(&response).into_owned())
-}
 
 pub fn list_models(provider: &Provider) -> Result<Vec<ModelInfo>, ProviderError> {
     list_openai_models(provider)
@@ -102,7 +53,7 @@ fn parse_openai_models(json: &str) -> Result<Vec<ModelInfo>, ProviderError> {
     let mut escape_next = false;
     let mut obj_start = None;
 
-    for (i, c) in json.chars().enumerate() {
+    for (i, c) in json.char_indices() {
         if escape_next { escape_next = false; continue; }
         match c {
             '\\' if in_string => escape_next = true,
@@ -160,14 +111,4 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
     Some(result)
 }
 
-fn extract_json_number(json: &str, key: &str) -> Option<u64> {
-    let pattern = format!("\"{}\"", key);
-    let start = json.find(&pattern)?;
-    let after_key = &json[start + pattern.len()..];
-    let colon_pos = after_key.find(':')?;
-    let after_colon = &after_key[colon_pos + 1..];
-    let trimmed = after_colon.trim_start();
-    let end = trimmed.find(|c: char| !c.is_ascii_digit()).unwrap_or(trimmed.len());
-    trimmed[..end].parse().ok()
-}
 

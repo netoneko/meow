@@ -97,7 +97,7 @@ pub fn tool_http_fetch(url: &str) -> ToolResult {
             None => return ToolResult::err("Failed to parse HTTP response"),
         };
 
-        if status < 200 || status >= 300 {
+        if !(200..300).contains(&status) {
             return ToolResult::err(&format!("HTTP error: status {}", status));
         }
 
