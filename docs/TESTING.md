@@ -1,40 +1,59 @@
 # Testing
 
-## Set up the repo
+## Built-in unit tests
+
+Run from the command line:
 
 ```bash
-pkg install meow
+meow test
+```
+
+Or from within the TUI:
+
+```
+/test
+```
+
+This runs test suites for:
+- **history**: token estimation, trim logic, JSON serialization
+- **config**: config file parsing (providers, keys, booleans)
+- **chat**: JSON extraction helpers, escape handling, tool call serialization
+- **stream**: streaming renderer state machine (requires `ENABLE_TESTS=true` in `config.rs`)
+
+The stream renderer tests are disabled by default to save memory. Enable them by setting `ENABLE_TESTS = true` in `src/config.rs` before building.
+
+## Non-interactive prompt test
+
+```bash
+meow -c "read the file prompts/000.txt and execute the instructions"
+meow -m qwen3:8b -c "read prompts/001.txt and follow the instructions"
+```
+
+Non-interactive mode (`-c`) sends a single message, runs any tool calls autonomously, and exits. Output goes to stdout with color; no TUI repainting.
+
+## Integration testing
+
+```bash
+# Clone the repo inside the VM
 apk add git
 git clone https://github.com/netoneko/meow.git
-
-# switch to a new branch
 cd /meow
 git checkout -b experimental
+
+# Run a prompt against the cloned repo
+meow -c "read document in prompts/000.txt and execute the instructions"
 ```
 
-## Running a single non-interactive promt test
+## Prompt files
+
+`prompts/` contains test prompts. The AI reads these and executes the instructions, then you verify the output matches expectations.
+
+## Memory stress
+
+To test behavior under low memory, set `MEMORY=256` when launching QEMU:
 
 ```bash
-pkg install meow
-cd /meow 
-
-meow -m qwen3:8b "read document in prompts/000.txt and execute the instructions from the document"
-
-meow -m MFDoom/deepseek-r1-tool-calling:14b "read document in prompts/000.txt and execute the instructions from the document"
+MEMORY=256 cargo run --release
 ```
 
-## Integration with chainlink
-
-```bash
-chainlink create new-prompts -d "create 3 new prompts for yourself to test your capabilities, output them to prompts/002.txt prompts/003.txt and promts/004.txt"
-
-meow -m qwen3:8b "read document in prompts/001.txt and execute the instructions from the document"
-```
-
-Alternatively
-
-```bash
-meow -m qwen3:8b "you have access to chainlink issue tracker, can you list your tasks and read the first one that you need to accomplish"
-
-meow -m MFDoom/deepseek-r1-tool-calling:14b "you have access to chainlink issue tracker, can you list your tasks and read the first one that you need to accomplish"
-```
+Meow is designed to stay functional at 256MB; context compaction keeps history small enough to fit.

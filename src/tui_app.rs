@@ -306,8 +306,11 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
     }
 
     get_pane_layout().reset_scroll_region();
-    akuma_write(fd::STDOUT, b"\x1b[<u");
+    // Exit kitty keyboard enhancement, then exit alternate screen buffer.
+    // Alternate screen exit restores the previous terminal content automatically,
+    // so we must NOT clear_screen() after this.
+    akuma_write(fd::STDOUT, b"\x1b[<u\x1b[?1049l");
     set_terminal_attributes(fd::STDIN, 0, old_mode);
-    clear_screen(); set_cursor_position(0, 0); show_cursor();
+    show_cursor();
     Ok(())
 }

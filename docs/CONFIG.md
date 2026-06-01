@@ -1,185 +1,116 @@
-# Meow Configuration
+# meow Configuration
 
-Meow stores its configuration at `/etc/meow/config`. This file controls which AI providers are available and which model to use by default.
+Config file: `/etc/meow/config`
 
-## Configuration Format
+Uses a simple INI-style format — global key=value settings at the top, then `[provider:name]` sections.
 
-The config file uses a simple key-value format with sections for each provider.
-
-### Example Configuration
+## Example
 
 ```ini
 # Global settings
-current_provider=ollama
-current_model=gemma3:27b
+current_provider=groq
+current_model=llama-3.3-70b-versatile
+current_personality=Meow
+render_markdown=true
+exit_on_escape=false
 
-# Default Ollama provider (QEMU host gateway)
+# Local Ollama (QEMU host gateway)
 [provider:ollama]
 base_url=http://10.0.2.2:11434
-api_type=ollama
-
-# Alternative: Ollama on a different host
-[provider:ollama-remote]
-base_url=http://192.168.1.100:11434
-api_type=ollama
-
-# OpenAI (HTTPS supported)
-[provider:openai]
-base_url=https://api.openai.com
-api_type=openai
-api_key=sk-your-api-key-here
-
-# Groq API (HTTPS supported)
-[provider:groq]
-base_url=https://api.groq.com/openai/v1
-api_type=openai
-api_key=gsk_your-groq-key-here
-
-[provider:gemini-openai-compat]
-base_url=https://generativelanguage.googleapis.com/v1beta/openai/
-api_type=openai
-api_key=your-openai-compatible-api-key
-```
-
-
-## Configuration Options
-
-### Global Settings
-
-| Key | Description | Default |
-|-----|-------------|---------|
-| `current_provider` | Name of the active provider | `ollama` |
-| `current_model` | Model to use for chat | `gemma3:27b` |
-
-### Provider Section
-
-Each provider is defined in a `[provider:name]` section:
-
-| Key | Description | Required |
-|-----|-------------|----------|
-| `base_url` | HTTP or HTTPS URL of the provider API | Yes |
-| `api_type` | API format: `ollama` or `openai` | Yes |
-| `api_key` | API key for authentication | No (required for OpenAI) |
-
-## Provider Types
-
-### Ollama (`api_type=ollama`)
-
-- Uses Ollama's native API format
-- Endpoints: `/api/chat`, `/api/tags`, `/api/show`
-- No API key required for local instances
-- Default port: 11434
-
-### OpenAI (`api_type=openai`)
-
-- Uses OpenAI-compatible API format
-- Endpoints: `/v1/chat/completions`, `/v1/models`
-- Requires API key via `Authorization: Bearer` header
-- Works with OpenAI, Groq, Together.ai, and other compatible providers
-
-## HTTPS Support
-
-Meow fully supports HTTPS connections via TLS 1.3 (using libakuma-tls).
-
-Example configurations:
-
-```ini
-# OpenAI
-[provider:openai]
-base_url=https://api.openai.com
-api_type=openai
-api_key=sk-your-api-key-here
 
 # Groq
 [provider:groq]
 base_url=https://api.groq.com/openai/v1
-api_type=openai
 api_key=gsk_your-groq-key-here
 
-# Anthropic (via OpenAI-compatible proxy)
-[provider:anthropic]
-base_url=https://api.anthropic.com
-api_type=openai
-api_key=sk-ant-your-key-here
+# OpenAI
+[provider:openai]
+base_url=https://api.openai.com
+api_key=sk-your-api-key-here
+
+# Gemini (OpenAI-compatible)
+[provider:gemini]
+base_url=https://generativelanguage.googleapis.com/v1beta/openai/
+api_key=your-gemini-key-here
 ```
 
-Note: Certificate verification is not yet implemented (NoVerify mode, similar to `curl -k`).
+## Global Settings
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `current_provider` | Active provider name | `ollama` |
+| `current_model` | Model to use | `gemma3:27b` |
+| `current_personality` | Active personality (`Meow`, `Jaffar`, `Rosie`) | `Meow` |
+| `render_markdown` | Render Markdown in TUI | `true` |
+| `exit_on_escape` | Exit app on Escape key | `false` |
+
+## Provider Settings
+
+Each `[provider:name]` section accepts:
+
+| Key | Description | Required |
+|-----|-------------|----------|
+| `base_url` | HTTP or HTTPS endpoint | Yes |
+| `api_key` | Bearer token for authentication | No |
+
+All providers use the OpenAI-compatible `/v1/chat/completions` endpoint. The path is inferred from `base_url`:
+
+- `http://host:11434` → `/v1/chat/completions`
+- `https://api.groq.com/openai/v1` → `/openai/v1/chat/completions`
+- Any URL ending in `/v1` → appends `/chat/completions`
+
+## HTTPS
+
+TLS 1.3 is supported via libakuma-tls. Certificate verification is not implemented (equivalent to `curl -k`).
 
 ## QEMU Networking
 
-When running in QEMU, the host machine is accessible at `10.0.2.2`:
+The host machine is reachable at `10.0.2.2` from inside the VM:
 
 ```ini
-# Ollama running on host machine
 [provider:ollama]
 base_url=http://10.0.2.2:11434
-api_type=ollama
 ```
+
+## Custom System Prompt
+
+Place a `MEOW.md` file in the current working directory to override the personality system prompt entirely. Meow loads it at startup if present.
 
 ## Runtime Commands
 
-You can switch providers and models at runtime:
+Switch provider/model without restarting:
 
 ```
 /provider              # Show current provider
 /provider list         # List all configured providers
-/provider openai       # Switch to a specific provider
+/provider groq         # Switch to groq
 
 /model                 # Show current model
 /model list            # List models from current provider
-/model gpt-4o          # Switch to a specific model
+/model gpt-4o          # Switch model
 
-/tokens                # Show current token usage
+/personality list      # List personalities
+/personality Rosie     # Switch personality
 ```
 
-## Creating the Config File
+Changes made with runtime commands are saved back to `/etc/meow/config`.
 
-1. Connect to the Akuma kernel via SSH:
-   ```bash
-   ssh -p 2222 user@localhost
-   ```
+## Quick Setup
 
-2. Create the config directory:
-   ```bash
-   mkdir -p /etc/meow
-   ```
+```bash
+# From inside the Akuma VM
+mkdir -p /etc/meow
+cat > /etc/meow/config << 'EOF'
+current_provider=groq
+current_model=llama-3.3-70b-versatile
 
-3. Create the config file:
-   ```bash
-   cat > /etc/meow/config << 'EOF'
-   current_provider=groq
-   current_model=llama-3.3-70b-versatile
+[provider:ollama]
+base_url=http://10.0.2.2:11434
 
-   [provider:ollama]
-   base_url=http://10.0.2.2:11434
-   api_type=ollama
+[provider:groq]
+base_url=https://api.groq.com/openai/v1
+api_key=gsk_your-groq-key-here
+EOF
 
-   [provider:groq]
-   base_url=https://api.groq.com/openai/v1
-   api_type=openai
-   api_key=gsk_your-groq-key-here
-   EOF
-   ```
-
-4. Run meow to verify:
-   ```bash
-   meow init
-   ```
-
-## Viewing Current Configuration
-
-Run `meow init` to see the current configuration:
-
-```
-  /\_/\  ╔══════════════════════════════════════╗
- ( o.o ) ║  M E O W - C H A N   I N I T         ║
-  > ^ <  ║  ～ Provider Configuration ～        ║
- /|   |\ ╚══════════════════════════════════════╝
-
-～ Current providers: ～
-  - ollama [Ollama]: http://10.0.2.2:11434
-  - groq [OpenAI]: https://api.groq.com/openai/v1 (current)
-
-  Current model: llama-3.3-70b-versatile
-  Config file: /etc/meow/config
+meow init   # verify
 ```
