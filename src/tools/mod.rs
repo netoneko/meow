@@ -47,11 +47,6 @@ pub fn execute_tool_by_name(name: &str, args_json: &str) -> Option<ToolResult> {
             let path = extract_string_field(args_json, "path")?;
             Some(fs::tool_folder_create(&path))
         }
-        "FileRename" => {
-            let source = extract_string_field(args_json, "source_filename")?;
-            let dest = extract_string_field(args_json, "destination_filename")?;
-            Some(fs::tool_file_rename(&source, &dest))
-        }
         "FileCopy" => {
             let source = extract_string_field(args_json, "source")?;
             let dest = extract_string_field(args_json, "destination")?;
@@ -66,68 +61,9 @@ pub fn execute_tool_by_name(name: &str, args_json: &str) -> Option<ToolResult> {
             let url = extract_string_field(args_json, "url")?;
             Some(net::tool_http_fetch(&url))
         }
-        "GitClone" => {
-            let url = extract_string_field(args_json, "url")?;
-            Some(git::tool_git_clone(&url))
-        }
-        "GitPull" => {
-            Some(git::tool_git_pull())
-        }
-        "GitPush" => {
-            let force = extract_string_field(args_json, "force")
-                .map(|s| s == "true")
-                .unwrap_or(false);
-            Some(git::tool_git_push(force))
-        }
-        "GitStatus" => {
-            Some(git::tool_git_status())
-        }
-        "GitBranch" => {
-            let branch_name = extract_string_field(args_json, "name");
-            let delete = extract_string_field(args_json, "delete")
-                .map(|s| s == "true")
-                .unwrap_or(false);
-            Some(git::tool_git_branch(branch_name.as_deref(), delete))
-        }
-        "GitFetch" => {
-            Some(git::tool_git_fetch())
-        }
-        "GitAdd" => {
-            let path = extract_string_field(args_json, "path").unwrap_or_else(|| String::from("."));
-            Some(git::tool_git_add(&path))
-        }
-        "GitCommit" => {
-            let message = extract_string_field(args_json, "message")?;
-            let amend = extract_string_field(args_json, "amend")
-                .map(|s| s == "true")
-                .unwrap_or(false);
-            Some(git::tool_git_commit(&message, amend))
-        }
-        "GitCheckout" => {
-            let branch = extract_string_field(args_json, "branch")?;
-            Some(git::tool_git_checkout(&branch))
-        }
-        "GitConfig" => {
-            let key = extract_string_field(args_json, "key")?;
-            let value = extract_string_field(args_json, "value");
-            Some(git::tool_git_config(&key, value.as_deref()))
-        }
-        "GitLog" => {
-            let count = extract_number_field(args_json, "count");
-            let oneline = extract_string_field(args_json, "oneline")
-                .map(|s| s == "true")
-                .unwrap_or(false);
-            Some(git::tool_git_log(count, oneline))
-        }
-        "GitTag" => {
-            let tag_name = extract_string_field(args_json, "name");
-            let delete = extract_string_field(args_json, "delete")
-                .map(|s| s == "true")
-                .unwrap_or(false);
-            Some(git::tool_git_tag(tag_name.as_deref(), delete))
-        }
-        "GitReset" => {
-            Some(git::tool_git_reset())
+        "Git" => {
+            let args = extract_string_field(args_json, "args")?;
+            Some(git::tool_git(&args))
         }
         "FileReadLines" => {
             let filename = extract_string_field(args_json, "filename")?;

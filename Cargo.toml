@@ -8,6 +8,13 @@ name = "meow"
 path = "src/main.rs"
 
 [features]
+default = ["compact-tools"]
+
+# Drop every per-tool `description` from the OpenAI tools schema (~930 fewer
+# tokens on every request). ON by default; disable with `--no-default-features`
+# to ship the descriptive schema. See config.rs OPENAI_TOOLS_JSON.
+compact-tools = []
+
 # Memory-constrained build: caps in-memory tool output at 2KB (vs 32KB default).
 # Build with: cargo build --release --features size
 size = []

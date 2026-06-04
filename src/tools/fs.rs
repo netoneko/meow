@@ -218,22 +218,6 @@ pub fn tool_pwd() -> ToolResult {
     }
 }
 
-pub fn tool_file_rename(source: &str, dest: &str) -> ToolResult {
-    let src_resolved = match resolve_path_or_err(source) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    let dst_resolved = match resolve_path_or_err(dest) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    
-    match tool_file_copy_internal(&src_resolved, &dst_resolved) {
-        Ok(_) => ToolResult::ok(format!("Renamed '{}' to '{}' (note: original not deleted yet)", source, dest)),
-        Err(e) => ToolResult::err(&e),
-    }
-}
-
 pub fn tool_file_copy(source: &str, dest: &str) -> ToolResult {
     let src_resolved = match resolve_path_or_err(source) {
         Ok(p) => p,
