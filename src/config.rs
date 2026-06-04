@@ -13,8 +13,12 @@ pub const TOKEN_LIMIT_FOR_COMPACTION: usize = 32_000;
 /// Default context window if we can't query the model
 pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 
-/// Maximum size for tool output to be kept in memory (32KB).
-/// If output exceeds this, it should be written to a temp file.
+/// Maximum size for tool output to be kept in memory.
+/// If output exceeds this, it is written to a temp file instead.
+/// The `size` feature caps this hard at 2KB for memory-constrained builds.
+#[cfg(feature = "size")]
+pub const MAX_TOOL_OUTPUT_SIZE: usize = 2 * 1024;
+#[cfg(not(feature = "size"))]
 pub const MAX_TOOL_OUTPUT_SIZE: usize = 32 * 1024;
 
 /// Default size for the buffer used by tool_shell to capture command output

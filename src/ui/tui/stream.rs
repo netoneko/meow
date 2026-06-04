@@ -41,9 +41,8 @@ impl StreamingRenderer {
             match &mut self.state {
                 StreamState::Text => {
                     if c == '\n' {
-                        chars_to_flush = self.line_buf.clone();
+                        chars_to_flush = core::mem::take(&mut self.line_buf);
                         chars_to_flush.push('\n');
-                        self.line_buf.clear();
                         self.at_line_start = true;
                     } else if self.at_line_start {
                         if c.is_whitespace() {
@@ -53,21 +52,18 @@ impl StreamingRenderer {
                             let trimmed = self.line_buf.trim_start();
                             if trimmed == "```" {
                                 next_state = Some(StreamState::BufferingPotentialTool {
-                                    buffer: self.line_buf.clone(),
+                                    buffer: core::mem::take(&mut self.line_buf),
                                 });
-                                self.line_buf.clear();
                             } else if trimmed == "{" {
                                 next_state = Some(StreamState::BufferingJson {
-                                    buffer: self.line_buf.clone(),
+                                    buffer: core::mem::take(&mut self.line_buf),
                                     depth: 1,
                                     in_string: false,
                                     escape: false,
                                 });
-                                self.line_buf.clear();
                             } else if ! "```".starts_with(trimmed) && ! "{".starts_with(trimmed) {
                                 // Clearly not a tool, flush line_buf and disable line-start buffering
-                                chars_to_flush = self.line_buf.clone();
-                                self.line_buf.clear();
+                                chars_to_flush = core::mem::take(&mut self.line_buf);
                                 self.at_line_start = false;
                             }
                         }
@@ -90,14 +86,14 @@ impl StreamingRenderer {
                             let tag = after_bt[..nl].trim();
                             if !tag.is_empty() && tag != "json" {
                                 // It's like ```rust\n... flush it
-                                chars_to_flush = buffer.clone();
+                                chars_to_flush = core::mem::take(buffer);
                                 next_state = Some(StreamState::Text);
                                 self.at_line_start = buffer.ends_with('\n');
                             }
                         } else {
                             // No newline yet, check if we are still typing "json"
                             if ! "json".starts_with(after_bt) {
-                                chars_to_flush = buffer.clone();
+                                chars_to_flush = core::mem::take(buffer);
                                 next_state = Some(StreamState::Text);
                                 self.at_line_start = buffer.ends_with('\n');
                             }
@@ -112,13 +108,13 @@ impl StreamingRenderer {
                             self.at_line_start = true;
                         } else {
                             // Not a tool call, flush the whole markdown block
-                            chars_to_flush = buffer.clone();
+                            chars_to_flush = core::mem::take(buffer);
                             next_state = Some(StreamState::Text);
                             self.at_line_start = buffer.ends_with('\n');
                         }
                     } else if next_state.is_none() && buffer.len() > 16384 {
                         // Safety fallback
-                        chars_to_flush = buffer.clone();
+                        chars_to_flush = core::mem::take(buffer);
                         next_state = Some(StreamState::Text);
                         self.at_line_start = buffer.ends_with('\n');
                     }
@@ -139,11 +135,11 @@ impl StreamingRenderer {
                                         print_tool_notification(&tool, &args, self.indent);
                                         self.at_line_start = true;
                                     } else {
-                                        chars_to_flush = buffer.clone();
+                                        chars_to_flush = core::mem::take(buffer);
                                         self.at_line_start = buffer.ends_with('\n');
                                     }
                                 } else {
-                                    chars_to_flush = buffer.clone();
+                                    chars_to_flush = core::mem::take(buffer);
                                     self.at_line_start = buffer.ends_with('\n');
                                 }
                                 next_state = Some(StreamState::Text);
@@ -165,21 +161,9 @@ impl StreamingRenderer {
 
     pub fn finalize(&mut self) {
         let to_flush = match &mut self.state {
-            StreamState::Text => {
-                let s = self.line_buf.clone();
-                self.line_buf.clear();
-                s
-            }
-            StreamState::BufferingPotentialTool { buffer } => {
-                let s = buffer.clone();
-                buffer.clear();
-                s
-            }
-            StreamState::BufferingJson { buffer, .. } => {
-                let s = buffer.clone();
-                buffer.clear();
-                s
-            }
+            StreamState::Text => core::mem::take(&mut self.line_buf),
+            StreamState::BufferingPotentialTool { buffer } => core::mem::take(buffer),
+            StreamState::BufferingJson { buffer, .. } => core::mem::take(buffer),
         };
         if !to_flush.is_empty() {
             tui_print_with_indent(&to_flush, "", self.indent, Some(COLOR_MEOW));

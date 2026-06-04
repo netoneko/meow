@@ -48,13 +48,6 @@ impl Message {
 
 pub const MAX_HISTORY_SIZE: usize = 100;
 
-pub fn trim_history(history: &mut Vec<Message>) {
-    if history.len() > MAX_HISTORY_SIZE {
-        let to_remove = history.len() - MAX_HISTORY_SIZE;
-        history.drain(1..1 + to_remove);
-    }
-}
-
 pub fn compact_history(history: &mut Vec<Message>) {
     for msg in history.iter_mut() {
         msg.role.shrink_to_fit();
@@ -92,17 +85,6 @@ pub fn run_tests() -> i32 {
         let got = estimate_tokens(input);
         if got == *expected { passed += 1; }
         else { libakuma::print(&format!("  [!] estimate_tokens({:?}): got {} want {}\n", input, got, expected)); }
-    }
-
-    // trim_history: keeps system + up to MAX_HISTORY_SIZE
-    total += 1;
-    {
-        let mut h: Vec<Message> = Vec::new();
-        h.push(Message::new("system", "sys"));
-        for i in 0..20 { h.push(Message::new("user", &format!("msg{}", i))); }
-        trim_history(&mut h);
-        if h.len() <= MAX_HISTORY_SIZE + 1 { passed += 1; }
-        else { libakuma::print(&format!("  [!] trim_history len {} > {}\n", h.len(), MAX_HISTORY_SIZE + 1)); }
     }
 
     // write_json basic

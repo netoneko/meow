@@ -7,6 +7,11 @@ edition = "2021"
 name = "meow"
 path = "src/main.rs"
 
+[features]
+# Memory-constrained build: caps in-memory tool output at 2KB (vs 32KB default).
+# Build with: cargo build --release --features size
+size = []
+
 [dependencies]
 libakuma = { path = "../libakuma", features = ["chunked-allocator"] }
 libakuma-tls = { path = "../libakuma-tls" }

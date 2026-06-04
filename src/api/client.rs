@@ -5,22 +5,48 @@ use core::sync::atomic::Ordering;
 
 use libakuma::net::{resolve, TcpStream};
 use libakuma_tls::{HttpHeaders, HttpStreamTls, StreamResult, TLS_RECORD_SIZE};
-use crate::util::StackBuffer;
+use crate::util::{StackBuffer, json_escape_to};
 use core::fmt::Write;
 use crate::ui::tui::layout::Stdout;
 
 use crate::config::{Provider, OPENAI_TOOLS_JSON};
+use crate::app::history::Message;
 use crate::tui_app;
 use super::types::{StreamResponse, StreamStats, ToolCallData};
 
 const MAX_RETRIES: u32 = 10;
 const DEFAULT_MAX_TOKENS: usize = 16384;
 
-/// Attempt to send request with retries and exponential backoff
+/// Serialize the chat request body to a temp file, stream it to the provider
+/// with retries, then remove the file. Serializing to disk (rather than into a
+/// single growing `String`) keeps the whole conversation from ever being
+/// resident in memory at send time.
 pub fn send_with_retry(
     model: &str,
     provider: &Provider,
-    history_json: &str,
+    history: &[Message],
+    is_continuation: bool,
+    current_tokens: usize,
+    token_limit: usize,
+    mem_kb: usize,
+) -> Result<StreamResponse, &'static str> {
+    let body_path = request_body_path();
+    let body_len = write_chat_body(&body_path, model, history)?;
+    let result = send_with_retry_inner(
+        provider, &body_path, body_len,
+        is_continuation, current_tokens, token_limit, mem_kb,
+    );
+    libakuma::unlink(&body_path);
+    result
+}
+
+/// Retry/backoff loop. The request body is read fresh from `body_path` on each
+/// attempt and streamed to the socket in chunks.
+#[allow(clippy::too_many_arguments)]
+fn send_with_retry_inner(
+    provider: &Provider,
+    body_path: &str,
+    body_len: usize,
     is_continuation: bool,
     current_tokens: usize,
     token_limit: usize,
@@ -46,6 +72,13 @@ pub fn send_with_retry(
     }
 
     let start_time = libakuma::uptime();
+    let path = build_request_path(provider);
+
+    // TLS record buffers are ~17KB each. Allocate them once and reuse across
+    // retry attempts (only for HTTPS providers) instead of per-attempt.
+    let needs_tls = provider.is_https();
+    let mut tls_read_buf: Vec<u8> = if needs_tls { alloc::vec![0u8; TLS_RECORD_SIZE] } else { Vec::new() };
+    let mut tls_write_buf: Vec<u8> = if needs_tls { alloc::vec![0u8; TLS_RECORD_SIZE] } else { Vec::new() };
 
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
@@ -93,15 +126,10 @@ pub fn send_with_retry(
         }
         if !is_tui { libakuma::print("."); }
 
-        let (path, request_body) = build_chat_request(model, provider, history_json);
-
         if provider.is_https() {
             let (host, _) = provider.host_port().ok_or("Invalid URL")?;
-            
-            let mut read_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
-            let mut write_buf = alloc::vec![0u8; TLS_RECORD_SIZE];
-            
-            let mut http_stream = match HttpStreamTls::connect(stream, &host, &mut read_buf, &mut write_buf) {
+
+            let mut http_stream = match HttpStreamTls::connect(stream, &host, &mut tls_read_buf, &mut tls_write_buf) {
                 Ok(s) => s,
                 Err(e) => {
                                     if attempt == MAX_RETRIES - 1 {
@@ -120,7 +148,17 @@ pub fn send_with_retry(
                 headers.bearer_auth(key);
             }
             
-            if http_stream.post(&host, &path, &request_body, &headers).is_err() {
+            let body_fd = libakuma::open(body_path, libakuma::open_flags::O_RDONLY);
+            if body_fd < 0 {
+                if attempt == MAX_RETRIES - 1 {
+                    if !is_tui { libakuma::print("] "); }
+                    return Err("Failed to open request buffer");
+                }
+                continue;
+            }
+            let post_result = http_stream.post_from_fd(&host, &path, body_len, body_fd, &headers);
+            libakuma::close(body_fd);
+            if post_result.is_err() {
                 if attempt == MAX_RETRIES - 1 {
                     if !is_tui { libakuma::print("] "); }
                     return Err("Failed to send request");
@@ -145,7 +183,17 @@ pub fn send_with_retry(
                 }
             }
         } else {
-            if let Err(e) = send_post_request(&stream, &path, &request_body, provider) {
+            let body_fd = libakuma::open(body_path, libakuma::open_flags::O_RDONLY);
+            if body_fd < 0 {
+                if attempt == MAX_RETRIES - 1 {
+                    if !is_tui { libakuma::print("] "); }
+                    return Err("Failed to open request buffer");
+                }
+                continue;
+            }
+            let post_result = send_post_request_from_fd(&stream, &path, body_len, body_fd, provider);
+            libakuma::close(body_fd);
+            if let Err(e) = post_result {
                 if attempt == MAX_RETRIES - 1 {
                     if !is_tui { libakuma::print("] "); }
                     return Err(e);
@@ -182,39 +230,139 @@ fn connect_to_provider(provider: &Provider) -> Result<TcpStream, String> {
     TcpStream::connect(&addr_str).map_err(|_| format!("Connection failed to: {}", addr_str))
 }
 
-fn send_post_request(stream: &TcpStream, path: &str, body: &str, provider: &Provider) -> Result<(), &'static str> {
+/// Send a plain-HTTP POST whose body is streamed from `body_fd` in chunks.
+/// `body_fd` must be positioned at the start; `body_len` is its byte length.
+fn send_post_request_from_fd(
+    stream: &TcpStream,
+    path: &str,
+    body_len: usize,
+    body_fd: i32,
+    provider: &Provider,
+) -> Result<(), &'static str> {
     let (host, port) = provider.host_port().ok_or("Invalid URL")?;
     let auth_header = match &provider.api_key {
         Some(key) => format!("Authorization: Bearer {}\r\n", key),
         None => String::new(),
     };
-    let request = format!(
+    let header = format!(
         "POST {} HTTP/1.0\r\n\
          Host: {}:{}\r\n\
          Content-Type: application/json\r\n\
          {}Content-Length: {}\r\n\
          Connection: close\r\n\
-         \r\n\
-         {}",
-        path, host, port, auth_header, body.len(), body
+         \r\n",
+        path, host, port, auth_header, body_len
     );
-    stream.write_all(request.as_bytes()).map_err(|_| "Failed to send request")
+    stream.write_all(header.as_bytes()).map_err(|_| "Failed to send request")?;
+
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = libakuma::read_fd(body_fd, &mut buf);
+        if n <= 0 {
+            break;
+        }
+        stream.write_all(&buf[..n as usize]).map_err(|_| "Failed to send request body")?;
+    }
+    Ok(())
 }
 
-fn build_chat_request(model: &str, provider: &Provider, history_json: &str) -> (String, String) {
-    let body = format!(
-        "{{\"model\":\"{}\",\"messages\":{},\"stream\":true,\"max_tokens\":{},\"tools\":{},\"tool_choice\":\"auto\"}}",
-        model, history_json, DEFAULT_MAX_TOKENS, OPENAI_TOOLS_JSON
-    );
+/// Compute the chat-completions URL path for a provider.
+fn build_request_path(provider: &Provider) -> String {
     let base = provider.base_path();
-    let path = if base.is_empty() || base == "/" {
+    if base.is_empty() || base == "/" {
         String::from("/v1/chat/completions")
     } else if base.ends_with("/v1") {
         format!("{}/chat/completions", base)
     } else {
         format!("{}/chat/completions", base.trim_end_matches('/'))
-    };
-    (path, body)
+    }
+}
+
+/// Path of the temp file used to stage the request body (sandbox-aware).
+fn request_body_path() -> String {
+    let sandbox = crate::tools::get_sandbox_root();
+    if sandbox == "/" {
+        String::from("/tmp/.meow_request.json")
+    } else {
+        format!("{}/tmp/.meow_request.json", sandbox)
+    }
+}
+
+/// Write `s` to `fd`, accumulating the byte count. Returns false on short write.
+fn fd_write_str(fd: i32, s: &str, total: &mut usize) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return true;
+    }
+    let n = libakuma::write_fd(fd, bytes);
+    if n < 0 || n as usize != bytes.len() {
+        return false;
+    }
+    *total += bytes.len();
+    true
+}
+
+/// Serialize the full OpenAI chat-completions request body to `path`, one
+/// message at a time, so peak memory stays bounded by the largest single
+/// message (the static tools schema is streamed directly, never copied).
+/// Returns the number of body bytes written.
+fn write_chat_body(path: &str, model: &str, history: &[Message]) -> Result<usize, &'static str> {
+    let sandbox = crate::tools::get_sandbox_root();
+    let tmp_dir = if sandbox == "/" { String::from("/tmp") } else { format!("{}/tmp", sandbox) };
+    let _ = libakuma::mkdir(&tmp_dir);
+
+    let fd = libakuma::open(
+        path,
+        libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_TRUNC,
+    );
+    if fd < 0 {
+        return Err("Failed to create request buffer");
+    }
+
+    let mut total = 0usize;
+    let mut scratch = String::new();
+    let ok = write_chat_body_inner(fd, model, history, &mut scratch, &mut total);
+    libakuma::close(fd);
+
+    if ok { Ok(total) } else { Err("Failed to write request buffer") }
+}
+
+fn write_chat_body_inner(
+    fd: i32,
+    model: &str,
+    history: &[Message],
+    scratch: &mut String,
+    total: &mut usize,
+) -> bool {
+    scratch.clear();
+    scratch.push_str("{\"model\":\"");
+    json_escape_to(model, scratch);
+    scratch.push_str("\",\"messages\":[");
+    if !fd_write_str(fd, scratch, total) {
+        return false;
+    }
+
+    for (i, msg) in history.iter().enumerate() {
+        scratch.clear();
+        if i > 0 {
+            scratch.push(',');
+        }
+        msg.write_json(scratch);
+        if !fd_write_str(fd, scratch, total) {
+            return false;
+        }
+    }
+
+    scratch.clear();
+    let _ = write!(scratch, "],\"stream\":true,\"max_tokens\":{},\"tools\":", DEFAULT_MAX_TOKENS);
+    if !fd_write_str(fd, scratch, total) {
+        return false;
+    }
+    // Stream the large, static tools schema straight from the const.
+    if !fd_write_str(fd, OPENAI_TOOLS_JSON, total) {
+        return false;
+    }
+    fd_write_str(fd, ",\"tool_choice\":\"auto\"}", total)
 }
 
 fn read_streaming_with_http_stream_tls(
@@ -335,14 +483,11 @@ fn read_streaming_with_http_stream_tls(
     if !pending_tool_calls.is_empty() {
         if is_tui { tui_app::finish_streaming(); }
         tui_app::clear_streaming_status();
-        full_response.shrink_to_fit();
         return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
     }
     if !stream_completed && !full_response.is_empty() {
-        full_response.shrink_to_fit();
         return Ok(StreamResponse::Partial(full_response, stats));
     }
-    full_response.shrink_to_fit();
     Ok(StreamResponse::Complete(full_response, stats))
 }
 
@@ -490,14 +635,11 @@ fn read_streaming_response_with_progress(
     }
     let stats = StreamStats { ttft_us, stream_us: if first_token_received { libakuma::uptime() - stream_start_us } else { 0 }, total_bytes: full_response.len() };
     if !pending_tool_calls.is_empty() {
-        full_response.shrink_to_fit();
         return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
     }
     if !stream_completed && !full_response.is_empty() {
-        full_response.shrink_to_fit();
         return Ok(StreamResponse::Partial(full_response, stats));
     }
-    full_response.shrink_to_fit();
     Ok(StreamResponse::Complete(full_response, stats))
 }
 

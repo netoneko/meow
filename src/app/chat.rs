@@ -1,16 +1,31 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::{Provider, DEFAULT_CONTEXT_WINDOW, COLOR_PEARL, COLOR_GREEN_LIGHT, COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, TOKEN_LIMIT_FOR_COMPACTION};
 use crate::util::json_escape_to;
 use crate::api::{self, StreamResponse, ToolCallData};
 use crate::tools;
 use crate::tui_app;
-use super::history::{Message, trim_history, compact_history, calculate_history_tokens};
+use super::history::{Message, compact_history, calculate_history_tokens, MAX_HISTORY_SIZE};
 
 const MAX_TOOL_ITERATIONS: usize = 20;
+
+/// Warn once per session when history hits the cap. Auto-compaction at this
+/// threshold is not yet implemented; for now we just surface the condition.
+static HISTORY_LIMIT_WARNED: AtomicBool = AtomicBool::new(false);
+fn warn_if_history_full(history: &[Message]) {
+    if history.len() >= MAX_HISTORY_SIZE && !HISTORY_LIMIT_WARNED.swap(true, Ordering::SeqCst) {
+        print_msg(
+            COLOR_YELLOW,
+            &format!(
+                "\n[!] History reached {} messages. Autocompact at this limit is not yet implemented \u{2014} it will be added in a future version.\n",
+                MAX_HISTORY_SIZE
+            ),
+        );
+    }
+}
 
 pub fn chat_once(
     model: &str,
@@ -20,7 +35,7 @@ pub fn chat_once(
     context_window: Option<usize>,
     system_prompt: &str,
 ) -> Result<(), &'static str> {
-    trim_history(history);
+    warn_if_history_full(history);
     history.push(Message::new("user", user_message));
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
@@ -28,15 +43,9 @@ pub fn chat_once(
         let mem_kb = libakuma::memory_usage() / 1024;
         let token_limit = context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
 
-        let mut messages_json = String::with_capacity(current_tokens * 4);
-        messages_json.push('[');
-        for (i, msg) in history.iter().enumerate() {
-            if i > 0 { messages_json.push(','); }
-            msg.write_json(&mut messages_json);
-        }
-        messages_json.push(']');
-
-        let stream_result = api::send_with_retry(model, provider, &messages_json, iteration > 0, current_tokens, token_limit, mem_kb);
+        // The request body is serialized straight to a temp file and streamed
+        // to the provider, so the conversation is never fully held in memory.
+        let stream_result = api::send_with_retry(model, provider, history, iteration > 0, current_tokens, token_limit, mem_kb);
         
         let stream_result = match stream_result {
             Ok(res) => res,
@@ -119,7 +128,7 @@ pub fn chat_once(
                     history.push(result_msg);
                 }
 
-                trim_history(history);
+                warn_if_history_full(history);
                 compact_history(history);
                 continue;
             }
@@ -129,7 +138,7 @@ pub fn chat_once(
                 if !assistant_response.is_empty() {
                     history.push(Message::new("assistant", &assistant_response));
                 }
-                trim_history(history);
+                warn_if_history_full(history);
                 compact_history(history);
                 if let Some(ctx_window) = context_window {
                     let current_tokens = calculate_history_tokens(history);
