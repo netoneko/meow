@@ -11,7 +11,8 @@ meow                          # Interactive TUI (default)
 meow -c "What is 2+2?"       # Non-interactive: print response and exit
 meow -m llama3.2              # Override model
 meow -p groq                  # Override provider
-meow -P Rosie                 # Override personality
+meow -P Meow                  # Override personality (default: Meow)
+meow -N                       # Disable persona; use a neutral assistant prompt
 meow init                     # Show/initialize configuration
 meow test                     # Run built-in tests
 meow -h                       # Show help
@@ -36,7 +37,8 @@ meow --no-tui -m gemma3:4b -c "summarize this file"
 - **Context compaction**: AI can summarize and reset its own context window when memory is low
 - **HTTPS support**: TLS 1.3 via libakuma-tls (no certificate verification)
 - **Multiple providers**: Ollama, Groq, OpenAI, and any OpenAI-compatible endpoint
-- **Personalities**: Meow (default), Jaffar, Rosie
+- **Personality**: Meow (default); `--no-personality` / `-N` switches to a neutral assistant prompt
+- **Compact tool schema**: the `compact-tools` build feature (on by default) ships the tools schema without per-tool descriptions, saving ~930 tokens on every request
 
 ---
 
@@ -76,8 +78,7 @@ The LLM can invoke these tools autonomously:
 | `FileList` | `path` | List directory |
 | `FileDelete` | `filename` | Delete file |
 | `FileCopy` | `source`, `destination` | Copy file |
-| `FileMove` | `source`, `destination` | Move file |
-| `FileRename` | `source_filename`, `destination_filename` | Rename file |
+| `FileMove` | `source`, `destination` | Move or rename file |
 | `FolderCreate` | `path` | Create directory |
 | `CodeSearch` | `pattern`, `path` | Grep source files recursively |
 
@@ -93,15 +94,9 @@ The LLM can invoke these tools autonomously:
 
 | Tool | Key args | Description |
 |------|----------|-------------|
-| `GitStatus` | — | Show git status |
-| `GitLog` | `count`, `oneline` | Show commit history |
-| `GitAdd` | `path` | Stage files |
-| `GitCommit` | `message` | Create commit |
-| `GitCheckout` | `branch` | Switch branch |
-| `GitBranch` | `name`, `delete` | List/create/delete branches |
-| `GitPull` | — | Pull from remote |
-| `GitPush` | — | Push to remote |
-| `GitClone` | `url` | Clone repository |
+| `Git` | `args` | Run any git subcommand, e.g. `status`, `commit -m "msg"`, `log --oneline`, `push`. Force-push is blocked. |
+
+> A single `Git` tool replaces the former per-subcommand tools (`GitStatus`, `GitCommit`, …), which were all thin `git <subcommand>` shell wrappers. This trims ~40% of the tools schema. Anything reachable via the old tools is reachable as `Git { "args": "<subcommand …>" }` (or directly via `Shell`).
 
 ### Network
 

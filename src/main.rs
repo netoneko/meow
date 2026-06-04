@@ -21,7 +21,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use app::Message;
-use config::{Config, DEFAULT_CONTEXT_WINDOW, PERSONALITIES, Provider};
+use config::{Config, DEFAULT_CONTEXT_WINDOW, NO_PERSONA, PERSONALITIES, Provider};
 use libakuma::{arg, argc, close, exit, fstat, open, open_flags, read_fd};
 
 #[no_mangle]
@@ -30,6 +30,7 @@ pub extern "C" fn main() {
     let mut model_override: Option<String> = None;
     let mut provider_override: Option<String> = None;
     let mut personality_override: Option<String> = None;
+    let mut no_personality = false;
     let mut one_shot_message: Option<String> = None;
     let mut use_tui = true;
 
@@ -71,6 +72,8 @@ pub extern "C" fn main() {
                     libakuma::print("meow: -P requires a personality name\n");
                     exit(1);
                 }
+            } else if arg_str == "-N" || arg_str == "--no-personality" {
+                no_personality = true;
             } else if arg_str == "-c" || arg_str == "--command" {
                 i += 1;
                 if let Some(msg) = arg(i) {
@@ -131,16 +134,7 @@ pub extern "C" fn main() {
     if let Some(prompt) = local_prompt {
         system_prompt.push_str(&prompt);
     } else {
-        // Find personality in registry
-        let persona = PERSONALITIES
-            .iter()
-            .find(|p| p.name == app_config.current_personality);
-        if let Some(p) = persona {
-            system_prompt.push_str(p.description);
-        } else {
-            // Fallback to Meow if not found
-            system_prompt.push_str(PERSONALITIES[0].description);
-        }
+        system_prompt.push_str(get_active_personality(&app_config, no_personality).description);
     }
 
     system_prompt.push_str("\n\n");
@@ -165,7 +159,7 @@ pub extern "C" fn main() {
         };
         history.push(Message::new("user", &cwd_context));
 
-        let persona = get_active_personality(&app_config);
+        let persona = get_active_personality(&app_config, no_personality);
         let ack_msg = persona.ack_tui;
         history.push(Message::new("assistant", ack_msg));
 
@@ -208,7 +202,7 @@ pub extern "C" fn main() {
         };
         history.push(Message::new("user", &cwd_context));
 
-        let persona = get_active_personality(&app_config);
+        let persona = get_active_personality(&app_config, no_personality);
         let ack_msg = persona.ack_tui;
         history.push(Message::new("assistant", ack_msg));
 
@@ -225,7 +219,7 @@ pub extern "C" fn main() {
                 exit(0);
             }
             Err(e) => {
-                let persona = get_active_personality(&app_config);
+                let persona = get_active_personality(&app_config, no_personality);
                 let err_msg = persona.error_format.replace("{}", e);
                 libakuma::print(&err_msg);
                 exit(1);
@@ -236,7 +230,10 @@ pub extern "C" fn main() {
     exit(0);
 }
 
-fn get_active_personality<'a>(config: &Config) -> &'a crate::config::Personality {
+fn get_active_personality(config: &Config, no_personality: bool) -> &'static crate::config::Personality {
+    if no_personality {
+        return &NO_PERSONA;
+    }
     PERSONALITIES
         .iter()
         .find(|p| p.name == config.current_personality)
@@ -276,7 +273,7 @@ fn load_local_prompt() -> Option<String> {
 
 fn print_usage() {
     libakuma::print(
-        "meow - AI assistant\n\nUsage:\n  meow                        Interactive TUI mode (default)\n  meow -c \"message\"           Non-interactive: send message and exit\n  meow init                   Configure providers\n  meow test                   Run built-in tests\n\nOptions:\n  -c, --command <MSG>     Non-interactive: send MSG and print response to stdout\n  -m, --model <NAME>      Override the active model\n  -p, --provider <NAME>   Override the active provider\n  -P, --personality <NAM> Switch persona (Meow, Jaffar, Rosie)\n  --tui                   Force interactive TUI mode\n  --no-tui                Force non-interactive mode (no repainting)\n  -h, --help              Show this help\n\nNon-interactive mode (-c) prints streaming output directly to stdout with\nANSI color codes but without cursor repositioning or the 3-pane layout.\nSuitable for scripting, pipes, and low-memory environments.\n\nInteractive Commands (TUI mode):\n  /clear              Wipe memory banks\n  /model [NAME]       Check/switch/list models\n  /provider [NAME]    Check/switch providers\n  /personality [NAME] Check/switch personality\n  /tokens             Show current token usage\n  /help               Command list\n  /quit               Quit\n",
+        "meow - AI assistant\n\nUsage:\n  meow                        Interactive TUI mode (default)\n  meow -c \"message\"           Non-interactive: send message and exit\n  meow init                   Configure providers\n  meow test                   Run built-in tests\n\nOptions:\n  -c, --command <MSG>     Non-interactive: send MSG and print response to stdout\n  -m, --model <NAME>      Override the active model\n  -p, --provider <NAME>   Override the active provider\n  -P, --personality <NAM> Switch persona (default: Meow)\n  -N, --no-personality    Disable the persona; use a neutral assistant prompt\n  --tui                   Force interactive TUI mode\n  --no-tui                Force non-interactive mode (no repainting)\n  -h, --help              Show this help\n\nNon-interactive mode (-c) prints streaming output directly to stdout with\nANSI color codes but without cursor repositioning or the 3-pane layout.\nSuitable for scripting, pipes, and low-memory environments.\n\nInteractive Commands (TUI mode):\n  /clear              Wipe memory banks\n  /model [NAME]       Check/switch/list models\n  /provider [NAME]    Check/switch providers\n  /personality [NAME] Check/switch personality\n  /tokens             Show current token usage\n  /help               Command list\n  /quit               Quit\n",
     );
 }
 
