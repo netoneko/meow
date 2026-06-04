@@ -7,18 +7,7 @@ use libakuma::{write as akuma_write, fd};
 // ANSI escapes
 pub const CLEAR_TO_EOL: &str = "\x1b[K";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TuiState {
-    Idle,
-    _Connecting,
-    _WaitingForResponse,
-    _Streaming,
-    _Processing,
-    _Exiting,
-}
-
 pub struct PaneLayout {
-    pub _state: TuiState,
     pub term_width: u16,
     pub term_height: u16,
     pub output_top: u16,
@@ -34,7 +23,6 @@ pub struct PaneLayout {
     pub footer_top: u16,
     pub footer_height: u16,
     pub prompt_scroll: u16,
-    pub _cursor_idx: u16,
     pub input_prefix_len: u16,
     pub repaint_counter: u16,
 }
@@ -48,7 +36,6 @@ impl PaneLayout {
         let output_bottom = status_row.saturating_sub(gap);
         
         Self {
-            _state: TuiState::Idle,
             term_width: width,
             term_height: height,
             output_top: 1,
@@ -64,7 +51,6 @@ impl PaneLayout {
             footer_top: separator_row,
             footer_height,
             prompt_scroll: 0,
-            _cursor_idx: 0,
             input_prefix_len: 0,
             repaint_counter: 0,
         }

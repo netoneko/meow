@@ -30,9 +30,10 @@ pub struct ModelInfo {
 }
 
 #[derive(Debug)]
+// Variants carry diagnostic strings consumed via Debug formatting (commands.rs `{:?}`),
+// which the dead-code lint deliberately ignores.
 #[allow(dead_code)]
 pub enum ProviderError {
-    ConnectionFailed(String),
     RequestFailed(String),
     ParseError(String),
 }

@@ -34,10 +34,10 @@ pub fn tui_print(s: &str) { render::tui_print(s); }
 pub fn tui_print_assistant(s: &str) { render::tui_print_assistant(s); }
 pub fn tui_print_with_indent(s: &str, prefix: &str, indent: u16, color: Option<&str>) { render::tui_print_with_indent(s, prefix, indent, color); }
 pub fn tui_render_markdown(markdown: &str) {
-    tui_render_markdown_with_indent(markdown, 9, None); // Default to None for general markdown
+    tui_render_markdown_with_indent(markdown, 9);
 }
-pub fn tui_render_markdown_with_indent(markdown: &str, indent: u16, base_style: Option<&'static str>) {
-    let renderer = crate::ui::tui::markdown::MarkdownRenderer::new(indent, "", base_style);
+pub fn tui_render_markdown_with_indent(markdown: &str, indent: u16) {
+    let renderer = crate::ui::tui::markdown::MarkdownRenderer::new(indent);
     renderer.render(markdown);
 }
 pub fn update_streaming_status(text: &str, dots: u8, time_ms: Option<u64>) { 
@@ -270,7 +270,7 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
             tui_print_with_indent(" >  ", "", 0, Some(color_buf.as_str()));
             
             if config.render_markdown {
-                tui_render_markdown_with_indent(&u_i, 4, Some(COLOR_USER)); // Pass user color here
+                tui_render_markdown_with_indent(&u_i, 4);
             } else {
                 tui_print_with_indent(&u_i, "", 4, Some(COLOR_USER));
             }

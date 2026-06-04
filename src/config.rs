@@ -290,7 +290,6 @@ impl Config {
     pub fn load() -> Self {
         let fd = open(CONFIG_PATH, open_flags::O_RDONLY);
         if fd < 0 {
-            // libakuma::print("  [DEBUG] Config file not found, using defaults\n");
             return Self::default();
         }
 
@@ -306,7 +305,6 @@ impl Config {
 
         let size = stat.st_size as usize;
         if size == 0 {
-            // libakuma::print("  [DEBUG] Config file is empty\n");
             close(fd);
             return Self::default();
         }
@@ -500,16 +498,6 @@ impl Config {
         self.providers.iter().find(|p| p.name == name)
     }
 
-    /// Add or update a provider
-    #[allow(dead_code)]
-    pub fn set_provider(&mut self, provider: Provider) {
-        if let Some(existing) = self.providers.iter_mut().find(|p| p.name == provider.name) {
-            *existing = provider;
-        } else {
-            self.providers.push(provider);
-        }
-    }
-
     pub fn run_tests() -> i32 {
         use alloc::format;
         let mut passed = 0usize;
@@ -567,13 +555,5 @@ impl Config {
 
         libakuma::print(&format!("  result: {}/{}\n", passed, total));
         if passed == total { 0 } else { 1 }
-    }
-
-    /// Remove a provider by name
-    #[allow(dead_code)]
-    pub fn remove_provider(&mut self, name: &str) -> bool {
-        let initial_len = self.providers.len();
-        self.providers.retain(|p| p.name != name);
-        self.providers.len() < initial_len
     }
 }

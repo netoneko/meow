@@ -10,7 +10,7 @@ pub struct MarkdownRenderer {
 }
 
 impl MarkdownRenderer {
-    pub fn new(indent: u16, _prefix: &str, _base_style: Option<&'static str>) -> Self {
+    pub fn new(indent: u16) -> Self {
         Self { indent }
     }
 
