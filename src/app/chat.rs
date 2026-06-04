@@ -96,6 +96,16 @@ pub fn chat_once(
                         continue;
                     }
 
+                    // Surface the full tool invocation (name + arguments) in the UI
+                    // before running it, so the user sees the exact command being executed.
+                    let args_trimmed = tc.arguments.trim();
+                    let call_line = if args_trimmed.is_empty() || args_trimmed == "{}" {
+                        format!("ToolCalled: {}", tc.name)
+                    } else {
+                        format!("ToolCalled: {} | Arguments {}", tc.name, args_trimmed)
+                    };
+                    print_notification(crate::config::COLOR_GRAY_DIM, &call_line, 0);
+
                     let tool_start = libakuma::uptime();
                     let tool_result = tools::execute_tool_by_name(&tc.name, &tc.arguments)
                         .unwrap_or_else(|| tools::ToolResult::err("Unknown or unsupported tool"));
