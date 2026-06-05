@@ -27,9 +27,10 @@ use alloc::format;
 
 use libakuma::{open, close, write_fd, open_flags, socket, connect, send, shutdown, socket_const, SocketAddrV4};
 
+use crate::config::MAX_SHELL_CAPTURE_SIZE;
 use super::context::resolve_path;
-use super::mod_types::ToolResult;
-use super::shell::{resolve_binary, spawn_and_collect, drain_child};
+use super::mod_types::{ToolResult, create_tool_tempfile};
+use super::shell::{resolve_binary, drain_child};
 
 /// Connector that precedes a command in the chain.
 #[derive(Clone, Copy, PartialEq)]
@@ -210,9 +211,131 @@ fn parse(toks: Vec<Tok>) -> Result<Vec<Command>, String> {
     Ok(commands)
 }
 
+/// The report's entire resident footprint: one page. The sink holds at most
+/// this much in RAM — past it the report spills to disk and this same window is
+/// kept as the model-facing preview. On a sub-1 MB box this is the hard ceiling
+/// on shell-report heap use, independent of how much the command actually emits.
+const REPORT_RAM_BUDGET: usize = 4 * 1024; // one page
+
+/// Accumulates the shell chain's combined report. Stays in meow's heap while it
+/// fits in one page, but once it grows past `REPORT_RAM_BUDGET` it spills to a
+/// temp file (`/tmp/meow_tool_<ts>.txt`) and keeps only that one-page window
+/// resident as a preview — so a chatty `cat`/`ls -R`/build-log can't grow the
+/// heap. Same shape as `mod_types::handle_output_overflow`, but streamed instead
+/// of buffer-then-spill.
+struct ReportSink {
+    /// The whole report while small; truncated to the preview once spilled.
+    ram: Vec<u8>,
+    /// `(fd, path)` of the spill file, set the first time we overflow RAM.
+    spill: Option<(i32, String)>,
+    /// Total bytes the report has received (RAM + file).
+    total: usize,
+    /// Last byte written, for `newline_if_needed`.
+    last: Option<u8>,
+}
+
+impl ReportSink {
+    fn new() -> Self {
+        Self { ram: Vec::new(), spill: None, total: 0, last: None }
+    }
+
+    fn total(&self) -> usize {
+        self.total
+    }
+
+    fn write(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.total += data.len();
+        self.last = data.last().copied();
+        if let Some((fd, _)) = self.spill {
+            write_all_fd(fd, data);
+            return;
+        }
+        self.ram.extend_from_slice(data);
+        if self.ram.len() > REPORT_RAM_BUDGET {
+            self.begin_spill();
+        }
+    }
+
+    fn write_str(&mut self, s: &str) {
+        self.write(s.as_bytes());
+    }
+
+    /// Append a trailing newline iff the last write didn't end in one — preserves
+    /// the per-command "+newline if missing" framing of the old buffered path.
+    fn newline_if_needed(&mut self) {
+        if self.last != Some(b'\n') {
+            self.write(b"\n");
+        }
+    }
+
+    /// Open the temp file, flush everything accumulated so far into it, and keep
+    /// only the one-page `REPORT_RAM_BUDGET` window resident as the preview. If
+    /// the temp file can't be created we silently stay in RAM (best effort; the
+    /// per-command `MAX_SHELL_CAPTURE_SIZE` guard still bounds it).
+    fn begin_spill(&mut self) {
+        if let Some((fd, path)) = create_tool_tempfile() {
+            write_all_fd(fd, &self.ram);
+            self.ram.truncate(REPORT_RAM_BUDGET);
+            self.spill = Some((fd, path));
+        }
+    }
+
+    /// Finalize into a `ToolResult`: the full inline report when it stayed in
+    /// RAM, or a preview-plus-pointer when it spilled to disk.
+    fn into_tool_result(mut self, last_exit: i32) -> ToolResult {
+        if let Some((fd, path)) = self.spill.take() {
+            close(fd);
+            let preview = String::from_utf8_lossy(&self.ram);
+            let mut out = String::from("[!] Output truncated due to memory limits.\n");
+            out.push_str(&format!("Full output saved to: {} ({} bytes)\n\n", path, self.total));
+            out.push_str("stdout (preview):\n```\n");
+            out.push_str(&preview);
+            out.push_str("\n...\n```\n");
+            out.push_str("Note: use `FileReadLines` to read specific parts of the saved output or `CodeSearch` for targeted investigation.\n");
+            out.push_str(&format!("Exit code: {}", last_exit));
+            // Already spilled + previewed — return directly so `ToolResult::ok`'s
+            // size check can't double-spill this (already-small) preview message.
+            return ToolResult { success: last_exit == 0, output: out };
+        }
+
+        let report = String::from_utf8_lossy(&self.ram);
+        let mut out = String::new();
+        if report.is_empty() {
+            out.push_str("(No output)\n");
+        } else {
+            out.push_str("stdout:\n```\n");
+            out.push_str(&report);
+            out.push_str("```\n");
+        }
+        out.push_str(&format!("Exit code: {}", last_exit));
+
+        if last_exit == 0 {
+            ToolResult::ok(out)
+        } else {
+            ToolResult { success: false, output: out }
+        }
+    }
+}
+
+/// Write every byte of `data` to `fd`, looping over partial writes. Best effort:
+/// a write error just stops (the captured report is diagnostic, not critical).
+fn write_all_fd(fd: i32, data: &[u8]) {
+    let mut off = 0usize;
+    while off < data.len() {
+        let n = write_fd(fd, &data[off..]);
+        if n <= 0 {
+            break;
+        }
+        off += n as usize;
+    }
+}
+
 /// Run the parsed chain with short-circuit semantics, collecting a report.
 fn execute(commands: Vec<Command>) -> ToolResult {
-    let mut report = String::new();
+    let mut report = ReportSink::new();
     let mut last_exit: i32 = 0;
     let mut any_ran = false;
 
@@ -240,7 +363,7 @@ fn execute(commands: Vec<Command>) -> ToolResult {
                     Ok(s) => s,
                     Err(e) => {
                         last_exit = 1;
-                        report.push_str(&format!("[{} > {}] {}\n", cmd.argv[0], r.target, e));
+                        report.write_str(&format!("[{} > {}] {}\n", cmd.argv[0], r.target, e));
                         continue;
                     }
                 };
@@ -252,34 +375,46 @@ fn execute(commands: Vec<Command>) -> ToolResult {
                 match res {
                     Ok(exit_code) => {
                         last_exit = exit_code;
-                        report.push_str(&format!(
+                        report.write_str(&format!(
                             "[{} {}> {}] piped {} bytes (exit {})\n",
                             cmd.argv[0], if r.append { ">" } else { "" }, r.target, written, exit_code
                         ));
                     }
                     Err(e) => {
                         last_exit = 1;
-                        report.push_str(&format!("[{} > {}] {}\n", cmd.argv[0], r.target, e));
+                        report.write_str(&format!("[{} > {}] {}\n", cmd.argv[0], r.target, e));
                     }
                 }
             }
-            // No redirect: collect stdout to return to the model.
-            None => match spawn_and_collect(&binary, &args) {
-                Ok((output, exit_code)) => {
-                    last_exit = exit_code;
-                    let s = core::str::from_utf8(&output).unwrap_or("<binary output>");
-                    if !s.is_empty() {
-                        report.push_str(s);
-                        if !s.ends_with('\n') {
-                            report.push('\n');
+            // No redirect: stream stdout into the report sink (disk-backed past
+            // MAX_TOOL_OUTPUT_SIZE) so even a huge `cat`/build-log stays bounded
+            // in RAM. The child is killed if it blows past MAX_SHELL_CAPTURE_SIZE
+            // (runaway guard for `yes`, `tail -f`, …).
+            None => {
+                let before = report.total();
+                let res = drain_child(&binary, &args, |chunk| {
+                    if report.total() + chunk.len() > MAX_SHELL_CAPTURE_SIZE {
+                        return Err(format!(
+                            "Command produced too much output (exceeded {} bytes)",
+                            MAX_SHELL_CAPTURE_SIZE
+                        ));
+                    }
+                    report.write(chunk);
+                    Ok(())
+                });
+                match res {
+                    Ok(exit_code) => {
+                        last_exit = exit_code;
+                        if report.total() > before {
+                            report.newline_if_needed();
                         }
                     }
+                    Err(e) => {
+                        last_exit = 127;
+                        report.write_str(&format!("[{}] {}\n", cmd.argv[0], e));
+                    }
                 }
-                Err(e) => {
-                    last_exit = 127;
-                    report.push_str(&format!("[{}] {}\n", cmd.argv[0], e));
-                }
-            },
+            }
         }
     }
 
@@ -287,21 +422,7 @@ fn execute(commands: Vec<Command>) -> ToolResult {
         return ToolResult::ok(String::from("(no command ran — short-circuited)\nExit code: 0"));
     }
 
-    let mut out = String::new();
-    if report.is_empty() {
-        out.push_str("(No output)\n");
-    } else {
-        out.push_str("stdout:\n```\n");
-        out.push_str(&report);
-        out.push_str("```\n");
-    }
-    out.push_str(&format!("Exit code: {}", last_exit));
-
-    if last_exit == 0 {
-        ToolResult::ok(out)
-    } else {
-        ToolResult { success: false, output: out }
-    }
+    report.into_tool_result(last_exit)
 }
 
 /// A streaming redirect backend: a TCP socket (`tcp:HOST:PORT`) or a file path

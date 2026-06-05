@@ -23,25 +23,37 @@ impl ToolResult {
     }
 }
 
-/// Handle tool output that exceeds memory limits by writing it to a temp file.
-fn handle_output_overflow(full_output: String) -> ToolResult {
+/// Create a fresh sandbox-aware `/tmp/meow_tool_<ts>.txt` for spilling oversized
+/// tool output. Returns the open write fd and its path, or `None` if the file
+/// could not be created. Shared by `handle_output_overflow` (whole-buffer spill)
+/// and the shell's streaming capture sink (`pretend_shell::ReportSink`).
+pub fn create_tool_tempfile() -> Option<(i32, String)> {
     let sandbox = get_sandbox_root();
     let tmp_dir = if sandbox == "/" {
         String::from("/tmp")
     } else {
         format!("{}/tmp", sandbox)
     };
-    
+
     let _ = mkdir(&tmp_dir);
-    
+
     let timestamp = libakuma::uptime();
     let filename = format!("{}/meow_tool_{}.txt", tmp_dir, timestamp);
-    
+
     let fd = open(&filename, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
     if fd >= 0 {
+        Some((fd, filename))
+    } else {
+        None
+    }
+}
+
+/// Handle tool output that exceeds memory limits by writing it to a temp file.
+fn handle_output_overflow(full_output: String) -> ToolResult {
+    if let Some((fd, filename)) = create_tool_tempfile() {
         let _ = write_fd(fd, full_output.as_bytes());
         close(fd);
-        
+
         let mut truncated = String::from("[!] Output truncated due to memory limits.\n");
         truncated.push_str(&format!("Full output saved to: {}\n\n", filename));
         truncated.push_str("Preview:\n---\n");

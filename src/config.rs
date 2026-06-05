@@ -21,8 +21,18 @@ pub const MAX_TOOL_OUTPUT_SIZE: usize = 2 * 1024;
 #[cfg(not(feature = "size"))]
 pub const MAX_TOOL_OUTPUT_SIZE: usize = 32 * 1024;
 
-/// Default size for the buffer used by tool_shell to capture command output
-pub const TOOL_BUFFER_SIZE: usize = 8 * 1024; // 8KB
+/// Buffer tool_shell uses to ferry a child's stdout chunk-by-chunk. One page —
+/// this is a stack array in `drain_child`, so on a sub-1 MB box it must stay
+/// page-sized, not balloon the stack.
+pub const TOOL_BUFFER_SIZE: usize = 4 * 1024; // one page
+
+/// Hard ceiling on a single shell invocation's model-facing (non-redirect)
+/// stdout. Output up to this is streamed to a temp file on the (disk-backed)
+/// ext2 `/tmp`, with only a one-page preview kept resident; beyond it the child
+/// is killed (runaway guard for `yes`, `tail -f`, …). This bounds the temp file
+/// on disk, NOT meow's RAM — the resident cost is one page regardless. Kept
+/// tight (16 pages) for a small ext2 `/tmp`.
+pub const MAX_SHELL_CAPTURE_SIZE: usize = 64 * 1024;
 
 /// Use meow's in-process "pretend shell" for the Shell tool instead of shelling
 /// out to busybox. The pretend shell parses `&&`, `||`, `>`, `>>` itself and
