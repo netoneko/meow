@@ -2,6 +2,7 @@ pub mod context;
 pub mod fs;
 pub mod net;
 pub mod shell;
+pub mod pretend_shell;
 pub mod helpers;
 pub mod mod_types;
 

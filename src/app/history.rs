@@ -1,5 +1,5 @@
 use alloc::string::String;
-use alloc::vec::Vec;
+use libakuma::{open, close, write_fd, open_flags};
 use crate::util::json_escape_to;
 
 #[derive(Clone)]
@@ -48,26 +48,96 @@ impl Message {
 
 pub const MAX_HISTORY_SIZE: usize = 100;
 
-pub fn compact_history(history: &mut Vec<Message>) {
-    for msg in history.iter_mut() {
-        msg.role.shrink_to_fit();
-        msg.content.shrink_to_fit();
-    }
-    history.shrink_to_fit();
-}
-
 pub fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
-pub fn calculate_history_tokens(history: &[Message]) -> usize {
-    history
-        .iter()
-        .map(|msg| {
-            let tc_tokens = msg.tool_calls_json.as_deref().map(estimate_tokens).unwrap_or(0);
-            estimate_tokens(&msg.content) + estimate_tokens(&msg.role) + tc_tokens + 4
-        })
-        .sum()
+/// Rough token cost of a single message, matching the per-message accounting the
+/// old in-heap `calculate_history_tokens` used (content + role + tool_calls + 4).
+fn message_tokens(msg: &Message) -> usize {
+    let tc_tokens = msg.tool_calls_json.as_deref().map(estimate_tokens).unwrap_or(0);
+    estimate_tokens(&msg.content) + estimate_tokens(&msg.role) + tc_tokens + 4
+}
+
+/// Sandbox-aware path of the on-disk conversation log.
+pub fn conversation_path() -> String {
+    let sandbox = crate::tools::get_sandbox_root();
+    if sandbox == "/" {
+        String::from("/tmp/.meow_conversation.jsonl")
+    } else {
+        alloc::format!("{}/tmp/.meow_conversation.jsonl", sandbox)
+    }
+}
+
+/// The conversation, backed by an on-disk JSONL log (one message object per
+/// line) rather than an in-heap `Vec<Message>`. On a 6 MB box the resident
+/// `Vec` was the one thing that grew turn-over-turn; the file is the source of
+/// truth and only two small aggregates (`count`, `tokens`) stay in RAM.
+///
+/// Access pattern is append-only with an occasional truncate-and-reseed (on
+/// `/clear` and context compaction) — nothing ever reads a message by index, so
+/// the log never needs to be materialized back into memory. The request body is
+/// streamed straight from this file (see api::client), one line at a time.
+pub struct Conversation {
+    path: String,
+    count: usize,
+    tokens: usize,
+}
+
+impl Conversation {
+    /// Open a fresh conversation at `path`, truncating any prior contents.
+    pub fn new(path: String) -> Self {
+        let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+        if fd >= 0 { close(fd); }
+        Conversation { path, count: 0, tokens: 0 }
+    }
+
+    pub fn path(&self) -> &str { &self.path }
+    pub fn len(&self) -> usize { self.count }
+    pub fn tokens(&self) -> usize { self.tokens }
+
+    /// Append one message as a JSONL line. Returns false on write failure (a
+    /// short/torn write leaves a line without a trailing '\n', which the request
+    /// builder drops on read).
+    pub fn append(&mut self, msg: &Message) -> bool {
+        let fd = open(&self.path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_APPEND);
+        if fd < 0 { return false; }
+        let mut line = String::new();
+        msg.write_json(&mut line);
+        line.push('\n');
+        let n = write_fd(fd, line.as_bytes());
+        close(fd);
+        if n < 0 || n as usize != line.len() { return false; }
+        self.count += 1;
+        self.tokens += message_tokens(msg);
+        true
+    }
+
+    /// Replace the entire conversation with `msgs` (truncate + rewrite). Used by
+    /// `/clear` and context compaction.
+    pub fn reseed(&mut self, msgs: &[Message]) -> bool {
+        let fd = open(&self.path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+        if fd < 0 { return false; }
+        let mut count = 0usize;
+        let mut tokens = 0usize;
+        let mut line = String::new();
+        let mut ok = true;
+        for m in msgs {
+            line.clear();
+            m.write_json(&mut line);
+            line.push('\n');
+            let n = write_fd(fd, line.as_bytes());
+            if n < 0 || n as usize != line.len() { ok = false; break; }
+            count += 1;
+            tokens += message_tokens(m);
+        }
+        close(fd);
+        if ok {
+            self.count = count;
+            self.tokens = tokens;
+        }
+        ok
+    }
 }
 
 #[cfg(feature = "tests")]
@@ -110,13 +180,12 @@ pub fn run_tests() -> i32 {
         else { libakuma::print(&format!("  [!] write_json escape: got {:?}\n", out)); }
     }
 
-    // calculate_history_tokens returns > 0 for non-empty history
+    // message_tokens returns > 0 for a non-empty message
     total += 1;
     {
-        let h = alloc::vec![Message::new("user", "hello world")];
-        let tokens = calculate_history_tokens(&h);
+        let tokens = message_tokens(&Message::new("user", "hello world"));
         if tokens > 0 { passed += 1; }
-        else { libakuma::print("  [!] calculate_history_tokens returned 0\n"); }
+        else { libakuma::print("  [!] message_tokens returned 0\n"); }
     }
 
     libakuma::print(&format!("  result: {}/{}\n", passed, total));

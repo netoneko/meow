@@ -24,6 +24,14 @@ pub const MAX_TOOL_OUTPUT_SIZE: usize = 32 * 1024;
 /// Default size for the buffer used by tool_shell to capture command output
 pub const TOOL_BUFFER_SIZE: usize = 8 * 1024; // 8KB
 
+/// Use meow's in-process "pretend shell" for the Shell tool instead of shelling
+/// out to busybox. The pretend shell parses `&&`, `||`, `>`, `>>` itself and
+/// emulates redirects by capturing each child's stdout and re-writing it to a
+/// file or `tcp:HOST:PORT` socket backend. ON by default — removes the hard
+/// dependency on /bin/busybox. Set false to fall back to the busybox path.
+/// See tools/pretend_shell.rs and docs/SHELL.md.
+pub const USE_PRETEND_SHELL: bool = true;
+
 /// Whether testing-related code (output capture, `meow test`) is active.
 /// Driven by the `tests` cargo feature (off by default); when false the
 /// capture branches compile to dead code and are dropped by the optimizer.

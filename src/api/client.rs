@@ -10,7 +10,6 @@ use core::fmt::Write;
 use crate::ui::tui::layout::Stdout;
 
 use crate::config::{Provider, OPENAI_TOOLS_JSON};
-use crate::app::history::Message;
 use crate::tui_app;
 use super::types::{StreamResponse, StreamStats, ToolCallData};
 
@@ -24,14 +23,14 @@ const DEFAULT_MAX_TOKENS: usize = 16384;
 pub fn send_with_retry(
     model: &str,
     provider: &Provider,
-    history: &[Message],
+    conversation_path: &str,
     is_continuation: bool,
     current_tokens: usize,
     token_limit: usize,
     mem_kb: usize,
 ) -> Result<StreamResponse, &'static str> {
     let body_path = request_body_path();
-    let body_len = write_chat_body(&body_path, model, history)?;
+    let body_len = write_chat_body(&body_path, model, conversation_path)?;
     let result = send_with_retry_inner(
         provider, &body_path, body_len,
         is_continuation, current_tokens, token_limit, mem_kb,
@@ -302,11 +301,12 @@ fn fd_write_str(fd: i32, s: &str, total: &mut usize) -> bool {
     true
 }
 
-/// Serialize the full OpenAI chat-completions request body to `path`, one
-/// message at a time, so peak memory stays bounded by the largest single
-/// message (the static tools schema is streamed directly, never copied).
-/// Returns the number of body bytes written.
-fn write_chat_body(path: &str, model: &str, history: &[Message]) -> Result<usize, &'static str> {
+/// Serialize the full OpenAI chat-completions request body to `path`, reading
+/// the conversation messages from the on-disk JSONL log one line at a time so
+/// peak memory stays bounded by the largest single message — the whole
+/// conversation is never materialized in RAM (the static tools schema is
+/// streamed directly from the const, never copied). Returns body bytes written.
+fn write_chat_body(path: &str, model: &str, conversation_path: &str) -> Result<usize, &'static str> {
     let sandbox = crate::tools::get_sandbox_root();
     let tmp_dir = if sandbox == "/" { String::from("/tmp") } else { format!("{}/tmp", sandbox) };
     let _ = libakuma::mkdir(&tmp_dir);
@@ -320,8 +320,7 @@ fn write_chat_body(path: &str, model: &str, history: &[Message]) -> Result<usize
     }
 
     let mut total = 0usize;
-    let mut scratch = String::new();
-    let ok = write_chat_body_inner(fd, model, history, &mut scratch, &mut total);
+    let ok = write_chat_body_inner(fd, model, conversation_path, &mut total);
     libakuma::close(fd);
 
     if ok { Ok(total) } else { Err("Failed to write request buffer") }
@@ -330,32 +329,24 @@ fn write_chat_body(path: &str, model: &str, history: &[Message]) -> Result<usize
 fn write_chat_body_inner(
     fd: i32,
     model: &str,
-    history: &[Message],
-    scratch: &mut String,
+    conversation_path: &str,
     total: &mut usize,
 ) -> bool {
-    scratch.clear();
+    let mut scratch = String::new();
     scratch.push_str("{\"model\":\"");
-    json_escape_to(model, scratch);
+    json_escape_to(model, &mut scratch);
     scratch.push_str("\",\"messages\":[");
-    if !fd_write_str(fd, scratch, total) {
+    if !fd_write_str(fd, &scratch, total) {
         return false;
     }
 
-    for (i, msg) in history.iter().enumerate() {
-        scratch.clear();
-        if i > 0 {
-            scratch.push(',');
-        }
-        msg.write_json(scratch);
-        if !fd_write_str(fd, scratch, total) {
-            return false;
-        }
+    if !stream_conversation_messages(fd, conversation_path, total) {
+        return false;
     }
 
     scratch.clear();
     let _ = write!(scratch, "],\"stream\":true,\"max_tokens\":{},\"tools\":", DEFAULT_MAX_TOKENS);
-    if !fd_write_str(fd, scratch, total) {
+    if !fd_write_str(fd, &scratch, total) {
         return false;
     }
     // Stream the large, static tools schema straight from the const.
@@ -363,6 +354,51 @@ fn write_chat_body_inner(
         return false;
     }
     fd_write_str(fd, ",\"tool_choice\":\"auto\"}", total)
+}
+
+/// Stream the JSONL conversation log into the request body as the contents of
+/// the `messages` array: each complete line is one message object, emitted
+/// comma-separated. Reads in fixed chunks, splitting on '\n' so RAM is bounded
+/// by the longest single message. A trailing partial line (no newline — e.g. a
+/// torn append) is dropped. A missing/empty log yields an empty array.
+fn stream_conversation_messages(fd: i32, conversation_path: &str, total: &mut usize) -> bool {
+    let cfd = libakuma::open(conversation_path, libakuma::open_flags::O_RDONLY);
+    if cfd < 0 {
+        return true; // no conversation yet -> empty messages array
+    }
+    let mut buf = [0u8; 4096];
+    let mut carry: Vec<u8> = Vec::new();
+    let mut first = true;
+    loop {
+        let n = libakuma::read_fd(cfd, &mut buf);
+        if n <= 0 {
+            break;
+        }
+        carry.extend_from_slice(&buf[..n as usize]);
+        loop {
+            let nl = match carry.iter().position(|&b| b == b'\n') {
+                Some(p) => p,
+                None => break,
+            };
+            {
+                let line = core::str::from_utf8(&carry[..nl]).unwrap_or("").trim();
+                if !line.is_empty() {
+                    if !first && !fd_write_str(fd, ",", total) {
+                        libakuma::close(cfd);
+                        return false;
+                    }
+                    first = false;
+                    if !fd_write_str(fd, line, total) {
+                        libakuma::close(cfd);
+                        return false;
+                    }
+                }
+            }
+            carry.drain(..nl + 1);
+        }
+    }
+    libakuma::close(cfd);
+    true
 }
 
 fn read_streaming_with_http_stream_tls(

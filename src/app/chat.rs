@@ -1,5 +1,4 @@
 use alloc::string::String;
-use alloc::vec::Vec;
 use alloc::format;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -8,15 +7,15 @@ use crate::util::json_escape_to;
 use crate::api::{self, StreamResponse, ToolCallData};
 use crate::tools;
 use crate::tui_app;
-use super::history::{Message, compact_history, calculate_history_tokens, MAX_HISTORY_SIZE};
+use super::history::{Message, Conversation, MAX_HISTORY_SIZE};
 
 const MAX_TOOL_ITERATIONS: usize = 20;
 
 /// Warn once per session when history hits the cap. Auto-compaction at this
 /// threshold is not yet implemented; for now we just surface the condition.
 static HISTORY_LIMIT_WARNED: AtomicBool = AtomicBool::new(false);
-fn warn_if_history_full(history: &[Message]) {
-    if history.len() >= MAX_HISTORY_SIZE && !HISTORY_LIMIT_WARNED.swap(true, Ordering::SeqCst) {
+fn warn_if_history_full(count: usize) {
+    if count >= MAX_HISTORY_SIZE && !HISTORY_LIMIT_WARNED.swap(true, Ordering::SeqCst) {
         print_msg(
             COLOR_YELLOW,
             &format!(
@@ -31,21 +30,21 @@ pub fn chat_once(
     model: &str,
     provider: &Provider,
     user_message: &str,
-    history: &mut Vec<Message>,
+    conversation: &mut Conversation,
     context_window: Option<usize>,
     system_prompt: &str,
 ) -> Result<(), &'static str> {
-    warn_if_history_full(history);
-    history.push(Message::new("user", user_message));
+    warn_if_history_full(conversation.len());
+    conversation.append(&Message::new("user", user_message));
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
-        let current_tokens = calculate_history_tokens(history);
+        let current_tokens = conversation.tokens();
         let mem_kb = libakuma::memory_usage() / 1024;
         let token_limit = context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
 
-        // The request body is serialized straight to a temp file and streamed
-        // to the provider, so the conversation is never fully held in memory.
-        let stream_result = api::send_with_retry(model, provider, history, iteration > 0, current_tokens, token_limit, mem_kb);
+        // The request body is streamed straight from the on-disk conversation
+        // log into a temp file, so the conversation is never held in memory.
+        let stream_result = api::send_with_retry(model, provider, conversation.path(), iteration > 0, current_tokens, token_limit, mem_kb);
         
         let stream_result = match stream_result {
             Ok(res) => res,
@@ -60,8 +59,8 @@ pub fn chat_once(
             StreamResponse::Partial(partial, stats) => {
                 print_stats(&stats, &partial);
                 if !partial.is_empty() {
-                    history.push(Message::new("assistant", &partial));
-                    history.push(Message::new("user", "[System: Your response was cut off mid-stream. Please continue exactly where you left off.]"));
+                    conversation.append(&Message::new("assistant", &partial));
+                    conversation.append(&Message::new("user", "[System: Your response was cut off mid-stream. Please continue exactly where you left off.]"));
                 }
                 continue;
             }
@@ -73,7 +72,7 @@ pub fn chat_once(
                 let tc_json = serialize_tool_calls(&tool_calls);
                 let mut asst_msg = Message::new("assistant", &content);
                 asst_msg.tool_calls_json = Some(tc_json);
-                history.push(asst_msg);
+                conversation.append(&asst_msg);
 
                 for tc in &tool_calls {
                     if tc.name == "CompactContext" {
@@ -81,15 +80,16 @@ pub fn chat_once(
                         if summary.is_empty() {
                             let mut result_msg = Message::new("tool", "CompactContext requires a non-empty summary");
                             result_msg.tool_call_id = Some(tc.id.clone());
-                            history.push(result_msg);
+                            conversation.append(&result_msg);
                         } else {
-                            let tokens_before = calculate_history_tokens(history);
-                            history.clear();
-                            history.push(Message::new("system", system_prompt));
+                            let tokens_before = conversation.tokens();
                             let compact_msg = format!("[Previous Conversation Summary]\n{}\n[End Summary]\n\nThe conversation has been compacted. Continue from here.", summary);
-                            history.push(Message::new("user", &compact_msg));
-                            history.push(Message::new("assistant", "Context loaded. Ready to continue."));
-                            let tokens_after = calculate_history_tokens(history);
+                            conversation.reseed(&[
+                                Message::new("system", system_prompt),
+                                Message::new("user", &compact_msg),
+                                Message::new("assistant", "Context loaded. Ready to continue."),
+                            ]);
+                            let tokens_after = conversation.tokens();
                             print_msg(COLOR_GREEN_LIGHT, &format!("\n[*] Context compacted: {} -> {} tokens\n", tokens_before, tokens_after));
                             return Ok(());
                         }
@@ -135,23 +135,21 @@ pub fn chat_once(
                     };
                     let mut result_msg = Message::new("tool", &result_content);
                     result_msg.tool_call_id = Some(tc.id.clone());
-                    history.push(result_msg);
+                    conversation.append(&result_msg);
                 }
 
-                warn_if_history_full(history);
-                compact_history(history);
+                warn_if_history_full(conversation.len());
                 continue;
             }
 
             StreamResponse::Complete(assistant_response, stats) => {
                 print_stats(&stats, &assistant_response);
                 if !assistant_response.is_empty() {
-                    history.push(Message::new("assistant", &assistant_response));
+                    conversation.append(&Message::new("assistant", &assistant_response));
                 }
-                warn_if_history_full(history);
-                compact_history(history);
+                warn_if_history_full(conversation.len());
                 if let Some(ctx_window) = context_window {
-                    let current_tokens = calculate_history_tokens(history);
+                    let current_tokens = conversation.tokens();
                     if current_tokens > TOKEN_LIMIT_FOR_COMPACTION && current_tokens < ctx_window {
                         print_msg(COLOR_RESET, "\n[!] Token count is high - consider asking to compact context\n");
                     }

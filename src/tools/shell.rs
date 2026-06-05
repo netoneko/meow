@@ -3,22 +3,27 @@ use alloc::vec::Vec;
 use alloc::format;
 use libakuma::{spawn, waitpid, read_fd, close, open, open_flags};
 
-use crate::config::TOOL_BUFFER_SIZE;
+use crate::config::{TOOL_BUFFER_SIZE, USE_PRETEND_SHELL};
 use super::mod_types::ToolResult;
+use super::pretend_shell;
 
 const EAGAIN_ERRNO: i64 = -11; // Value of EAGAIN from libc_errno
 
-/// Shell binary used to interpret command lines. busybox is a static-pie
-/// aarch64 build (see bootstrap/bin/busybox); `busybox sh -c "<line>"` runs the
-/// ash applet, giving full shell grammar — &&, ||, |, ;, >, <, globbing, $VARS.
+/// Shell binary used to interpret command lines when the pretend shell is
+/// disabled. busybox is a static-pie aarch64 build (see bootstrap/bin/busybox);
+/// `busybox sh -c "<line>"` runs the ash applet, giving full shell grammar.
 const SHELL_BIN: &str = "/bin/busybox";
 
 pub fn tool_shell(command: &str) -> ToolResult {
-    // Route the command line through a real shell so operators work as the
-    // model expects. meow itself does NOT parse shell grammar — without this,
-    // `tcc a.c && ./a` would pass `&&` and `./a` as extra argv to tcc.
-    //
-    // If no shell is installed (minimal image), fall back to the legacy path:
+    // Default path: meow's own in-process "pretend shell". It parses the
+    // operators we care about (&&, ||, >, >>) itself and emulates redirects by
+    // capturing each child's stdout and re-writing it to a file/socket backend.
+    // This removes the hard dependency on busybox being present on disk.
+    if USE_PRETEND_SHELL {
+        return pretend_shell::run(command);
+    }
+
+    // Legacy path: route the line through busybox if it is installed, otherwise
     // tokenize on whitespace and exec the first token directly (no operators).
     let shell_fd = open(SHELL_BIN, open_flags::O_RDONLY);
     if shell_fd >= 0 {
@@ -26,7 +31,6 @@ pub fn tool_shell(command: &str) -> ToolResult {
         return run_and_capture(SHELL_BIN, &["sh", "-c", command]);
     }
 
-    // Fallback: no shell on disk — exec the first token directly.
     let tokens = tokenize_command(command);
     if tokens.is_empty() {
         return ToolResult::err("Empty command");
@@ -40,7 +44,7 @@ pub fn tool_shell(command: &str) -> ToolResult {
 /// Resolve a bare binary name against /bin and /usr/bin. Absolute or relative
 /// paths are returned unchanged; an unresolved name is returned as-is so spawn
 /// can report a clean "not found".
-fn resolve_binary(binary: &str) -> String {
+pub fn resolve_binary(binary: &str) -> String {
     if binary.starts_with('/') || binary.starts_with('.') {
         return String::from(binary);
     }
@@ -55,85 +59,109 @@ fn resolve_binary(binary: &str) -> String {
     String::from(binary)
 }
 
-/// Spawn `binary_path` with `args`, drain its stdout (with a 30s timeout and a
-/// 1 MB output cap), and return the captured output plus exit code.
-fn run_and_capture(binary_path: &str, args: &[&str]) -> ToolResult {
-    // Spawn the process
+/// Spawn `binary_path` with `args`, drive the child to completion, and invoke
+/// `on_chunk` for each stdout chunk as it arrives. Enforces a 30s wall-clock
+/// timeout (the child is killed if exceeded). If `on_chunk` returns `Err`, the
+/// child is killed and that error is propagated. Returns the child's exit code.
+///
+/// This is the shared workhorse. Buffering vs streaming is the caller's choice:
+/// `spawn_and_collect` accumulates into a `Vec`, while the pretend shell pipes
+/// each chunk straight into a file/socket fd (bounded memory, no full buffer).
+pub fn drain_child<F>(binary_path: &str, args: &[&str], mut on_chunk: F) -> Result<i32, String>
+where
+    F: FnMut(&[u8]) -> Result<(), String>,
+{
     let result = match spawn(binary_path, Some(args)) {
         Some(r) => r,
-        None => return ToolResult::err(&format!("Failed to spawn '{}' (not found?)", binary_path)),
+        None => return Err(format!("Failed to spawn '{}' (not found?)", binary_path)),
     };
 
-    // Read output from child process
-    let mut output = Vec::new();
-    let mut buf = [0u8; TOOL_BUFFER_SIZE]; 
+    let mut buf = [0u8; TOOL_BUFFER_SIZE];
     let mut waited_ms = 0u32;
     let max_wait_ms = 30000; // 30 seconds timeout
-    let max_shell_output = 1024 * 1024; // 1MB absolute max for shell output to avoid OOM
 
     loop {
-        // Try to read all available data without blocking indefinitely
         let n = read_fd(result.stdout_fd as i32, &mut buf);
         if n > 0 {
-            if output.len() + n as usize > max_shell_output {
-                let _ = libakuma::kill(result.pid); // Kill runaway process
+            if let Err(e) = on_chunk(&buf[..n as usize]) {
+                let _ = libakuma::kill(result.pid);
                 close(result.stdout_fd as i32);
-                return ToolResult::err("Command produced too much output (exceeded 1MB limit)");
+                return Err(e);
             }
-            output.extend_from_slice(&buf[..n as usize]);
-            waited_ms = 0; // Reset timeout if we're making progress
+            waited_ms = 0; // Reset timeout while making progress
         } else if n < 0 && n == EAGAIN_ERRNO as isize {
             // EAGAIN: no data available right now, but process not exited.
         }
 
-        // Check if process has exited
         if let Some((_pid, exit_code)) = waitpid(result.pid) {
-            // Process has exited. Do one final aggressive drain to ensure all remaining output is captured.
+            // Final aggressive drain of anything still buffered in the pipe.
             loop {
                 let n_final = read_fd(result.stdout_fd as i32, &mut buf);
                 if n_final > 0 {
-                    output.extend_from_slice(&buf[..n_final as usize]);
+                    if let Err(e) = on_chunk(&buf[..n_final as usize]) {
+                        close(result.stdout_fd as i32);
+                        return Err(e);
+                    }
                 } else {
                     break;
                 }
             }
             close(result.stdout_fd as i32);
-
-            let output_str = core::str::from_utf8(&output).unwrap_or("<binary output>");
-
-            let mut result_str = String::new();
-            if !output_str.is_empty() {
-                result_str.push_str("stdout:\n```\n");
-                result_str.push_str(output_str);
-                result_str.push_str("```\n");
-                result_str.push_str(&format!("Exit code: {}", exit_code));
-            } else {
-                result_str.push_str(&format!("(No output)\nExit code: {}", exit_code));
-            }
-
-            if exit_code == 0 {
-                return ToolResult::ok(result_str);
-            } else {
-                return ToolResult {
-                    success: false,
-                    output: result_str,
-                };
-            }
+            return Ok(exit_code);
         }
-        
-        // If no data and process not exited, sleep briefly before next poll
+
         libakuma::sleep_ms(50);
         waited_ms += 50;
-
         if waited_ms >= max_wait_ms {
             let _ = libakuma::kill(result.pid);
             close(result.stdout_fd as i32);
-            return ToolResult::err("Command timed out after 30 seconds");
+            return Err(String::from("Command timed out after 30 seconds"));
         }
     }
 }
 
-/// Tokenize a command string into arguments
+/// Spawn `binary_path` with `args` and collect the child's stdout into a byte
+/// buffer, returning `(output, exit_code)`. Caps the buffer at 1 MB (the child
+/// is killed if exceeded). Used for output that must be returned to the model.
+pub fn spawn_and_collect(binary_path: &str, args: &[&str]) -> Result<(Vec<u8>, i32), String> {
+    let mut output = Vec::new();
+    let max_shell_output = 1024 * 1024; // 1MB absolute max to avoid OOM
+    let exit_code = drain_child(binary_path, args, |chunk| {
+        if output.len() + chunk.len() > max_shell_output {
+            return Err(String::from("Command produced too much output (exceeded 1MB limit)"));
+        }
+        output.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    Ok((output, exit_code))
+}
+
+/// Spawn `binary_path` with `args`, collect stdout, and format a ToolResult.
+fn run_and_capture(binary_path: &str, args: &[&str]) -> ToolResult {
+    let (output, exit_code) = match spawn_and_collect(binary_path, args) {
+        Ok(v) => v,
+        Err(e) => return ToolResult::err(&e),
+    };
+
+    let output_str = core::str::from_utf8(&output).unwrap_or("<binary output>");
+    let mut result_str = String::new();
+    if !output_str.is_empty() {
+        result_str.push_str("stdout:\n```\n");
+        result_str.push_str(output_str);
+        result_str.push_str("```\n");
+        result_str.push_str(&format!("Exit code: {}", exit_code));
+    } else {
+        result_str.push_str(&format!("(No output)\nExit code: {}", exit_code));
+    }
+
+    if exit_code == 0 {
+        ToolResult::ok(result_str)
+    } else {
+        ToolResult { success: false, output: result_str }
+    }
+}
+
+/// Tokenize a command string into arguments (quote-aware, no operators).
 pub fn tokenize_command(cmd: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();

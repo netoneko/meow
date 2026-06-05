@@ -18,9 +18,8 @@ mod util;
 
 use alloc::format;
 use alloc::string::String;
-use alloc::vec::Vec;
 
-use app::Message;
+use app::{Message, Conversation};
 use config::{Config, DEFAULT_CONTEXT_WINDOW, NO_PERSONA, PERSONALITIES, Provider};
 use libakuma::{arg, argc, close, exit, fstat, open, open_flags, read_fd};
 
@@ -147,8 +146,8 @@ pub extern "C" fn main() {
 
 
     if use_tui || one_shot_message.is_none() {
-        let mut history: Vec<Message> = Vec::new();
-        history.push(Message::new("system", &system_prompt));
+        let mut conversation = Conversation::new(app::conversation_path());
+        conversation.append(&Message::new("system", &system_prompt));
 
         let initial_cwd = tools::get_working_dir();
         let sandbox_root = tools::get_sandbox_root();
@@ -163,11 +162,11 @@ pub extern "C" fn main() {
                 initial_cwd, sandbox_root
             )
         };
-        history.push(Message::new("user", &cwd_context));
+        conversation.append(&Message::new("user", &cwd_context));
 
         let persona = get_active_personality(&app_config, no_personality);
         let ack_msg = persona.ack_tui;
-        history.push(Message::new("assistant", ack_msg));
+        conversation.append(&Message::new("assistant", ack_msg));
 
         // Skip blocking model info query on startup to prevent hangs.
         // It can be queried later if needed or configured via commands.
@@ -180,7 +179,7 @@ pub extern "C" fn main() {
             &mut current_model,
             &mut current_provider,
             &mut app_config,
-            &mut history,
+            &mut conversation,
             context_window,
             &system_prompt,
         ) {
@@ -191,8 +190,8 @@ pub extern "C" fn main() {
     }
 
     if let Some(msg) = one_shot_message {
-        let mut history = Vec::new();
-        history.push(Message::new("system", &system_prompt));
+        let mut conversation = Conversation::new(app::conversation_path());
+        conversation.append(&Message::new("system", &system_prompt));
         let initial_cwd = tools::get_working_dir();
         let sandbox_root = tools::get_sandbox_root();
         let cwd_context = if sandbox_root == "/" {
@@ -206,17 +205,17 @@ pub extern "C" fn main() {
                 initial_cwd, sandbox_root
             )
         };
-        history.push(Message::new("user", &cwd_context));
+        conversation.append(&Message::new("user", &cwd_context));
 
         let persona = get_active_personality(&app_config, no_personality);
         let ack_msg = persona.ack_tui;
-        history.push(Message::new("assistant", ack_msg));
+        conversation.append(&Message::new("assistant", ack_msg));
 
         match app::chat_once(
             &model,
             &current_provider,
             &msg,
-            &mut history,
+            &mut conversation,
             None,
             &system_prompt,
         ) {

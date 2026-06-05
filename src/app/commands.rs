@@ -5,7 +5,7 @@ use alloc::format;
 use crate::config::{Config, Provider, TOKEN_LIMIT_FOR_COMPACTION};
 use crate::api;
 use crate::tui_app;
-use super::history::{Message, calculate_history_tokens};
+use super::history::{Message, Conversation};
 
 pub enum CommandResult {
     Continue,
@@ -17,7 +17,7 @@ pub fn handle_command(
     model: &mut String,
     provider: &mut Provider,
     config: &mut Config,
-    history: &mut Vec<Message>,
+    conversation: &mut Conversation,
     system_prompt: &str,
 ) -> (CommandResult, Option<String>) {
     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
@@ -29,8 +29,7 @@ pub fn handle_command(
             (CommandResult::Quit, Some(String::from("Goodbye.")))
         }
         "/clear" | "/reset" => {
-            history.clear();
-            history.push(Message::new("system", system_prompt));
+            conversation.reseed(&[Message::new("system", system_prompt)]);
             (CommandResult::Continue, Some(String::from("History cleared.")))
         }
         "/model" => {
@@ -94,7 +93,7 @@ pub fn handle_command(
             }
         }
         "/tokens" => {
-            let current = calculate_history_tokens(history);
+            let current = conversation.tokens();
             (CommandResult::Continue, Some(format!("Current token usage: {} / {}\n  Ask the AI to 'compact the context' when tokens are high.", current, TOKEN_LIMIT_FOR_COMPACTION)))
         }
         "/personality" => {

@@ -1,5 +1,4 @@
 use alloc::string::String;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use libakuma::{
@@ -8,7 +7,7 @@ use libakuma::{
 };
 
 use crate::config::{Provider, Config, COLOR_GRAY_BRIGHT, COLOR_YELLOW, COLOR_RESET, COLOR_BOLD, COLOR_VIOLET, COLOR_USER};
-use crate::app::{self, Message, commands::CommandResult, calculate_history_tokens, compact_history, state};
+use crate::app::{self, Message, Conversation, commands::CommandResult, state};
 use crate::ui::tui::layout::{get_pane_layout, TERM_WIDTH, TERM_HEIGHT};
 use crate::ui::tui::input::{self, InputEvent, CURSOR_IDX};
 use crate::ui::tui::render;
@@ -217,7 +216,7 @@ fn probe_terminal_size() -> (u16, u16) {
     (100, 25)
 }
 
-pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config, history: &mut Vec<Message>, context_window: usize, system_prompt: &str) -> Result<(), &'static str> {
+pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config, conversation: &mut Conversation, context_window: usize, system_prompt: &str) -> Result<(), &'static str> {
     let _guard = TuiGuard::new();
     let mut old_mode: u64 = 0;
     get_terminal_attributes(fd::STDIN, &mut old_mode as *mut u64 as u64);
@@ -245,7 +244,7 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
     layout.output_row = o_r; layout.output_col = 0;
 
     loop {
-        let c_t = calculate_history_tokens(history);
+        let c_t = conversation.tokens();
         let m_kb = libakuma::memory_usage() / 1024;
         state::set_last_history_kb(c_t / 1024);
         render::render_footer(c_t, context_window, m_kb);
@@ -277,7 +276,7 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
             tui_print("\n");
 
             if u_i.starts_with('/') {
-                let (res, out) = app::commands::handle_command(&u_i, model, provider, config, history, system_prompt);
+                let (res, out) = app::commands::handle_command(&u_i, model, provider, config, conversation, system_prompt);
                 if let Some(o) = out {
                     tui_print_with_indent("\n", "", 0, None);
                     if config.render_markdown {
@@ -286,18 +285,17 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
                         tui_print_assistant(&o);
                     }
                     tui_print_with_indent("\n\n", "", 0, None);
-                    history.push(Message::new("system", &o));
+                    conversation.append(&Message::new("system", &o));
                 }
                 if let CommandResult::Quit = res { break; }
             } else {
                 state::STREAMING.store(true, Ordering::SeqCst);
                 layout.update_status("[MEOW] jacking in", 1, None);
                 tui_print("\n\n");
-                let _ = app::chat::chat_once(model, provider, &u_i, history, Some(context_window), system_prompt);
+                let _ = app::chat::chat_once(model, provider, &u_i, conversation, Some(context_window), system_prompt);
                 state::STREAMING.store(false, Ordering::SeqCst); state::CANCELLED.store(false, Ordering::SeqCst);
                 layout.clear_status();
                 let _ = writeln!(stdout, "{}", COLOR_RESET);
-                compact_history(history);
             }
         }
     }
