@@ -1,6 +1,5 @@
 pub mod context;
 pub mod fs;
-pub mod git;
 pub mod net;
 pub mod shell;
 pub mod helpers;
@@ -60,10 +59,6 @@ pub fn execute_tool_by_name(name: &str, args_json: &str) -> Option<ToolResult> {
         "HttpFetch" => {
             let url = extract_string_field(args_json, "url")?;
             Some(net::tool_http_fetch(&url))
-        }
-        "Git" => {
-            let args = extract_string_field(args_json, "args")?;
-            Some(git::tool_git(&args))
         }
         "FileReadLines" => {
             let filename = extract_string_field(args_json, "filename")?;

@@ -41,7 +41,13 @@ pub extern "C" fn main() {
                 exit(run_init(&mut app_config));
             }
             if first_arg == "test" || first_arg == "test_stream" {
+                #[cfg(feature = "tests")]
                 exit(run_all_tests());
+                #[cfg(not(feature = "tests"))]
+                {
+                    libakuma::print("meow: built without the test suite (rebuild with --features tests)\n");
+                    exit(1);
+                }
             }
         }
     }
@@ -277,6 +283,7 @@ fn print_usage() {
     );
 }
 
+#[cfg(feature = "tests")]
 fn run_all_tests() -> i32 {
     libakuma::print("=== Meow Test Suite ===\n");
     let mut failures = 0i32;

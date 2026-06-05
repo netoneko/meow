@@ -252,6 +252,7 @@ fn print_tool_notification(tool: &str, args: &str, indent: u16) {
     tui_print_with_indent("", "", indent, None);
 }
 
+#[cfg(feature = "tests")]
 pub fn run_tests() -> i32 {
 
     if !crate::config::ENABLE_TESTS {

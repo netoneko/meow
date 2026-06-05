@@ -165,6 +165,7 @@ pub fn handle_command(
 ");
             (CommandResult::Continue, Some(output))
         }
+        #[cfg(feature = "tests")]
         "/test" | "/test_stream" => {
             let res = crate::app::history::run_tests()
                 + crate::config::Config::run_tests()

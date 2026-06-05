@@ -205,6 +205,7 @@ fn serialize_tool_calls(tool_calls: &[ToolCallData]) -> String {
     s
 }
 
+#[cfg(feature = "tests")]
 pub fn run_tests() -> i32 {
     use alloc::format;
     let mut passed = 0usize;
@@ -309,14 +310,17 @@ fn format_duration(us: u64) -> String {
 }
 
 fn print_stats(stats: &api::StreamStats, full_response: &str) {
-    let tokens = stats.total_bytes.div_ceil(4);
-    let tps = if stats.stream_us > 0 { (tokens as f64) / (stats.stream_us as f64 / 1_000_000.0) } else { 0.0 };
+    let tokens = stats.total_bytes.div_ceil(4) as u64;
+    // Fixed-point integer math (×100 for KB, ×10 for TPS) avoids dragging in
+    // core's f64 formatting machinery — ~9KB of code + grisu tables for one line.
+    let kb_x100 = (stats.total_bytes as u64 * 100) / 1024;
+    let tps_x10 = if stats.stream_us > 0 { (tokens * 10_000_000) / stats.stream_us } else { 0 };
     if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
         if full_response.ends_with('\n') { tui_app::tui_print_with_indent("\n", "", 0, None); }
         else { tui_app::tui_print_with_indent("\n\n", "", 0, None); }
     } else if full_response.ends_with('\n') { libakuma::print("\n"); }
     else { libakuma::print("\n\n"); }
-    let stats_content = format!("First: {}ms | Stream: {}ms | Size: {:.2}KB | TPS: {:.1}", stats.ttft_us / 1000, stats.stream_us / 1000, stats.total_bytes as f64 / 1024.0, tps);
+    let stats_content = format!("First: {}ms | Stream: {}ms | Size: {}.{:02}KB | TPS: {}.{}", stats.ttft_us / 1000, stats.stream_us / 1000, kb_x100 / 100, kb_x100 % 100, tps_x10 / 10, tps_x10 % 10);
     print_notification(COLOR_YELLOW, &stats_content, stats.ttft_us + stats.stream_us);
 }
 

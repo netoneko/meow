@@ -70,6 +70,7 @@ pub fn calculate_history_tokens(history: &[Message]) -> usize {
         .sum()
 }
 
+#[cfg(feature = "tests")]
 pub fn run_tests() -> i32 {
     use alloc::format;
     let mut passed = 0usize;

@@ -8,45 +8,58 @@ use super::mod_types::ToolResult;
 
 const EAGAIN_ERRNO: i64 = -11; // Value of EAGAIN from libc_errno
 
+/// Shell binary used to interpret command lines. busybox is a static-pie
+/// aarch64 build (see bootstrap/bin/busybox); `busybox sh -c "<line>"` runs the
+/// ash applet, giving full shell grammar — &&, ||, |, ;, >, <, globbing, $VARS.
+const SHELL_BIN: &str = "/bin/busybox";
+
 pub fn tool_shell(command: &str) -> ToolResult {
-    // Parse the command to get the binary and arguments
-    // Simple tokenizer: split on whitespace, respecting quotes
+    // Route the command line through a real shell so operators work as the
+    // model expects. meow itself does NOT parse shell grammar — without this,
+    // `tcc a.c && ./a` would pass `&&` and `./a` as extra argv to tcc.
+    //
+    // If no shell is installed (minimal image), fall back to the legacy path:
+    // tokenize on whitespace and exec the first token directly (no operators).
+    let shell_fd = open(SHELL_BIN, open_flags::O_RDONLY);
+    if shell_fd >= 0 {
+        close(shell_fd);
+        return run_and_capture(SHELL_BIN, &["sh", "-c", command]);
+    }
+
+    // Fallback: no shell on disk — exec the first token directly.
     let tokens = tokenize_command(command);
     if tokens.is_empty() {
         return ToolResult::err("Empty command");
     }
-
-    let binary = &tokens[0];
-    // Skip argv[0] - the kernel adds the program name automatically
+    let binary_path = resolve_binary(&tokens[0]);
+    // spawn() sets argv[0] to the binary path itself, so pass only tokens[1..].
     let args: Vec<&str> = tokens[1..].iter().map(|s| s.as_str()).collect();
+    run_and_capture(&binary_path, &args)
+}
 
-    // Check for the binary in common paths
-    let binary_path = if binary.starts_with('/') || binary.starts_with('.') {
-        binary.clone()
-    } else {
-        // Try to find the binary
-        let paths = ["/bin/", "/usr/bin/"];
-        let mut found = None;
-        for path in paths {
-            let full_path = format!("{}{}", path, binary);
-            let fd = open(&full_path, open_flags::O_RDONLY);
-            if fd >= 0 {
-                close(fd);
-                found = Some(full_path);
-                break;
-            }
+/// Resolve a bare binary name against /bin and /usr/bin. Absolute or relative
+/// paths are returned unchanged; an unresolved name is returned as-is so spawn
+/// can report a clean "not found".
+fn resolve_binary(binary: &str) -> String {
+    if binary.starts_with('/') || binary.starts_with('.') {
+        return String::from(binary);
+    }
+    for path in ["/bin/", "/usr/bin/"] {
+        let full_path = format!("{}{}", path, binary);
+        let fd = open(&full_path, open_flags::O_RDONLY);
+        if fd >= 0 {
+            close(fd);
+            return full_path;
         }
-        match found {
-            Some(p) => p,
-            None => {
-                // Try the binary name directly
-                binary.clone()
-            }
-        }
-    };
+    }
+    String::from(binary)
+}
 
+/// Spawn `binary_path` with `args`, drain its stdout (with a 30s timeout and a
+/// 1 MB output cap), and return the captured output plus exit code.
+fn run_and_capture(binary_path: &str, args: &[&str]) -> ToolResult {
     // Spawn the process
-    let result = match spawn(&binary_path, Some(&args[..])) {
+    let result = match spawn(binary_path, Some(args)) {
         Some(r) => r,
         None => return ToolResult::err(&format!("Failed to spawn '{}' (not found?)", binary_path)),
     };

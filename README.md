@@ -86,17 +86,11 @@ The LLM can invoke these tools autonomously:
 
 | Tool | Key args | Description |
 |------|----------|-------------|
-| `Shell` | `cmd` | Execute shell command |
+| `Shell` | `cmd` | Execute shell command (also how git is run, e.g. `git status`, `git commit -m "msg"`) |
 | `Cd` | `path` | Change working directory |
 | `Pwd` | — | Print working directory |
 
-### Git
-
-| Tool | Key args | Description |
-|------|----------|-------------|
-| `Git` | `args` | Run any git subcommand, e.g. `status`, `commit -m "msg"`, `log --oneline`, `push`. Force-push is blocked. |
-
-> A single `Git` tool replaces the former per-subcommand tools (`GitStatus`, `GitCommit`, …), which were all thin `git <subcommand>` shell wrappers. This trims ~40% of the tools schema. Anything reachable via the old tools is reachable as `Git { "args": "<subcommand …>" }` (or directly via `Shell`).
+> **Git** has no dedicated tool. The former 13 per-subcommand git tools — and the single `Git` tool that briefly replaced them — were all just `git <subcommand>` shell-outs, so they were dropped entirely. The model runs git through `Shell`, e.g. `Shell { "cmd": "git commit -m 'msg'" }`.
 
 ### Network
 
@@ -126,6 +120,19 @@ Run `meow init` to view current settings. See [docs/CONFIG.md](docs/CONFIG.md) f
 cd userspace
 ./build.sh --meow-only
 ```
+
+`build.sh` builds meow size-optimized: it rebuilds `core`/`alloc` from source
+(`-Z build-std`, nightly) with the `immediate-abort` panic strategy, shaving a
+page off the binary. Panics therefore trap immediately rather than printing via
+the panic handler.
+
+Relevant cargo features (see `Cargo.toml`):
+
+| Feature | Default | Effect |
+|---------|---------|--------|
+| `compact-tools` | **on** | Ship the tools schema without per-tool descriptions (~930 fewer tokens/request). `--no-default-features` restores the descriptive schema. |
+| `tests` | off | Compile the in-binary self-test suite (`meow test`, `/test`). Omitted from shipped builds. |
+| `size` | off | Cap in-memory tool output at 2KB (vs 32KB). |
 
 ---
 

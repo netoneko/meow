@@ -15,6 +15,11 @@ default = ["compact-tools"]
 # to ship the descriptive schema. See config.rs OPENAI_TOOLS_JSON.
 compact-tools = []
 
+# Compile the in-binary self-test suite (`meow test`) and its capture hooks.
+# OFF by default — the tests are dead weight in shipped builds. Enable with
+# `--features tests` to build a binary that can run `meow test`.
+tests = []
+
 # Memory-constrained build: caps in-memory tool output at 2KB (vs 32KB default).
 # Build with: cargo build --release --features size
 size = []
