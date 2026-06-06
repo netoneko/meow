@@ -33,6 +33,8 @@ pub extern "C" fn main() {
     let mut one_shot_message: Option<String> = None;
     let mut use_tui = true;
 
+    let mut cgi_mode = false;
+
     let mut i = 1;
     if argc() > 1 {
         if let Some(first_arg) = arg(1) {
@@ -79,6 +81,9 @@ pub extern "C" fn main() {
                 }
             } else if arg_str == "-N" || arg_str == "--no-personality" {
                 no_personality = true;
+            } else if arg_str == "--cgi" {
+                cgi_mode = true;
+                use_tui = false;
             } else if arg_str == "-c" || arg_str == "--command" {
                 i += 1;
                 if let Some(msg) = arg(i) {
@@ -102,6 +107,12 @@ pub extern "C" fn main() {
             }
         }
         i += 1;
+    }
+
+    // CGI mode: triggered by REQUEST_METHOD env var (set by httpd for all CGI
+    // spawns) or the explicit --cgi flag.
+    if !cgi_mode {
+        cgi_mode = libakuma::env("REQUEST_METHOD").is_some();
     }
 
     if let Some(ref prov_name) = provider_override {
@@ -144,6 +155,50 @@ pub extern "C" fn main() {
 
     system_prompt.push_str("\n\n");
 
+
+    if cgi_mode {
+        // Read prompt from POST body on stdin (fd 0, provided by httpd)
+        let mut stdin_buf = alloc::vec![0u8; 32 * 1024];
+        let n = read_fd(0, &mut stdin_buf);
+        if n <= 0 {
+            libakuma::print("Content-Type: text/plain\r\n\r\nError: no prompt in POST body\n");
+            exit(1);
+        }
+        let raw = String::from_utf8_lossy(&stdin_buf[..n as usize]);
+        let trimmed = raw.trim();
+        let prompt = String::from(trimmed);
+        if prompt.is_empty() {
+            libakuma::print("Content-Type: text/plain\r\n\r\nError: empty prompt\n");
+            exit(1);
+        }
+
+        // Print CGI response headers before any model output
+        libakuma::print("Content-Type: text/plain\r\n\r\n");
+
+        let mut conversation = Conversation::new(app::conversation_path());
+        conversation.append(&Message::new("system", &system_prompt));
+        let cwd_context = "[System Context] Current working directory: /\nNo sandbox restrictions.";
+        conversation.append(&Message::new("user", cwd_context));
+        let persona = get_active_personality(&app_config, no_personality);
+        conversation.append(&Message::new("assistant", persona.ack_tui));
+
+        match app::chat_once(
+            &model,
+            &current_provider,
+            &prompt,
+            &mut conversation,
+            None,
+            &system_prompt,
+        ) {
+            Ok(_) => { libakuma::print("\n"); exit(0); }
+            Err(e) => {
+                let err_persona = get_active_personality(&app_config, no_personality);
+                let err_msg = err_persona.error_format.replace("{}", e);
+                libakuma::print(&err_msg);
+                exit(1);
+            }
+        }
+    }
 
     if use_tui || one_shot_message.is_none() {
         let mut conversation = Conversation::new(app::conversation_path());
