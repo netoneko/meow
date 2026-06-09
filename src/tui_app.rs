@@ -14,6 +14,7 @@ use crate::ui::tui::render;
 
 pub static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static CANCELLED: AtomicBool = AtomicBool::new(false);
+pub static DEBUG_MODE: AtomicBool = AtomicBool::new(false);
 pub static CUR_COL: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 pub static CUR_ROW: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 

@@ -13,6 +13,14 @@ use crate::config::{Provider, OPENAI_TOOLS_JSON};
 use crate::tui_app;
 use super::types::{StreamResponse, StreamStats, ToolCallData};
 
+fn debug_print(msg: &str) {
+    if tui_app::DEBUG_MODE.load(Ordering::SeqCst) {
+        libakuma::print("[meow:debug] ");
+        libakuma::print(msg);
+        libakuma::print("\n");
+    }
+}
+
 const MAX_RETRIES: u32 = 10;
 const DEFAULT_MAX_TOKENS: usize = 16384;
 
@@ -72,6 +80,12 @@ fn send_with_retry_inner(
 
     let start_time = libakuma::uptime();
     let path = build_request_path(provider);
+    {
+        let mut buf_data = [0u8; 256];
+        let mut buf = StackBuffer::new(&mut buf_data);
+        let _ = write!(buf, "POST {}{}", provider.base_url, path);
+        debug_print(buf.as_str());
+    }
 
     // TLS record buffers are ~17KB each. Allocate them once and reuse across
     // retry attempts (only for HTTPS providers) instead of per-attempt.
@@ -108,10 +122,14 @@ fn send_with_retry_inner(
         let stream = match connect_to_provider(provider) {
             Ok(s) => s,
             Err(e) => {
+                if tui_app::DEBUG_MODE.load(Ordering::SeqCst) {
+                    let mut stdout = Stdout;
+                    let _ = write!(stdout, "\n[meow:debug] connect error (attempt {}): {}\n", attempt, e);
+                }
                 if attempt == MAX_RETRIES - 1 {
-                    if !is_tui { 
+                    if !is_tui {
                         let mut stdout = Stdout;
-                        let _ = write!(stdout, "] {}", e); 
+                        let _ = write!(stdout, "] {}", e);
                     }
                     return Err("Connection failed");
                 }
@@ -224,8 +242,20 @@ fn send_with_retry_inner(
 
 fn connect_to_provider(provider: &Provider) -> Result<TcpStream, String> {
     let (host, port) = provider.host_port().ok_or_else(|| String::from("Invalid provider URL"))?;
+    {
+        let mut buf_data = [0u8; 128];
+        let mut buf = StackBuffer::new(&mut buf_data);
+        let _ = write!(buf, "resolving {}:{}", host, port);
+        debug_print(buf.as_str());
+    }
     let ip = resolve(&host).map_err(|_| format!("DNS resolution failed for: {}", host))?;
     let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port);
+    {
+        let mut buf_data = [0u8; 128];
+        let mut buf = StackBuffer::new(&mut buf_data);
+        let _ = write!(buf, "connecting to {}", addr_str);
+        debug_print(buf.as_str());
+    }
     TcpStream::connect(&addr_str).map_err(|_| format!("Connection failed to: {}", addr_str))
 }
 
@@ -600,7 +630,22 @@ fn read_streaming_response_with_progress(
                 if !headers_parsed {
                     if let Some(pos) = find_header_end(&pending_data) {
                         let header_str = core::str::from_utf8(&pending_data[..pos]).unwrap_or("");
-                        if !header_str.contains(" 200 ") { return Err("Server returned error"); }
+                        if !header_str.contains(" 200 ") {
+                            if tui_app::DEBUG_MODE.load(Ordering::SeqCst) {
+                                let status_line = header_str.lines().next().unwrap_or("?");
+                                let body_start = pos + 4;
+                                let body_preview_end = (body_start + 512).min(pending_data.len());
+                                let body_snippet = core::str::from_utf8(&pending_data[body_start..body_preview_end]).unwrap_or("(non-utf8)");
+                                let mut stdout = Stdout;
+                                let _ = write!(stdout, "\n[meow:debug] server error: {}\n[meow:debug] body: {}\n", status_line, body_snippet);
+                            }
+                            return Err("Server returned error");
+                        }
+                        if tui_app::DEBUG_MODE.load(Ordering::SeqCst) {
+                            let status_line = header_str.lines().next().unwrap_or("?");
+                            let mut stdout = Stdout;
+                            let _ = write!(stdout, "\n[meow:debug] response: {}\n", status_line);
+                        }
                         headers_parsed = true;
                         pending_data.drain(..pos + 4);
                     }
