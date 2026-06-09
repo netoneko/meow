@@ -16,6 +16,21 @@ pub fn json_escape_to(s: &str, out: &mut String) {
     }
 }
 
+/// Extract a named parameter from a CGI QUERY_STRING (e.g. "model=qwen3:4b&foo=bar").
+/// Returns None if the key is absent; Some(value) if present (value may be empty).
+pub fn parse_query_param(query_string: &str, param: &str) -> Option<String> {
+    for part in query_string.split('&') {
+        if let Some(eq_pos) = part.find('=') {
+            if &part[..eq_pos] == param {
+                return Some(String::from(&part[eq_pos + 1..]));
+            }
+        } else if part == param {
+            return Some(String::new());
+        }
+    }
+    None
+}
+
 pub struct StackBuffer<'a> {
     buffer: &'a mut [u8],
     offset: usize,

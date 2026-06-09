@@ -157,6 +157,22 @@ pub extern "C" fn main() {
 
 
     if cgi_mode {
+        // Check QUERY_STRING for per-request model override (?model=<name>)
+        let model = {
+            let mut m = model;
+            if let Some(qs) = libakuma::env("QUERY_STRING") {
+                if let Some(val) = util::parse_query_param(&qs, "model") {
+                    let val = String::from(val.trim());
+                    if val.is_empty() {
+                        libakuma::print("Content-Type: text/plain\r\n\r\nError: unsupported model (empty model name)\n");
+                        exit(1);
+                    }
+                    m = val;
+                }
+            }
+            m
+        };
+
         // Read prompt from POST body on stdin (fd 0, provided by httpd)
         let mut stdin_buf = alloc::vec![0u8; 32 * 1024];
         let n = read_fd(0, &mut stdin_buf);

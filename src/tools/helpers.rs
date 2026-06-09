@@ -33,6 +33,20 @@ pub fn extract_string_field(json: &str, field: &str) -> Option<String> {
                         '"' => result.push('"'),
                         '\\' => result.push('\\'),
                         '/' => result.push('/'),
+                        'u' => {
+                            let mut codepoint: u32 = 0;
+                            for _ in 0..4 {
+                                match chars.next() {
+                                    Some(h @ '0'..='9') => codepoint = codepoint * 16 + (h as u32 - '0' as u32),
+                                    Some(h @ 'a'..='f') => codepoint = codepoint * 16 + (h as u32 - 'a' as u32 + 10),
+                                    Some(h @ 'A'..='F') => codepoint = codepoint * 16 + (h as u32 - 'A' as u32 + 10),
+                                    _ => { codepoint = 0xFFFD; break; }
+                                }
+                            }
+                            if let Some(ch) = char::from_u32(codepoint) {
+                                result.push(ch);
+                            }
+                        }
                         _ => {
                             result.push('\\');
                             result.push(next);
