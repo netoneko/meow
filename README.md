@@ -27,6 +27,10 @@ meow -c "list files in the current directory"
 meow --no-tui -m gemma3:4b -c "summarize this file"
 ```
 
+The **first line** of non-interactive output (both `-c` and CGI mode) is
+`session: <id>`, identifying the on-disk session log for later debugging (see
+[Sessions](#sessions)).
+
 ---
 
 ## Features
@@ -48,6 +52,8 @@ meow --no-tui -m gemma3:4b -c "summarize this file"
 |---------|-------------|
 | `/help` | Show available commands |
 | `/clear` | Clear chat history |
+| `/session` | Describe the current session (id, log path, message/token counts) |
+| `/new` | Start a fresh session |
 | `/model [NAME]` | Show or switch model |
 | `/model list` | List models from current provider |
 | `/provider [NAME]` | Show or switch provider |
@@ -58,6 +64,25 @@ meow --no-tui -m gemma3:4b -c "summarize this file"
 | `/hotkeys` | Show keyboard shortcuts |
 | `/test` | Run built-in tests |
 | `/quit` | Exit |
+
+---
+
+## Sessions
+
+Each conversation is a **session**, backed by its own directory under
+`/tmp/meow/<id>/` (sandbox-prefixed when running sandboxed). The conversation
+log lives at `/tmp/meow/<id>/conversation.jsonl` — one JSON message object per
+line, which is also the source streamed straight into each API request.
+
+The session id is derived from the wall-clock time and pid (`<hex-seconds>-<hex-pid>`),
+so it's unique across concurrent invocations and easy to correlate with logs.
+When the RTC is unavailable the timestamp falls back to monotonic uptime.
+
+- **Interactive (TUI):** the active session id is shown in the startup banner.
+  Use `/session` to print its id, log path, and message/token counts, and
+  `/new` to start a fresh session (allocates a new id + directory and reseeds).
+- **Non-interactive (`-c` / CGI):** the session id is printed as the first line
+  of output (`session: <id>`) so you can find the corresponding log afterward.
 
 ---
 

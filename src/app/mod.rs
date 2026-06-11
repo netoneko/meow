@@ -1,6 +1,7 @@
 pub mod history;
 pub mod chat;
 pub mod commands;
+pub mod session;
 pub mod state;
 
 pub use history::*;

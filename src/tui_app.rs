@@ -8,7 +8,7 @@ use libakuma::{
 
 use crate::config::{Provider, Config, COLOR_GRAY_BRIGHT, COLOR_YELLOW, COLOR_RESET, COLOR_BOLD, COLOR_VIOLET, COLOR_USER};
 use crate::app::{self, Message, Conversation, commands::CommandResult, state};
-use crate::ui::tui::layout::{get_pane_layout, TERM_WIDTH, TERM_HEIGHT};
+use crate::ui::tui::layout::{get_pane_layout, TERM_WIDTH, TERM_HEIGHT, CLEAR_TO_EOL};
 use crate::ui::tui::input::{self, InputEvent, CURSOR_IDX};
 use crate::ui::tui::render;
 
@@ -50,6 +50,25 @@ pub fn clear_streaming_status() {
 }
 pub fn set_model_and_provider(model: &str, provider: &str) { state::set_model_and_provider(model, provider); }
 pub fn tui_is_cancelled() -> bool { state::CANCELLED.load(Ordering::SeqCst) }
+
+/// Update the status row immediately without a full footer repaint.
+/// Safe to call from inside a blocking tool execution.
+pub fn render_status_now(text: &str) {
+    if !TUI_ACTIVE.load(Ordering::SeqCst) { return; }
+    let layout = get_pane_layout();
+    layout.update_status(text, 1, None);
+    let status_row = layout.status_row as u64;
+    akuma_write(fd::STDOUT, b"\x1b[s");
+    set_cursor_position(0, status_row);
+    akuma_write(fd::STDOUT, CLEAR_TO_EOL.as_bytes());
+    if !text.is_empty() {
+        use crate::ui::tui::layout::Stdout;
+        use core::fmt::Write;
+        let mut stdout = Stdout;
+        let _ = write!(stdout, "  {}{}\x1b[0m", COLOR_YELLOW, text);
+    }
+    akuma_write(fd::STDOUT, b"\x1b[u");
+}
 
 static mut STREAMING_RENDERER: Option<crate::ui::tui::stream::StreamingRenderer> = None;
 
@@ -238,7 +257,8 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
     use crate::ui::tui::layout::Stdout;
     use core::fmt::Write;
     let mut stdout = Stdout;
-    let _ = write!(stdout, "  {}TIP:{} Type {}/hotkeys{} to see input shortcuts\n\n", COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, COLOR_RESET);
+    let _ = write!(stdout, "  {}TIP:{} Type {}/hotkeys{} to see input shortcuts\n", COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, COLOR_RESET);
+    let _ = write!(stdout, "  {}Session:{} {}{}{}\n\n", COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, conversation.session_id(), COLOR_RESET);
 
     let o_r = h.saturating_sub(layout.footer_height + 1 + layout.gap());
     CUR_ROW.store(o_r, Ordering::SeqCst); CUR_COL.store(0, Ordering::SeqCst);

@@ -59,16 +59,6 @@ fn message_tokens(msg: &Message) -> usize {
     estimate_tokens(&msg.content) + estimate_tokens(&msg.role) + tc_tokens + 4
 }
 
-/// Sandbox-aware path of the on-disk conversation log.
-pub fn conversation_path() -> String {
-    let sandbox = crate::tools::get_sandbox_root();
-    if sandbox == "/" {
-        String::from("/tmp/.meow_conversation.jsonl")
-    } else {
-        alloc::format!("{}/tmp/.meow_conversation.jsonl", sandbox)
-    }
-}
-
 /// The conversation, backed by an on-disk JSONL log (one message object per
 /// line) rather than an in-heap `Vec<Message>`. On a 6 MB box the resident
 /// `Vec` was the one thing that grew turn-over-turn; the file is the source of
@@ -80,19 +70,39 @@ pub fn conversation_path() -> String {
 /// streamed straight from this file (see api::client), one line at a time.
 pub struct Conversation {
     path: String,
+    session_id: String,
     count: usize,
     tokens: usize,
 }
 
 impl Conversation {
-    /// Open a fresh conversation at `path`, truncating any prior contents.
-    pub fn new(path: String) -> Self {
+    /// Open a fresh conversation for `session_id`, creating its session
+    /// directory under `/tmp/meow/<id>/` and truncating any prior log.
+    pub fn new_session(session_id: String) -> Self {
+        let dir = crate::app::session::session_dir(&session_id);
+        libakuma::mkdir_p(&dir);
+        let path = crate::app::session::conversation_path(&session_id);
         let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
         if fd >= 0 { close(fd); }
-        Conversation { path, count: 0, tokens: 0 }
+        Conversation { path, session_id, count: 0, tokens: 0 }
+    }
+
+    /// Allocate a brand-new session: pick a fresh id, create its directory,
+    /// repoint the log there, and reseed it with `msgs`. Returns the new id.
+    pub fn start_new(&mut self, msgs: &[Message]) -> String {
+        let id = crate::app::session::generate_session_id();
+        let dir = crate::app::session::session_dir(&id);
+        libakuma::mkdir_p(&dir);
+        self.path = crate::app::session::conversation_path(&id);
+        self.session_id = id.clone();
+        self.count = 0;
+        self.tokens = 0;
+        self.reseed(msgs);
+        id
     }
 
     pub fn path(&self) -> &str { &self.path }
+    pub fn session_id(&self) -> &str { &self.session_id }
     pub fn len(&self) -> usize { self.count }
     pub fn tokens(&self) -> usize { self.tokens }
 

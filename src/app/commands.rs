@@ -32,6 +32,20 @@ pub fn handle_command(
             conversation.reseed(&[Message::new("system", system_prompt)]);
             (CommandResult::Continue, Some(String::from("History cleared.")))
         }
+        "/session" => {
+            let info = format!(
+                "Current session: {}\n  Path: {}\n  Messages: {}\n  Tokens: {}",
+                conversation.session_id(),
+                conversation.path(),
+                conversation.len(),
+                conversation.tokens(),
+            );
+            (CommandResult::Continue, Some(info))
+        }
+        "/new" => {
+            let id = conversation.start_new(&[Message::new("system", system_prompt)]);
+            (CommandResult::Continue, Some(format!("Started new session: {}", id)))
+        }
         "/model" => {
             match arg {
                 Some("?") | Some("list") => {
@@ -148,6 +162,8 @@ pub fn handle_command(
             let output = String::from("# Commands
 
 * `/clear`: Clear history
+* `/session`: Describe the current session
+* `/new`: Start a new session
 * `/model [NAME]`: Check/switch model
 * `/model list`: List available models
 * `/provider`: Check/switch provider

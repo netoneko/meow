@@ -193,7 +193,11 @@ pub extern "C" fn main() {
         // Print CGI response headers before any model output
         libakuma::print("Content-Type: text/plain\r\n\r\n");
 
-        let mut conversation = Conversation::new(app::conversation_path());
+        // Session id as the first line of the body, for later debugging.
+        let session_id = app::session::generate_session_id();
+        libakuma::print(&format!("session: {}\n", session_id));
+
+        let mut conversation = Conversation::new_session(session_id);
         conversation.append(&Message::new("system", &system_prompt));
         let cwd_context = "[System Context] Current working directory: /\nNo sandbox restrictions.";
         conversation.append(&Message::new("user", cwd_context));
@@ -219,7 +223,8 @@ pub extern "C" fn main() {
     }
 
     if use_tui || one_shot_message.is_none() {
-        let mut conversation = Conversation::new(app::conversation_path());
+        let session_id = app::session::generate_session_id();
+        let mut conversation = Conversation::new_session(session_id);
         conversation.append(&Message::new("system", &system_prompt));
 
         let initial_cwd = tools::get_working_dir();
@@ -263,7 +268,9 @@ pub extern "C" fn main() {
     }
 
     if let Some(msg) = one_shot_message {
-        let mut conversation = Conversation::new(app::conversation_path());
+        let session_id = app::session::generate_session_id();
+        libakuma::print(&format!("session: {}\n", session_id));
+        let mut conversation = Conversation::new_session(session_id);
         conversation.append(&Message::new("system", &system_prompt));
         let initial_cwd = tools::get_working_dir();
         let sandbox_root = tools::get_sandbox_root();
@@ -351,7 +358,7 @@ fn load_local_prompt() -> Option<String> {
 
 fn print_usage() {
     libakuma::print(
-        "meow - AI assistant\n\nUsage:\n  meow                        Interactive TUI mode (default)\n  meow -c \"message\"           Non-interactive: send message and exit\n  meow init                   Configure providers\n  meow test                   Run built-in tests\n\nOptions:\n  -c, --command <MSG>     Non-interactive: send MSG and print response to stdout\n  -m, --model <NAME>      Override the active model\n  -p, --provider <NAME>   Override the active provider\n  -P, --personality <NAM> Switch persona (default: Meow)\n  -N, --no-personality    Disable the persona; use a neutral assistant prompt\n  --tui                   Force interactive TUI mode\n  --no-tui                Force non-interactive mode (no repainting)\n  --debug                 Log connection and HTTP details (non-TUI only)\n  -h, --help              Show this help\n\nNon-interactive mode (-c) prints streaming output directly to stdout with\nANSI color codes but without cursor repositioning or the 3-pane layout.\nSuitable for scripting, pipes, and low-memory environments.\n\nInteractive Commands (TUI mode):\n  /clear              Wipe memory banks\n  /model [NAME]       Check/switch/list models\n  /provider [NAME]    Check/switch providers\n  /personality [NAME] Check/switch personality\n  /tokens             Show current token usage\n  /help               Command list\n  /quit               Quit\n",
+        "meow - AI assistant\n\nUsage:\n  meow                        Interactive TUI mode (default)\n  meow -c \"message\"           Non-interactive: send message and exit\n  meow init                   Configure providers\n  meow test                   Run built-in tests\n\nOptions:\n  -c, --command <MSG>     Non-interactive: send MSG and print response to stdout\n  -m, --model <NAME>      Override the active model\n  -p, --provider <NAME>   Override the active provider\n  -P, --personality <NAM> Switch persona (default: Meow)\n  -N, --no-personality    Disable the persona; use a neutral assistant prompt\n  --tui                   Force interactive TUI mode\n  --no-tui                Force non-interactive mode (no repainting)\n  --debug                 Log connection and HTTP details (non-TUI only)\n  -h, --help              Show this help\n\nNon-interactive mode (-c) prints streaming output directly to stdout with\nANSI color codes but without cursor repositioning or the 3-pane layout.\nSuitable for scripting, pipes, and low-memory environments.\n\nInteractive Commands (TUI mode):\n  /clear              Wipe memory banks\n  /session            Describe the current session\n  /new                Start a new session\n  /model [NAME]       Check/switch/list models\n  /provider [NAME]    Check/switch providers\n  /personality [NAME] Check/switch personality\n  /tokens             Show current token usage\n  /help               Command list\n  /quit               Quit\n",
     );
 }
 

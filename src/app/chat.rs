@@ -96,15 +96,16 @@ pub fn chat_once(
                         continue;
                     }
 
-                    // Surface the full tool invocation (name + arguments) in the UI
-                    // before running it, so the user sees the exact command being executed.
                     let args_trimmed = tc.arguments.trim();
                     let call_line = if args_trimmed.is_empty() || args_trimmed == "{}" {
                         format!("ToolCalled: {}", tc.name)
                     } else {
                         format!("ToolCalled: {} | Arguments {}", tc.name, args_trimmed)
                     };
-                    print_notification(crate::config::COLOR_GRAY_DIM, &call_line, 0);
+                    print_notification(COLOR_YELLOW, &call_line, 0);
+                    if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+                        tui_app::render_status_now(&format!("[TOOL] Running: {}", tc.name));
+                    }
 
                     let tool_start = libakuma::uptime();
                     let tool_result = tools::execute_tool_by_name(&tc.name, &tc.arguments)
