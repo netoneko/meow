@@ -158,6 +158,40 @@ Relevant cargo features (see `Cargo.toml`):
 | `compact-tools` | **on** | Ship the tools schema without per-tool descriptions (~930 fewer tokens/request). `--no-default-features` restores the descriptive schema. |
 | `tests` | off | Compile the in-binary self-test suite (`meow test`, `/test`). Omitted from shipped builds. |
 | `size` | off | Cap in-memory tool output at 2KB (vs 32KB). |
+| `linux-net` | off | Use standard Linux socket/DNS syscalls (+ `libakuma/linux-abi` for `getpid`/clock) instead of the Akuma-custom `RESOLVE_HOST`/`UPTIME` syscalls. Build for the `aarch64-unknown-linux-musl` target (see below). Lets meow run inside a `stack=rump` box, where the kernel sysproxy intercepts those syscalls and routes them through the NetBSD rump TCP/IP stack; also works on the native smoltcp stack (box 0). **Not** built by `build.sh` (which targets `aarch64-unknown-none` with Akuma-custom syscalls). |
+
+### `linux-net` build (run over the NetBSD rump stack)
+
+```bash
+cd userspace/meow
+MUSL_LIBC=/opt/homebrew/Cellar/musl-cross/0.9.11/libexec/aarch64-linux-musl/lib/libc.a
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc \
+RUSTFLAGS="-C link-self-contained=no -C link-arg=-nostartfiles -C link-arg=$MUSL_LIBC" \
+cargo +nightly build --release -Zbuild-std=core,alloc \
+    --target aarch64-unknown-linux-musl --features linux-net
+```
+
+Stage the resulting `target/aarch64-unknown-linux-musl/release/meow` into the box
+rootfs (`/srv/rumpbox/bin/meow`) and run it **non-interactively** via SSH:
+
+```bash
+box use rumpnet -i /bin/meow -N -m qwen3.5:0.8b -c 'say hi in three words'
+# → "hi there", with meow's socket traffic carried by the NetBSD rump stack
+#   (kernel trace: connect fam=2 port=11434 ip=10.0.2.2 → RumpSocket recvfrom...)
+```
+
+Verified working on both stacks: non-interactive over rump (~42 TPS) and on the
+native smoltcp stack / box 0 (~81 TPS, no sysproxy hop).
+
+> **Known limitation — interactive TUI over the NetBSD rump stack.** The
+> non-interactive (`-c`) path over `box use` is reliable. A fully *interactive*
+> meow session over **`ssh -p 2223` into the box (NetBSD rump stack) with the
+> toybox shell** currently performs poorly: the TUI **flickers** (every redraw is
+> a round-trip through the slow rump-proxied SSH session — ~1s/syscall) and the
+> **connection fails / drops** mid-session (the box's single rump client-slot
+> wedges; see the rump-kernel `HANDOFF.md` / acceptance/11 "task #9"
+> session-robustness gap). Use non-interactive `-c` over `box use`, or the native
+> smoltcp stack, for an interactive session until that gap is closed.
 
 ---
 
