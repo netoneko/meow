@@ -3,7 +3,11 @@ use alloc::vec::Vec;
 use alloc::format;
 use core::sync::atomic::Ordering;
 
-use libakuma::net::{resolve, TcpStream};
+#[cfg(feature = "linux-net")]
+use crate::linux_net::resolve;
+#[cfg(not(feature = "linux-net"))]
+use libakuma::net::resolve;
+use libakuma::net::TcpStream;
 use libakuma_tls::{HttpHeaders, HttpStreamTls, StreamResult, TLS_RECORD_SIZE};
 use crate::util::{StackBuffer, json_escape_to};
 use core::fmt::Write;
@@ -12,6 +16,11 @@ use crate::ui::tui::layout::Stdout;
 use crate::config::{Provider, OPENAI_TOOLS_JSON};
 use crate::tui_app;
 use super::types::{StreamResponse, StreamStats, ToolCallData};
+
+#[cfg(feature = "linux-net")]
+fn now_us() -> u64 { crate::linux_net::uptime_us() }
+#[cfg(not(feature = "linux-net"))]
+fn now_us() -> u64 { now_us() }
 
 fn debug_print(msg: &str) {
     if tui_app::DEBUG_MODE.load(Ordering::SeqCst) {
@@ -78,7 +87,7 @@ fn send_with_retry_inner(
         }
     }
 
-    let start_time = libakuma::uptime();
+    let start_time = now_us();
     let path = build_request_path(provider);
     {
         let mut buf_data = [0u8; 256];
@@ -464,7 +473,7 @@ fn read_streaming_with_http_stream_tls(
                             if !content.is_empty() {
                                 if !first_token_received {
                                     first_token_received = true;
-                                    let now = libakuma::uptime();
+                                    let now = now_us();
                                     ttft_us = now - start_time;
                                     stream_start_us = now;
                                     tui_app::update_streaming_status("[MEOW] streaming", 0, None);
@@ -486,7 +495,7 @@ fn read_streaming_with_http_stream_tls(
                             if done {
                                 if is_tui { tui_app::finish_streaming(); }
                                 tui_app::clear_streaming_status();
-                                let stats = StreamStats { ttft_us, stream_us: libakuma::uptime() - stream_start_us, total_bytes: full_response.len() };
+                                let stats = StreamStats { ttft_us, stream_us: now_us() - stream_start_us, total_bytes: full_response.len() };
                                 if !pending_tool_calls.is_empty() {
                                     return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
                                 }
@@ -511,7 +520,7 @@ fn read_streaming_with_http_stream_tls(
                         if !content.is_empty() {
                             if !first_token_received {
                                 first_token_received = true;
-                                let now = libakuma::uptime();
+                                let now = now_us();
                                 ttft_us = now - start_time;
                                 stream_start_us = now;
                                 tui_app::update_streaming_status("[MEOW] streaming", 0, None);
@@ -545,7 +554,7 @@ fn read_streaming_with_http_stream_tls(
             }
         }
     }
-    let stats = StreamStats { ttft_us, stream_us: if first_token_received { libakuma::uptime() - stream_start_us } else { 0 }, total_bytes: full_response.len() };
+    let stats = StreamStats { ttft_us, stream_us: if first_token_received { now_us() - stream_start_us } else { 0 }, total_bytes: full_response.len() };
     if !pending_tool_calls.is_empty() {
         if is_tui { tui_app::finish_streaming(); }
         tui_app::clear_streaming_status();
@@ -594,7 +603,7 @@ fn read_streaming_response_with_progress(
                             if !content.is_empty() {
                                 if !first_token_received {
                                     first_token_received = true;
-                                    let now = libakuma::uptime();
+                                    let now = now_us();
                                     ttft_us = now - start_time;
                                     stream_start_us = now;
                                     tui_app::update_streaming_status("[MEOW] streaming", 0, None);
@@ -662,7 +671,7 @@ fn read_streaming_response_with_progress(
                             if !content.is_empty() {
                                 if !first_token_received {
                                     first_token_received = true;
-                                    let now = libakuma::uptime();
+                                    let now = now_us();
                                     ttft_us = now - start_time;
                                     stream_start_us = now;
                                     tui_app::update_streaming_status("[MEOW] streaming", 0, None);
@@ -691,7 +700,7 @@ fn read_streaming_response_with_progress(
                     }
                     if let Some(pos) = last_newline { pending_data.drain(..pos + 1); }
                     if is_done {
-                        let stats = StreamStats { ttft_us, stream_us: libakuma::uptime() - stream_start_us, total_bytes: full_response.len() };
+                        let stats = StreamStats { ttft_us, stream_us: now_us() - stream_start_us, total_bytes: full_response.len() };
                         if !pending_tool_calls.is_empty() {
                             return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
                         }
@@ -714,7 +723,7 @@ fn read_streaming_response_with_progress(
             }
         }
     }
-    let stats = StreamStats { ttft_us, stream_us: if first_token_received { libakuma::uptime() - stream_start_us } else { 0 }, total_bytes: full_response.len() };
+    let stats = StreamStats { ttft_us, stream_us: if first_token_received { now_us() - stream_start_us } else { 0 }, total_bytes: full_response.len() };
     if !pending_tool_calls.is_empty() {
         return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
     }
@@ -852,8 +861,8 @@ fn print_elapsed(ms: u64) {
 }
 
 fn poll_sleep(ms: u64, current_tokens: usize, token_limit: usize, mem_kb: usize) {
-    let end = libakuma::uptime() + ms * 1000;
-    while libakuma::uptime() < end { 
+    let end = now_us() + ms * 1000;
+    while now_us() < end { 
         tui_app::tui_handle_input(current_tokens, token_limit, mem_kb); 
         if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
             crate::ui::tui::render::render_footer(current_tokens, token_limit, mem_kb);

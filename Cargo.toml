@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "meow"
 version = "0.1.0"
@@ -23,6 +25,24 @@ tests = []
 # Memory-constrained build: caps in-memory tool output at 2KB (vs 32KB default).
 # Build with: cargo build --release --features size
 size = []
+
+# Use standard Linux socket syscalls for DNS (replaces Akuma-custom RESOLVE_HOST
+# syscall 300). Enables meow to run in a stack=rump box where socket syscalls are
+# intercepted by the kernel sysproxy and routed through the NetBSD rump TCP/IP stack.
+# Also replaces UPTIME (319) with clock_gettime(CLOCK_MONOTONIC).
+# Build with: cargo build --target aarch64-unknown-linux-musl --features linux-net
+linux-net = ["libakuma/linux-abi"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+codegen-units = 1
+strip = true
+overflow-checks = false
 
 [dependencies]
 libakuma = { path = "../libakuma", features = ["chunked-allocator"] }

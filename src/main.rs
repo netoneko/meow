@@ -11,6 +11,8 @@ mod api;
 mod app;
 mod code_search;
 mod config;
+#[cfg(feature = "linux-net")]
+mod linux_net;
 mod tools;
 mod tui_app;
 mod ui;
