@@ -548,8 +548,12 @@ fn read_streaming_with_http_stream_tls(
                 }
                 break;
             }
-            StreamResult::Error(_) => {
+            StreamResult::Error(e) => {
                 if is_tui { tui_app::finish_streaming(); }
+                if tui_app::DEBUG_MODE.load(Ordering::SeqCst) {
+                    let mut stdout = Stdout;
+                    let _ = write!(stdout, "\n[meow:debug] stream error: {:?}\n", e);
+                }
                 return Err("Server returned error");
             }
         }
