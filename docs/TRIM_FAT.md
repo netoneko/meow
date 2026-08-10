@@ -1,9 +1,47 @@
 # Allocation review: useless double-allocations in meow
 
-**Status: OPEN — audit only, no fixes applied.** Written 2026-08-10 while
-verifying `docs/MLX_SERVER_TOOL_CALLS.md`. Scope: `userspace/meow/src`
+**Status: FIXED (2026-08-10).** Written 2026-08-10 while verifying
+`docs/MLX_SERVER_TOOL_CALLS.md` as an audit only; all four findings below
+were then implemented the same day. Scope: `userspace/meow/src`
 (6,468 lines), no_std + `alloc`, talc allocator, running on VMs as small as
 4 MB RAM. Every avoidable allocation is a real cost here, not a style nit.
+
+## Fix applied (2026-08-10)
+
+All four findings implemented as proposed, with two small deviations from the
+exact "Fix" text below (found while implementing, both purely mechanical):
+
+- **Finding 1**: `ToolResult::err` now takes `impl Into<String>` as proposed.
+  The 22 `err(&format!(...))` call sites became `err(format!(...))`; 4
+  additional sites that passed an owned `String` error by reference
+  (`err(&e)`, not caught by the original `format!`-only grep) were also
+  fixed to pass by value (`err(e)`), since they were the same double-alloc
+  shape.
+- **Finding 2 & 3**: all 17 + 4 sites converted to `write!`/`writeln!`.
+  `pretend_shell.rs`'s `ReportSink` didn't implement `core::fmt::Write` (only
+  had an inherent `write_str(&mut self, s: &str)` with no `Result`), so it
+  needed a real trait impl added before `write!(report, ...)` would compile —
+  the old inherent method became dead code and was removed.
+- **Finding 4**: implemented via a `find_wrapped(json, field, open, close)`
+  helper that scans `json.match_indices(field)` and checks the surrounding
+  bytes, instead of the proposed `StackBuffer`-reuse approach — avoids all
+  three allocations per pattern rather than reducing to one reused buffer.
+
+**Verification:**
+- `cargo build --release` / `cargo clippy --release` (with and without
+  `--features tests`): zero warnings.
+- `cargo clippy --release -- -W clippy::format_push_string`: 0 hits (was 17).
+- In-VM self-test suite (`meow test`) run before and after on the *same*
+  devbox-smoltcp VM: identical results — the two pre-existing
+  `StreamingRenderer` test failures were confirmed byte-for-byte unchanged
+  (rebuilt and ran the pre-fix binary side-by-side to prove they predate this
+  work), and the two tests that actually exercise the rewritten
+  `extract_field_value` (`Simple tool call`, `Tool call without code block`)
+  both still pass.
+- Real end-to-end run against the live `mlx-server`: `Shell`, `FileList`,
+  a `Shell` redirect (exercising the `ReportSink` rewrite), and `FileRead`
+  all succeeded with correctly-formatted output, confirming no behavior
+  change reached the model-facing side either.
 
 ## Summary
 
@@ -177,11 +215,15 @@ exactly this kind of formatting) instead of three heap `String`s per call.
 
 ## Reproducing the counts
 
+Counts as found, before the fix above. All three now return 0/no matches —
+that confirms the fix, not a reason to skip re-running them if auditing this
+again later.
+
 ```bash
 cd userspace/meow
-cargo clippy --release -- -W clippy::format_push_string   # Finding 2 (17)
-grep -rn "err(&format!" src/                               # Finding 1 (22)
-grep -rn "write_str(&format!" src/                          # Finding 3 (4)
+cargo clippy --release -- -W clippy::format_push_string   # Finding 2 (17 → 0)
+grep -rn "err(&format!" src/                               # Finding 1 (22 → 0)
+grep -rn "write_str(&format!" src/                          # Finding 3 (4 → 0)
 ```
 
 Clippy at its default level (`cargo clippy --release`, no extra flags) is
