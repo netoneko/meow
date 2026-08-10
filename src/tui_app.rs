@@ -257,7 +257,7 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
     use crate::ui::tui::layout::Stdout;
     use core::fmt::Write;
     let mut stdout = Stdout;
-    let _ = write!(stdout, "  {}TIP:{} Type {}/hotkeys{} to see input shortcuts\n", COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, COLOR_RESET);
+    let _ = writeln!(stdout, "  {}TIP:{} Type {}/hotkeys{} to see input shortcuts", COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, COLOR_RESET);
     let _ = write!(stdout, "  {}Session:{} {}{}{}\n\n", COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, conversation.session_id(), COLOR_RESET);
 
     let o_r = h.saturating_sub(layout.footer_height + 1 + layout.gap());

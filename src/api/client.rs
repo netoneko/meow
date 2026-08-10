@@ -20,7 +20,7 @@ use super::types::{StreamResponse, StreamStats, ToolCallData};
 #[cfg(feature = "linux-net")]
 fn now_us() -> u64 { crate::linux_net::uptime_us() }
 #[cfg(not(feature = "linux-net"))]
-fn now_us() -> u64 { now_us() }
+fn now_us() -> u64 { libakuma::uptime() }
 
 fn debug_print(msg: &str) {
     if tui_app::DEBUG_MODE.load(Ordering::SeqCst) {
@@ -414,11 +414,7 @@ fn stream_conversation_messages(fd: i32, conversation_path: &str, total: &mut us
             break;
         }
         carry.extend_from_slice(&buf[..n as usize]);
-        loop {
-            let nl = match carry.iter().position(|&b| b == b'\n') {
-                Some(p) => p,
-                None => break,
-            };
+        while let Some(nl) = carry.iter().position(|&b| b == b'\n') {
             {
                 let line = core::str::from_utf8(&carry[..nl]).unwrap_or("").trim();
                 if !line.is_empty() {
@@ -754,7 +750,7 @@ fn accumulate_tool_call_delta(line: &str, pending: &mut Vec<ToolCallData>) -> bo
     let json = match line.strip_prefix("data:") { Some(j) => j.trim(), None => return false };
     if json.is_empty() || json == "[DONE]" { return false; }
 
-    let is_finish = json.contains("\"finish_reason\":\"tool_calls\"");
+    let is_finish = json_field_is(json, "finish_reason", "tool_calls");
 
     if let Some(tc_pos) = json.find("\"tool_calls\"") {
         let tc_json = &json[tc_pos..];
@@ -812,12 +808,35 @@ fn extract_openai_delta_content(json: &str) -> Option<String> {
     Some(result)
 }
 
+/// Find the byte offset of a JSON key's value, tolerating optional whitespace
+/// between the key and its colon and between the colon and the value (mlx-server's
+/// `json.dumps` defaults insert a space after every colon; ollama's compact
+/// serializer does not — meow must match structure, not byte-exact formatting).
+fn json_value_start(json: &str, key: &str) -> Option<usize> {
+    let key_pattern = format!("\"{}\"", key);
+    let key_pos = json.find(&key_pattern)?;
+    let after_key = &json[key_pos + key_pattern.len()..];
+    let colon_offset = after_key.find(':')?;
+    if !after_key[..colon_offset].trim().is_empty() { return None; }
+    let after_colon = &after_key[colon_offset + 1..];
+    let value_offset = after_colon.len() - after_colon.trim_start().len();
+    Some(key_pos + key_pattern.len() + colon_offset + 1 + value_offset)
+}
+
+/// True if `key`'s value in `json` is the string `value`, tolerating optional
+/// whitespace around the colon (see `json_value_start`).
+fn json_field_is(json: &str, key: &str, value: &str) -> bool {
+    let Some(value_start) = json_value_start(json, key) else { return false };
+    let rest = &json[value_start..];
+    let Some(after_quote) = rest.strip_prefix('"') else { return false };
+    after_quote.strip_prefix(value).is_some_and(|tail| tail.starts_with('"'))
+}
+
 fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\":\"", key);
-    let start = json.find(&pattern)?;
-    let value_start = start + pattern.len();
+    let value_start = json_value_start(json, key)?;
+    if !json[value_start..].starts_with('"') { return None; }
     let mut result = String::new();
-    let mut chars = json[value_start..].chars().peekable();
+    let mut chars = json[value_start + 1..].chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '"' => break,

@@ -163,12 +163,27 @@ pub fn chat_once(
     Ok(())
 }
 
+/// Find the byte offset of a JSON key's value, tolerating optional whitespace
+/// between the key and its colon and between the colon and the value — mirrors
+/// `api::client::json_value_start` (see docs/MLX_SERVER_TOOL_CALLS.md: some
+/// OpenAI-compatible servers/models space their JSON, `"key": "value"`, where
+/// meow's hand-rolled parser previously only matched `"key":"value"`).
+fn json_value_start(json: &str, key: &str) -> Option<usize> {
+    let key_pattern = format!("\"{}\"", key);
+    let key_pos = json.find(&key_pattern)?;
+    let after_key = &json[key_pos + key_pattern.len()..];
+    let colon_offset = after_key.find(':')?;
+    if !after_key[..colon_offset].trim().is_empty() { return None; }
+    let after_colon = &after_key[colon_offset + 1..];
+    let value_offset = after_colon.len() - after_colon.trim_start().len();
+    Some(key_pos + key_pattern.len() + colon_offset + 1 + value_offset)
+}
+
 fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\":\"", key);
-    let start = json.find(&pattern)?;
-    let value_start = start + pattern.len();
+    let value_start = json_value_start(json, key)?;
+    if !json[value_start..].starts_with('"') { return None; }
     let mut result = String::new();
-    let mut chars = json[value_start..].chars().peekable();
+    let mut chars = json[value_start + 1..].chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '"' => break,
@@ -233,6 +248,14 @@ pub fn run_tests() -> i32 {
         let got = extract_json_string("{\"other\":\"value\"}", "summary");
         if got.is_none() { passed += 1; }
         else { libakuma::print(&format!("  [!] extract_json_string missing: got {:?}\n", got)); }
+    }
+
+    // extract_json_string: tolerates a space after the colon (Python json.dumps style)
+    total += 1;
+    {
+        let got = extract_json_string("{\"summary\": \"hello world\"}", "summary");
+        if got.as_deref() == Some("hello world") { passed += 1; }
+        else { libakuma::print(&format!("  [!] extract_json_string spaced: {:?}\n", got)); }
     }
 
     // json_escape_to: basic special chars
