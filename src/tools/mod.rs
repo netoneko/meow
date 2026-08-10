@@ -97,13 +97,13 @@ pub fn execute_tool_by_name(name: &str, args_json: &str) -> Option<ToolResult> {
 fn tool_code_search(pattern: &str, path: &str, context: usize) -> ToolResult {
     let resolved = match context::resolve_path(path) {
         Some(p) => p,
-        None => return ToolResult::err(&format!(
+        None => return ToolResult::err(format!(
             "Access denied: '{}' is outside the working directory '{}'",
             path, context::get_working_dir()
         )),
     };
     match crate::code_search::search_to_string(pattern, &resolved, context) {
         Ok(results) => ToolResult::ok(results),
-        Err(e) => ToolResult::err(&format!("Search failed: {}", e)),
+        Err(e) => ToolResult::err(format!("Search failed: {}", e)),
     }
 }

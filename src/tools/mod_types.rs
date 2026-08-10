@@ -1,5 +1,6 @@
 use alloc::string::String;
 use alloc::format;
+use core::fmt::Write;
 use crate::config::MAX_TOOL_OUTPUT_SIZE;
 use libakuma::{mkdir, open, open_flags, write_fd, close};
 
@@ -18,8 +19,8 @@ impl ToolResult {
         Self { success: true, output }
     }
     
-    pub fn err(message: &str) -> Self {
-        Self { success: false, output: String::from(message) }
+    pub fn err(message: impl Into<String>) -> Self {
+        Self { success: false, output: message.into() }
     }
 }
 
@@ -55,7 +56,7 @@ fn handle_output_overflow(full_output: String) -> ToolResult {
         close(fd);
 
         let mut truncated = String::from("[!] Output truncated due to memory limits.\n");
-        truncated.push_str(&format!("Full output saved to: {}\n\n", filename));
+        let _ = write!(truncated, "Full output saved to: {}\n\n", filename);
         truncated.push_str("Preview:\n---\n");
 
         let preview_len = core::cmp::min(full_output.len(), 4096);

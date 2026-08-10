@@ -1,6 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
+use core::fmt::Write;
 
 use crate::config::{Config, Provider, TOKEN_LIMIT_FOR_COMPACTION};
 use crate::api;
@@ -58,7 +59,7 @@ pub fn handle_command(
                                 for (i, m) in models.iter().enumerate() {
                                     let current_marker = if m.name == *model { " (current)" } else { "" };
                                     let size_info = m._parameter_size.as_ref().map(|s| format!(" [{}]", s)).unwrap_or_default();
-                                    output.push_str(&format!("  {}. {}{}{}\n", i + 1, m.name, size_info, current_marker));
+                                    let _ = writeln!(output, "  {}. {}{}{}", i + 1, m.name, size_info, current_marker);
                                 }
                                 (CommandResult::Continue, Some(output))
                             }
@@ -86,7 +87,7 @@ pub fn handle_command(
                     let mut output = String::from("Configured providers:\n");
                     for (i, p) in config.providers.iter().enumerate() {
                         let current_marker = if p.name == provider.name { " (current)" } else { "" };
-                        output.push_str(&format!("  {}. {} ({}){}\n", i + 1, p.name, p.base_url, current_marker));
+                        let _ = writeln!(output, "  {}. {} ({}){}", i + 1, p.name, p.base_url, current_marker);
                     }
                     (CommandResult::Continue, Some(output))
                 }
@@ -116,7 +117,7 @@ pub fn handle_command(
                     let mut output = String::from("Available personalities:\n");
                     for p in crate::config::PERSONALITIES {
                         let current_marker = if p.name == config.current_personality { " (current)" } else { "" };
-                        output.push_str(&format!("  - {}{}\n", p.name, current_marker));
+                        let _ = writeln!(output, "  - {}{}", p.name, current_marker);
                     }
                     (CommandResult::Continue, Some(output))
                 }

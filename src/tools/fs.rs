@@ -1,6 +1,7 @@
 use alloc::string::String;
 use alloc::format;
 use alloc::vec::Vec;
+use core::fmt::Write;
 
 use libakuma::{
     open, close, read_fd, write_fd, fstat, mkdir, read_dir,
@@ -16,7 +17,7 @@ const MAX_FILE_SIZE: usize = 512 * 1024;
 fn resolve_path_or_err(path: &str) -> Result<String, ToolResult> {
     match resolve_path(path) {
         Some(p) => Ok(p),
-        None => Err(ToolResult::err(&format!(
+        None => Err(ToolResult::err(format!(
             "Access denied: '{}' is outside the working directory '{}'",
             path, get_working_dir()
         ))),
@@ -31,7 +32,7 @@ pub fn tool_file_read(filename: &str) -> ToolResult {
     
     let fd = open(&resolved, open_flags::O_RDONLY);
     if fd < 0 {
-        return ToolResult::err(&format!("Failed to open file: {}", filename));
+        return ToolResult::err(format!("Failed to open file: {}", filename));
     }
     
     // Get file size
@@ -71,7 +72,7 @@ pub fn tool_file_write(filename: &str, content: &str) -> ToolResult {
     
     let fd = open(&resolved, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
     if fd < 0 {
-        return ToolResult::err(&format!("Failed to create file: {}", filename));
+        return ToolResult::err(format!("Failed to create file: {}", filename));
     }
     
     let bytes_written = write_fd(fd, content.as_bytes());
@@ -92,7 +93,7 @@ pub fn tool_file_append(filename: &str, content: &str) -> ToolResult {
     
     let fd = open(&resolved, open_flags::O_WRONLY | open_flags::O_APPEND);
     if fd < 0 {
-        return ToolResult::err(&format!("Failed to open file for append: {}", filename));
+        return ToolResult::err(format!("Failed to open file for append: {}", filename));
     }
     
     let bytes_written = write_fd(fd, content.as_bytes());
@@ -132,7 +133,7 @@ pub fn tool_file_list(path: &str) -> ToolResult {
             let mut count = 0;
             for entry in entries {
                 let type_indicator = if entry.is_dir { "/" } else { "" };
-                output.push_str(&format!("  {}{}\n", entry.name, type_indicator));
+                let _ = writeln!(output, "  {}{}", entry.name, type_indicator);
                 count += 1;
             }
             if count == 0 {
@@ -140,7 +141,7 @@ pub fn tool_file_list(path: &str) -> ToolResult {
             }
             ToolResult::ok(output)
         }
-        None => ToolResult::err(&format!("Failed to list directory: {}", path)),
+        None => ToolResult::err(format!("Failed to list directory: {}", path)),
     }
 }
 
@@ -150,7 +151,7 @@ pub fn tool_file_delete(filename: &str) -> ToolResult {
         Err(e) => return e,
     };
     // Note: libakuma doesn't have unlink syscall yet
-    ToolResult::err(&format!("Delete not yet implemented for: {}", filename))
+    ToolResult::err(format!("Delete not yet implemented for: {}", filename))
 }
 
 pub fn tool_folder_create(path: &str) -> ToolResult {
@@ -163,7 +164,7 @@ pub fn tool_folder_create(path: &str) -> ToolResult {
     if result >= 0 {
         ToolResult::ok(format!("Successfully created directory: '{}'", path))
     } else {
-        ToolResult::err(&format!("Failed to create directory: {}", path))
+        ToolResult::err(format!("Failed to create directory: {}", path))
     }
 }
 
@@ -185,7 +186,7 @@ pub fn tool_cd(path: &str) -> ToolResult {
     
     // Check if new path is within sandbox
     if !is_within_sandbox(&new_path, &sandbox) {
-        return ToolResult::err(&format!(
+        return ToolResult::err(format!(
             "Access denied: '{}' is outside the sandbox '{}'",
             new_path, sandbox
         ));
@@ -199,9 +200,9 @@ pub fn tool_cd(path: &str) -> ToolResult {
         ToolResult::ok(format!("Changed directory to: {}", new_path))
     } else if result == -2 {
         // ENOENT
-        ToolResult::err(&format!("Directory not found: {}", new_path))
+        ToolResult::err(format!("Directory not found: {}", new_path))
     } else {
-        ToolResult::err(&format!("Failed to change directory: error {}", result))
+        ToolResult::err(format!("Failed to change directory: error {}", result))
     }
 }
 
@@ -230,7 +231,7 @@ pub fn tool_file_copy(source: &str, dest: &str) -> ToolResult {
     
     match tool_file_copy_internal(&src_resolved, &dst_resolved) {
         Ok(msg) => ToolResult::ok(msg),
-        Err(e) => ToolResult::err(&e),
+        Err(e) => ToolResult::err(e),
     }
 }
 
@@ -289,7 +290,7 @@ pub fn tool_file_move(source: &str, dest: &str) -> ToolResult {
     
     match tool_file_copy_internal(&src_resolved, &dst_resolved) {
         Ok(_) => ToolResult::ok(format!("Moved '{}' to '{}' (note: source not deleted yet)", source, dest)),
-        Err(e) => ToolResult::err(&e),
+        Err(e) => ToolResult::err(e),
     }
 }
 
@@ -301,7 +302,7 @@ pub fn tool_file_read_lines(filename: &str, start: usize, end: usize) -> ToolRes
     
     let fd = open(&resolved, open_flags::O_RDONLY);
     if fd < 0 {
-        return ToolResult::err(&format!("Failed to open file: {}", filename));
+        return ToolResult::err(format!("Failed to open file: {}", filename));
     }
 
     let stat = match fstat(fd) {
@@ -337,7 +338,7 @@ pub fn tool_file_read_lines(filename: &str, start: usize, end: usize) -> ToolRes
     let end_idx = end.min(total_lines);
 
     if start_idx >= total_lines {
-        return ToolResult::err(&format!(
+        return ToolResult::err(format!(
             "Start line {} is beyond file length ({} lines)",
             start, total_lines
         ));
@@ -350,7 +351,7 @@ pub fn tool_file_read_lines(filename: &str, start: usize, end: usize) -> ToolRes
 
     for (idx, line) in lines[start_idx..end_idx].iter().enumerate() {
         let line_num = start_idx + idx + 1;
-        output.push_str(&format!("{:>4}: {}\n", line_num, line));
+        let _ = writeln!(output, "{:>4}: {}", line_num, line);
     }
     output.push_str("```");
 
@@ -365,7 +366,7 @@ pub fn tool_file_edit(filename: &str, old_text: &str, new_text: &str) -> ToolRes
     
     let fd = open(&resolved, open_flags::O_RDONLY);
     if fd < 0 {
-        return ToolResult::err(&format!("Failed to open file: {}", filename));
+        return ToolResult::err(format!("Failed to open file: {}", filename));
     }
 
     let stat = match fstat(fd) {
@@ -398,7 +399,7 @@ pub fn tool_file_edit(filename: &str, old_text: &str, new_text: &str) -> ToolRes
     let occurrences: Vec<_> = content.match_indices(old_text).collect();
 
     if occurrences.is_empty() {
-        return ToolResult::err(&format!(
+        return ToolResult::err(format!(
             "Text not found in '{}'. Make sure the text matches exactly (including whitespace).",
             filename
         ));
@@ -410,7 +411,7 @@ pub fn tool_file_edit(filename: &str, old_text: &str, new_text: &str) -> ToolRes
             let line_num = content[..*pos].matches('\n').count() + 1;
             line_nums.push(line_num);
         }
-        return ToolResult::err(&format!(
+        return ToolResult::err(format!(
             "Found {} occurrences at lines {:?}. Please provide more context to make the match unique.",
             occurrences.len(),
             line_nums
@@ -425,7 +426,7 @@ pub fn tool_file_edit(filename: &str, old_text: &str, new_text: &str) -> ToolRes
         open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC,
     );
     if fd < 0 {
-        return ToolResult::err(&format!("Failed to open file for writing: {}", filename));
+        return ToolResult::err(format!("Failed to open file for writing: {}", filename));
     }
 
     let bytes_written = write_fd(fd, new_content.as_bytes());
@@ -442,10 +443,10 @@ pub fn tool_file_edit(filename: &str, old_text: &str, new_text: &str) -> ToolRes
 
     let mut diff = format!("Modified '{}' at line {}:\n```diff\n", filename, line_num);
     for line in &old_lines {
-        diff.push_str(&format!("- {}\n", line));
+        let _ = writeln!(diff, "- {}", line);
     }
     for line in &new_lines {
-        diff.push_str(&format!("+ {}\n", line));
+        let _ = writeln!(diff, "+ {}", line);
     }
     diff.push_str("```");
 

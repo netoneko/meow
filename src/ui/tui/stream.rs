@@ -197,43 +197,57 @@ fn extract_tool_info(json: &str) -> Option<(String, String)> {
     Some((tool, args))
 }
 
+/// Find `field` in `json` wrapped by `open`/`close` (e.g. `"field"` via
+/// `Some('"'), '"'`, or a bare `field:` via `None, ':'`), returning the byte
+/// offset right past the closing wrapper char. Avoids `format!`-ing the three
+/// quoting-style patterns `extract_field_value` used to allocate per call.
+fn find_wrapped(json: &str, field: &str, open: Option<char>, close: char) -> Option<usize> {
+    for (p, _) in json.match_indices(field) {
+        if let Some(open) = open {
+            if p == 0 || json.as_bytes()[p - 1] != open as u8 { continue; }
+        }
+        let end = p + field.len();
+        if !json[end..].starts_with(close) { continue; }
+        return Some(end + 1);
+    }
+    None
+}
+
 fn extract_field_value(json: &str, field: &str) -> Option<String> {
-    let patterns = [
-        alloc::format!("\"{}\"", field),
-        alloc::format!("'{}'", field),
-        alloc::format!("{}:", field),
+    let pattern_ends = [
+        find_wrapped(json, field, Some('"'), '"'),
+        find_wrapped(json, field, Some('\''), '\''),
+        find_wrapped(json, field, None, ':'),
     ];
 
-    for pattern in patterns {
-        if let Some(pos) = json.find(&pattern) {
-            let after = &json[pos + pattern.len()..];
-            if let Some(colon_pos) = after.find(':') {
-                let after_colon = after[colon_pos + 1..].trim_start();
-                if after_colon.starts_with('"') || after_colon.starts_with('\'') {
-                    let quote = after_colon.chars().next().unwrap();
-                    let after_quote = &after_colon[1..];
-                    let mut val = String::new();
-                    let mut escape = false;
-                    for c in after_quote.chars() {
-                        if escape {
-                            match c {
-                                'n' => val.push('\n'),
-                                'r' => val.push('\r'),
-                                't' => val.push('\t'),
-                                _ => val.push(c),
-                            }
-                            escape = false;
-                        } else if c == '\\' { escape = true; }
-                        else if c == quote { return Some(val); }
-                        else { val.push(c); }
-                    }
-                } else {
-                    let end = after_colon.find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace())
-                        .unwrap_or(after_colon.len());
-                    if end > 0 {
-                        let val = after_colon[..end].trim();
-                        if !val.is_empty() && val != "{" { return Some(String::from(val)); }
-                    }
+    for after_pattern in pattern_ends.into_iter().flatten() {
+        let after = &json[after_pattern..];
+        if let Some(colon_pos) = after.find(':') {
+            let after_colon = after[colon_pos + 1..].trim_start();
+            if after_colon.starts_with('"') || after_colon.starts_with('\'') {
+                let quote = after_colon.chars().next().unwrap();
+                let after_quote = &after_colon[1..];
+                let mut val = String::new();
+                let mut escape = false;
+                for c in after_quote.chars() {
+                    if escape {
+                        match c {
+                            'n' => val.push('\n'),
+                            'r' => val.push('\r'),
+                            't' => val.push('\t'),
+                            _ => val.push(c),
+                        }
+                        escape = false;
+                    } else if c == '\\' { escape = true; }
+                    else if c == quote { return Some(val); }
+                    else { val.push(c); }
+                }
+            } else {
+                let end = after_colon.find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace())
+                    .unwrap_or(after_colon.len());
+                if end > 0 {
+                    let val = after_colon[..end].trim();
+                    if !val.is_empty() && val != "{" { return Some(String::from(val)); }
                 }
             }
         }

@@ -31,18 +31,18 @@ pub fn tool_http_fetch(url: &str) -> ToolResult {
                     Err(_) => ToolResult::err("Response contains non-UTF8 data (binary content)"),
                 }
             }
-            Err(e) => ToolResult::err(&format!("HTTPS fetch failed: {:?}", e)),
+            Err(e) => ToolResult::err(format!("HTTPS fetch failed: {:?}", e)),
         }
     } else {
         let ip = match resolve(parsed.host) {
             Ok(ip) => ip,
-            Err(_) => return ToolResult::err(&format!("DNS resolution failed for: {}", parsed.host)),
+            Err(_) => return ToolResult::err(format!("DNS resolution failed for: {}", parsed.host)),
         };
 
         let addr_str = format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], parsed.port);
         let stream = match TcpStream::connect(&addr_str) {
             Ok(s) => s,
-            Err(_) => return ToolResult::err(&format!("Connection failed to: {}", addr_str)),
+            Err(_) => return ToolResult::err(format!("Connection failed to: {}", addr_str)),
         };
 
         let request = format!(
@@ -98,7 +98,7 @@ pub fn tool_http_fetch(url: &str) -> ToolResult {
         };
 
         if !(200..300).contains(&status) {
-            return ToolResult::err(&format!("HTTP error: status {}", status));
+            return ToolResult::err(format!("HTTP error: status {}", status));
         }
 
         match core::str::from_utf8(body) {

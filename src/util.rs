@@ -1,5 +1,4 @@
 use alloc::string::String;
-use alloc::format;
 use core::fmt::{self, Write};
 
 pub fn json_escape_to(s: &str, out: &mut String) {
@@ -10,7 +9,7 @@ pub fn json_escape_to(s: &str, out: &mut String) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if c.is_control() => { let _ = write!(out, "\\u{:04x}", c as u32); }
             _    => out.push(c),
         }
     }

@@ -1,6 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
+use core::fmt::Write;
 use libakuma::{spawn, waitpid, read_fd, close, open, open_flags};
 
 use crate::config::{TOOL_BUFFER_SIZE, USE_PRETEND_SHELL};
@@ -140,7 +141,7 @@ pub fn spawn_and_collect(binary_path: &str, args: &[&str]) -> Result<(Vec<u8>, i
 fn run_and_capture(binary_path: &str, args: &[&str]) -> ToolResult {
     let (output, exit_code) = match spawn_and_collect(binary_path, args) {
         Ok(v) => v,
-        Err(e) => return ToolResult::err(&e),
+        Err(e) => return ToolResult::err(e),
     };
 
     let output_str = core::str::from_utf8(&output).unwrap_or("<binary output>");
@@ -149,9 +150,9 @@ fn run_and_capture(binary_path: &str, args: &[&str]) -> ToolResult {
         result_str.push_str("stdout:\n```\n");
         result_str.push_str(output_str);
         result_str.push_str("```\n");
-        result_str.push_str(&format!("Exit code: {}", exit_code));
+        let _ = write!(result_str, "Exit code: {}", exit_code);
     } else {
-        result_str.push_str(&format!("(No output)\nExit code: {}", exit_code));
+        let _ = write!(result_str, "(No output)\nExit code: {}", exit_code);
     }
 
     if exit_code == 0 {

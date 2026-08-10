@@ -24,6 +24,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
+use core::fmt::Write as _;
 
 use libakuma::{open, close, write_fd, open_flags, socket, connect, send, shutdown, socket_const, SocketAddrV4};
 
@@ -72,7 +73,7 @@ pub fn run(line: &str) -> ToolResult {
     }
     let commands = match parse(toks) {
         Ok(c) => c,
-        Err(e) => return ToolResult::err(&e),
+        Err(e) => return ToolResult::err(e),
     };
     if commands.is_empty() {
         return ToolResult::err("Empty command");
@@ -258,11 +259,16 @@ impl ReportSink {
             self.begin_spill();
         }
     }
+}
 
-    fn write_str(&mut self, s: &str) {
+impl core::fmt::Write for ReportSink {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
         self.write(s.as_bytes());
+        Ok(())
     }
+}
 
+impl ReportSink {
     /// Append a trailing newline iff the last write didn't end in one — preserves
     /// the per-command "+newline if missing" framing of the old buffered path.
     fn newline_if_needed(&mut self) {
@@ -290,12 +296,12 @@ impl ReportSink {
             close(fd);
             let preview = String::from_utf8_lossy(&self.ram);
             let mut out = String::from("[!] Output truncated due to memory limits.\n");
-            out.push_str(&format!("Full output saved to: {} ({} bytes)\n\n", path, self.total));
+            let _ = writeln!(out, "Full output saved to: {} ({} bytes)\n", path, self.total);
             out.push_str("stdout (preview):\n```\n");
             out.push_str(&preview);
             out.push_str("\n...\n```\n");
             out.push_str("Note: use `FileReadLines` to read specific parts of the saved output or `CodeSearch` for targeted investigation.\n");
-            out.push_str(&format!("Exit code: {}", last_exit));
+            let _ = write!(out, "Exit code: {}", last_exit);
             // Already spilled + previewed — return directly so `ToolResult::ok`'s
             // size check can't double-spill this (already-small) preview message.
             return ToolResult { success: last_exit == 0, output: out };
@@ -310,7 +316,7 @@ impl ReportSink {
             out.push_str(&report);
             out.push_str("```\n");
         }
-        out.push_str(&format!("Exit code: {}", last_exit));
+        let _ = write!(out, "Exit code: {}", last_exit);
 
         if last_exit == 0 {
             ToolResult::ok(out)
@@ -363,7 +369,7 @@ fn execute(commands: Vec<Command>) -> ToolResult {
                     Ok(s) => s,
                     Err(e) => {
                         last_exit = 1;
-                        report.write_str(&format!("[{} > {}] {}\n", cmd.argv[0], r.target, e));
+                        let _ = writeln!(report, "[{} > {}] {}", cmd.argv[0], r.target, e);
                         continue;
                     }
                 };
@@ -375,14 +381,15 @@ fn execute(commands: Vec<Command>) -> ToolResult {
                 match res {
                     Ok(exit_code) => {
                         last_exit = exit_code;
-                        report.write_str(&format!(
-                            "[{} {}> {}] piped {} bytes (exit {})\n",
+                        let _ = writeln!(
+                            report,
+                            "[{} {}> {}] piped {} bytes (exit {})",
                             cmd.argv[0], if r.append { ">" } else { "" }, r.target, written, exit_code
-                        ));
+                        );
                     }
                     Err(e) => {
                         last_exit = 1;
-                        report.write_str(&format!("[{} > {}] {}\n", cmd.argv[0], r.target, e));
+                        let _ = writeln!(report, "[{} > {}] {}", cmd.argv[0], r.target, e);
                     }
                 }
             }
@@ -411,7 +418,7 @@ fn execute(commands: Vec<Command>) -> ToolResult {
                     }
                     Err(e) => {
                         last_exit = 127;
-                        report.write_str(&format!("[{}] {}\n", cmd.argv[0], e));
+                        let _ = writeln!(report, "[{}] {}", cmd.argv[0], e);
                     }
                 }
             }

@@ -6,6 +6,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
+use core::fmt::Write;
 
 use libakuma::{open, close, read_fd, fstat, read_dir, open_flags};
 
@@ -48,17 +49,14 @@ pub fn search_to_string(
     };
 
     let mut output = String::new();
-    output.push_str(&format!(
-        "Found {} matches for '{}'",
-        total_matches, pattern
-    ));
+    let _ = write!(output, "Found {} matches for '{}'", total_matches, pattern);
     if truncated {
-        output.push_str(&format!(" (showing first {})", MAX_MATCHES));
+        let _ = write!(output, " (showing first {})", MAX_MATCHES);
     }
     output.push_str(":\n\n");
 
     for m in display_matches {
-        output.push_str(&format!("{}:{}\n", m.file, m.line_num));
+        let _ = writeln!(output, "{}:{}", m.file, m.line_num);
         for line in &m.context {
             output.push_str(line);
             output.push('\n');

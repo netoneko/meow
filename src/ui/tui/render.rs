@@ -299,7 +299,7 @@ pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
 pub fn print_greeting() {
     let mut stdout = Stdout;
     use core::fmt::Write;
-    let _ = write!(stdout, "\n{}\x1b[38;5;236m", COLOR_RESET);
+    let _ = write!(stdout, "\n{}{}", COLOR_RESET, crate::config::COLOR_LOGO);
     let _ = write!(stdout, "{}", CAT_ASCII);
     let _ = write!(stdout, "{}\n  {}meow{}\n\n", COLOR_RESET, COLOR_BOLD, COLOR_RESET);
 }

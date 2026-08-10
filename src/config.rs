@@ -109,8 +109,8 @@ pub const OPENAI_TOOLS_JSON: &str = r#"[{"type":"function","function":{"name":"F
 
 // UI Colors (Cyber-Steel / Tokyo Night)
 pub const COLOR_VIOLET: &str = "\x1b[38;2;181;126;220m"; // Lavender (#B57EDC)
-pub const COLOR_BLUE: &str = "\x1b[38;5;111m";   // Meow (Cyan/Blue)
-pub const COLOR_MEOW: &str = COLOR_BLUE;
+pub const COLOR_MEOW: &str = "\x1b[38;5;111m";   // Meow (Cyan/Blue)
+pub const COLOR_LOGO: &str = "\x1b[38;5;231m";   // Startup cat ASCII art (White)
 pub const COLOR_GRAY_DIM: &str = "\x1b[38;5;242m"; // Outer Frame
 pub const COLOR_GRAY_BRIGHT: &str = "\x1b[38;5;250m"; // Headers
 pub const COLOR_USER: &str = COLOR_VIOLET; // User input color
