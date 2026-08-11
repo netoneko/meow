@@ -76,7 +76,7 @@ pub fn chat_once(
 
                 for tc in &tool_calls {
                     if tc.name == "CompactContext" {
-                        let summary = extract_json_string(&tc.arguments, "summary").unwrap_or_default();
+                        let summary = crate::json::string_at(&tc.arguments, &["summary"]).unwrap_or_default();
                         if summary.is_empty() {
                             let mut result_msg = Message::new("tool", "CompactContext requires a non-empty summary");
                             result_msg.tool_call_id = Some(tc.id.clone());
@@ -163,54 +163,19 @@ pub fn chat_once(
     Ok(())
 }
 
-/// Find the byte offset of a JSON key's value, tolerating optional whitespace
-/// between the key and its colon and between the colon and the value — mirrors
-/// `api::client::json_value_start` (see docs/MLX_SERVER_TOOL_CALLS.md: some
-/// OpenAI-compatible servers/models space their JSON, `"key": "value"`, where
-/// meow's hand-rolled parser previously only matched `"key":"value"`).
-fn json_value_start(json: &str, key: &str) -> Option<usize> {
-    let key_pattern = format!("\"{}\"", key);
-    let key_pos = json.find(&key_pattern)?;
-    let after_key = &json[key_pos + key_pattern.len()..];
-    let colon_offset = after_key.find(':')?;
-    if !after_key[..colon_offset].trim().is_empty() { return None; }
-    let after_colon = &after_key[colon_offset + 1..];
-    let value_offset = after_colon.len() - after_colon.trim_start().len();
-    Some(key_pos + key_pattern.len() + colon_offset + 1 + value_offset)
-}
-
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let value_start = json_value_start(json, key)?;
-    if !json[value_start..].starts_with('"') { return None; }
-    let mut result = String::new();
-    let mut chars = json[value_start + 1..].chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => break,
-            '\\' => {
-                if let Some(&next) = chars.peek() {
-                    chars.next();
-                    match next {
-                        'n' => result.push('\n'), 'r' => result.push('\r'), 't' => result.push('\t'),
-                        '"' => result.push('"'), '\\' => result.push('\\'), '/' => result.push('/'),
-                        _ => { result.push('\\'); result.push(next); }
-                    }
-                }
-            }
-            _ => result.push(c),
-        }
-    }
-    Some(result)
-}
-
+/// `tc.id`/`tc.name` come from `extract_json_string`/`accumulate_tool_call_delta`
+/// parsing the model provider's SSE response — not compile-time-controlled —
+/// so they go through `json_escape_to` like `arguments` does. A provider that
+/// ever returns a tool name/id containing `"` or `\` would otherwise write an
+/// invalid JSON line to the conversation log, breaking every request after it.
 fn serialize_tool_calls(tool_calls: &[ToolCallData]) -> String {
     let mut s = String::from("[");
     for (i, tc) in tool_calls.iter().enumerate() {
         if i > 0 { s.push(','); }
         s.push_str("{\"id\":\"");
-        s.push_str(&tc.id);
+        json_escape_to(&tc.id, &mut s);
         s.push_str("\",\"type\":\"function\",\"function\":{\"name\":\"");
-        s.push_str(&tc.name);
+        json_escape_to(&tc.name, &mut s);
         s.push_str("\",\"arguments\":\"");
         json_escape_to(&tc.arguments, &mut s);
         s.push_str("\"}}");
@@ -229,7 +194,7 @@ pub fn run_tests() -> i32 {
     // extract_json_string: basic
     total += 1;
     {
-        let got = extract_json_string("{\"summary\":\"hello world\"}", "summary");
+        let got = crate::json::string_at("{\"summary\":\"hello world\"}", &["summary"]);
         if got.as_deref() == Some("hello world") { passed += 1; }
         else { libakuma::print(&format!("  [!] extract_json_string basic: {:?}\n", got)); }
     }
@@ -237,7 +202,7 @@ pub fn run_tests() -> i32 {
     // extract_json_string: with escape sequences
     total += 1;
     {
-        let got = extract_json_string("{\"summary\":\"line1\\nline2\"}", "summary");
+        let got = crate::json::string_at("{\"summary\":\"line1\\nline2\"}", &["summary"]);
         if got.as_deref() == Some("line1\nline2") { passed += 1; }
         else { libakuma::print(&format!("  [!] extract_json_string escape: {:?}\n", got)); }
     }
@@ -245,7 +210,7 @@ pub fn run_tests() -> i32 {
     // extract_json_string: missing key returns None
     total += 1;
     {
-        let got = extract_json_string("{\"other\":\"value\"}", "summary");
+        let got = crate::json::string_at("{\"other\":\"value\"}", &["summary"]);
         if got.is_none() { passed += 1; }
         else { libakuma::print(&format!("  [!] extract_json_string missing: got {:?}\n", got)); }
     }
@@ -253,7 +218,7 @@ pub fn run_tests() -> i32 {
     // extract_json_string: tolerates a space after the colon (Python json.dumps style)
     total += 1;
     {
-        let got = extract_json_string("{\"summary\": \"hello world\"}", "summary");
+        let got = crate::json::string_at("{\"summary\": \"hello world\"}", &["summary"]);
         if got.as_deref() == Some("hello world") { passed += 1; }
         else { libakuma::print(&format!("  [!] extract_json_string spaced: {:?}\n", got)); }
     }
@@ -288,6 +253,20 @@ pub fn run_tests() -> i32 {
         let json = serialize_tool_calls(&calls);
         if json.contains("\"id\":\"call1\"") && json.contains("\"name\":\"Shell\"") { passed += 1; }
         else { libakuma::print(&format!("  [!] serialize_tool_calls: {:?}\n", json)); }
+    }
+
+    // serialize_tool_calls: escapes a provider-supplied id/name containing a quote
+    total += 1;
+    {
+        let calls = alloc::vec![crate::api::ToolCallData {
+            id: String::from("call\"1"),
+            name: String::from("She\\ll"),
+            arguments: String::from("{}"),
+        }];
+        let json = serialize_tool_calls(&calls);
+        let want = "[{\"id\":\"call\\\"1\",\"type\":\"function\",\"function\":{\"name\":\"She\\\\ll\",\"arguments\":\"{}\"}}]";
+        if json == want { passed += 1; }
+        else { libakuma::print(&format!("  [!] serialize_tool_calls escaping: got {:?} want {:?}\n", json, want)); }
     }
 
     libakuma::print(&format!("  result: {}/{}\n", passed, total));

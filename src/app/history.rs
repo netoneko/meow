@@ -37,8 +37,12 @@ impl Message {
         }
 
         if let Some(ref tc_id) = self.tool_call_id {
+            // tc_id came from the model provider's SSE response (see
+            // api::client::accumulate_tool_call_delta), not a compile-time
+            // string, so it must be escaped like `content` above — an
+            // unescaped `"` here would corrupt this JSONL line.
             out.push_str(",\"tool_call_id\":\"");
-            out.push_str(tc_id);
+            json_escape_to(tc_id, out);
             out.push('"');
         }
 
@@ -196,6 +200,18 @@ pub fn run_tests() -> i32 {
         let tokens = message_tokens(&Message::new("user", "hello world"));
         if tokens > 0 { passed += 1; }
         else { libakuma::print("  [!] message_tokens returned 0\n"); }
+    }
+
+    // write_json escapes a provider-supplied tool_call_id containing a quote
+    total += 1;
+    {
+        let mut msg = Message::new("tool", "result");
+        msg.tool_call_id = Some(String::from("call\"1"));
+        let mut out = String::new();
+        msg.write_json(&mut out);
+        let want = "{\"role\":\"tool\",\"content\":\"result\",\"tool_call_id\":\"call\\\"1\"}";
+        if out == want { passed += 1; }
+        else { libakuma::print(&format!("  [!] write_json tool_call_id escaping: got {:?}\n", out)); }
     }
 
     libakuma::print(&format!("  result: {}/{}\n", passed, total));

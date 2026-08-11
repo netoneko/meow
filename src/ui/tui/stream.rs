@@ -173,86 +173,61 @@ impl StreamingRenderer {
     }
 }
 
-fn extract_tool_info(json: &str) -> Option<(String, String)> {
-    let tool = extract_field_value(json, "tool")?;
-    if tool.is_empty() { return None; }
-    
-    let mut args = String::new();
-    let fields = [
-        "filename", "path", "cmd", "url", "message", "branch", 
-        "source", "destination", "source_filename", "destination_filename",
-        "pattern", "content", "old_text", "new_text", "id", "status"
-    ];
-    
-    for field in fields {
-        if let Some(val) = extract_field_value(json, field) {
-            if field == "tool" || field == "command" || field == "args" { continue; }
-            if !args.is_empty() { args.push_str(", "); }
-            args.push_str(field);
-            args.push_str("=\"");
-            args.push_str(&val);
-            args.push('"');
-        }
-    }
-    Some((tool, args))
+/// The fixed field names this recognizes, and the fixed order they're
+/// reported in — independent of where the model actually nested them (e.g.
+/// `{"command": {"tool": "X", "args": {"filename": "Y"}}}` and
+/// `{"tool": "X", "args": {"filename": "Y"}}` both match `"filename"` the
+/// same way). This only decorates a chat notification and never reaches a
+/// filesystem or shell call — see `execute_tool_by_name` for the path that
+/// actually runs a tool, which reads structured `tool_calls`, not this.
+const TOOL_INFO_FIELDS: [&str; 16] = [
+    "filename", "path", "cmd", "url", "message", "branch",
+    "source", "destination", "source_filename", "destination_filename",
+    "pattern", "content", "old_text", "new_text", "id", "status",
+];
+
+/// `buffer` is a code-fenced block (` ```json\n{...}\n``` `) or a bare
+/// `{...}` — either way the JSON value itself is the first `{` through the
+/// last `}`.
+fn json_slice(buffer: &str) -> Option<&str> {
+    let start = buffer.find('{')?;
+    let end = buffer.rfind('}')?;
+    if end < start { return None; }
+    Some(&buffer[start..=end])
 }
 
-/// Find `field` in `json` wrapped by `open`/`close` (e.g. `"field"` via
-/// `Some('"'), '"'`, or a bare `field:` via `None, ':'`), returning the byte
-/// offset right past the closing wrapper char. Avoids `format!`-ing the three
-/// quoting-style patterns `extract_field_value` used to allocate per call.
-fn find_wrapped(json: &str, field: &str, open: Option<char>, close: char) -> Option<usize> {
-    for (p, _) in json.match_indices(field) {
-        if let Some(open) = open {
-            if p == 0 || json.as_bytes()[p - 1] != open as u8 { continue; }
+fn extract_tool_info(buffer: &str) -> Option<(String, String)> {
+    let json = json_slice(buffer)?;
+
+    let mut tool: Option<String> = None;
+    let mut found: [Option<String>; TOOL_INFO_FIELDS.len()] = core::array::from_fn(|_| None);
+    let _ = crate::json::walk(json, |path, value| {
+        let crate::json::Value::Str(s) = value else { return };
+        let Some(crate::json::Seg::Key(key)) = path.segments().last() else { return };
+        if tool.is_none() && key == "tool" {
+            tool = Some(String::from(s));
+            return;
         }
-        let end = p + field.len();
-        if !json[end..].starts_with(close) { continue; }
-        return Some(end + 1);
-    }
-    None
-}
-
-fn extract_field_value(json: &str, field: &str) -> Option<String> {
-    let pattern_ends = [
-        find_wrapped(json, field, Some('"'), '"'),
-        find_wrapped(json, field, Some('\''), '\''),
-        find_wrapped(json, field, None, ':'),
-    ];
-
-    for after_pattern in pattern_ends.into_iter().flatten() {
-        let after = &json[after_pattern..];
-        if let Some(colon_pos) = after.find(':') {
-            let after_colon = after[colon_pos + 1..].trim_start();
-            if after_colon.starts_with('"') || after_colon.starts_with('\'') {
-                let quote = after_colon.chars().next().unwrap();
-                let after_quote = &after_colon[1..];
-                let mut val = String::new();
-                let mut escape = false;
-                for c in after_quote.chars() {
-                    if escape {
-                        match c {
-                            'n' => val.push('\n'),
-                            'r' => val.push('\r'),
-                            't' => val.push('\t'),
-                            _ => val.push(c),
-                        }
-                        escape = false;
-                    } else if c == '\\' { escape = true; }
-                    else if c == quote { return Some(val); }
-                    else { val.push(c); }
-                }
-            } else {
-                let end = after_colon.find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace())
-                    .unwrap_or(after_colon.len());
-                if end > 0 {
-                    let val = after_colon[..end].trim();
-                    if !val.is_empty() && val != "{" { return Some(String::from(val)); }
-                }
+        if let Some(idx) = TOOL_INFO_FIELDS.iter().position(|&f| f == key.as_str()) {
+            if found[idx].is_none() {
+                found[idx] = Some(String::from(s));
             }
         }
+    });
+
+    let tool = tool?;
+    if tool.is_empty() { return None; }
+
+    let mut args = String::new();
+    for (field, val) in TOOL_INFO_FIELDS.iter().zip(found.iter()) {
+        let Some(val) = val else { continue };
+        if !args.is_empty() { args.push_str(", "); }
+        args.push_str(field);
+        args.push_str("=\"");
+        args.push_str(val);
+        args.push('"');
     }
-    None
+    Some((tool, args))
 }
 
 fn print_tool_notification(tool: &str, args: &str, indent: u16) {

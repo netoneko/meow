@@ -38,77 +38,12 @@ fn list_openai_models(provider: &Provider) -> Result<Vec<ModelInfo>, ProviderErr
 }
 
 fn parse_openai_models(json: &str) -> Result<Vec<ModelInfo>, ProviderError> {
-    let mut models = Vec::new();
-    let data_start = json.find("\"data\"")
-        .ok_or_else(|| ProviderError::ParseError(String::from("No data field found")))?;
-
-    let json = &json[data_start..];
-    let array_start = json.find('[')
-        .ok_or_else(|| ProviderError::ParseError(String::from("No data array found")))?;
-
-    let json = &json[array_start..];
-
-    let mut depth = 0;
-    let mut in_string = false;
-    let mut escape_next = false;
-    let mut obj_start = None;
-
-    for (i, c) in json.char_indices() {
-        if escape_next { escape_next = false; continue; }
-        match c {
-            '\\' if in_string => escape_next = true,
-            '"' => in_string = !in_string,
-            '{' if !in_string => { if depth == 0 { obj_start = Some(i); } depth += 1; }
-            '}' if !in_string => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(start) = obj_start {
-                        let obj = &json[start..=i];
-                        if let Some(id) = extract_json_string(obj, "id") {
-                            models.push(ModelInfo { name: id, _size: None, _parameter_size: None });
-                        }
-                    }
-                    obj_start = None;
-                }
-            }
-            ']' if !in_string && depth == 0 => break,
-            _ => {}
-        }
+    if !crate::json::exists(json, &["data"]) {
+        return Err(ProviderError::ParseError(String::from("No data field found")));
     }
-    Ok(models)
+    Ok(crate::json::strings_at(json, &["data", "*", "id"])
+        .into_iter()
+        .map(|name| ModelInfo { name, _size: None, _parameter_size: None })
+        .collect())
 }
-
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\"", key);
-    let start = json.find(&pattern)?;
-    let after_key = &json[start + pattern.len()..];
-    let colon_pos = after_key.find(':')?;
-    let after_colon = &after_key[colon_pos + 1..];
-    let trimmed = after_colon.trim_start();
-    if !trimmed.starts_with('"') { return None; }
-    let rest = &trimmed[1..];
-    let mut result = String::new();
-    let mut chars = rest.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => break,
-            '\\' => {
-                if let Some(&next) = chars.peek() {
-                    chars.next();
-                    match next {
-                        'n' => result.push('\n'),
-                        'r' => result.push('\r'),
-                        't' => result.push('\t'),
-                        '"' => result.push('"'),
-                        '\\' => result.push('\\'),
-                        _ => { result.push('\\'); result.push(next); }
-                    }
-                }
-            }
-            _ => result.push(c),
-        }
-    }
-    Some(result)
-}
-
 

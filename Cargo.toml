@@ -47,3 +47,8 @@ overflow-checks = false
 [dependencies]
 libakuma = { path = "../libakuma", features = ["chunked-allocator"] }
 libakuma-tls = { path = "../libakuma-tls" }
+# JSON. no_std, allocation-free, non-recursive pull parser — same choice and
+# feature set `box` already made (see userspace/box/Cargo.toml): no floats
+# needed for chat-API/tool-call JSON, and float-skip steps over one rather
+# than failing the whole document.
+picojson = { version = "0.2", default-features = false, features = ["int64", "float-skip"] }

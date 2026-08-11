@@ -744,125 +744,66 @@ fn parse_streaming_line(line: &str) -> Option<(String, bool)> {
 
 /// Accumulate a tool_call delta from an OpenAI SSE line into the pending list.
 /// Returns true if the stream signals finish_reason "tool_calls".
+///
+/// Each `data:` line is one complete JSON chunk, so the whole line is walked
+/// as a document; a string is only treated as an `id`/`name`/`arguments`
+/// fragment if `tool_calls` appears somewhere above it in the path — this is
+/// what excludes the chunk's own top-level `"id"` (every OpenAI-compatible
+/// chunk has one) from being mistaken for a tool call id. Whether a provider
+/// nests `name`/`arguments` under `tool_calls[].function` (OpenAI) or not is
+/// deliberately not encoded in the path match, for the same compatibility
+/// reason `json_value_start` used to tolerate spacing differences.
+///
+/// The three fields are collected independently and only applied to `pending`
+/// *after* the walk finishes, rather than in visit order: at least one
+/// OpenAI-compatible server (mlx-server) emits `function` (name + arguments)
+/// *before* `id` in the same object, and a single left-to-right pass that
+/// pushes a new `ToolCallData` on `id` would silently drop `name`/`arguments`
+/// seen before that push had happened.
 fn accumulate_tool_call_delta(line: &str, pending: &mut Vec<ToolCallData>) -> bool {
     let line = line.trim();
     if !line.starts_with("data:") { return false; }
     let json = match line.strip_prefix("data:") { Some(j) => j.trim(), None => return false };
     if json.is_empty() || json == "[DONE]" { return false; }
 
-    let is_finish = json_field_is(json, "finish_reason", "tool_calls");
+    let is_finish = crate::json::string_at(json, &["choices", "0", "finish_reason"]).as_deref() == Some("tool_calls");
 
-    if let Some(tc_pos) = json.find("\"tool_calls\"") {
-        let tc_json = &json[tc_pos..];
+    let mut id = None;
+    let mut name = None;
+    let mut arguments = None;
+    let _ = crate::json::walk(json, |path, value| {
+        let crate::json::Value::Str(s) = value else { return };
+        let segs = path.segments();
+        if !segs.iter().any(|seg| matches!(seg, crate::json::Seg::Key(k) if k == "tool_calls")) {
+            return;
+        }
+        match segs.last() {
+            Some(crate::json::Seg::Key(k)) if k == "id" && id.is_none() => id = Some(String::from(s)),
+            Some(crate::json::Seg::Key(k)) if k == "name" && name.is_none() => name = Some(String::from(s)),
+            Some(crate::json::Seg::Key(k)) if k == "arguments" && arguments.is_none() => arguments = Some(String::from(s)),
+            _ => {}
+        }
+    });
 
-        // A new tool call starts when an "id" appears inside tool_calls
-        if let Some(id) = extract_json_string(tc_json, "id") {
-            if !id.is_empty() {
-                pending.push(ToolCallData { id, name: String::new(), arguments: String::new() });
-            }
+    if let Some(id) = id {
+        if !id.is_empty() {
+            pending.push(ToolCallData { id, name: String::new(), arguments: String::new() });
         }
-        if let Some(name) = extract_json_string(tc_json, "name") {
-            if !name.is_empty() {
-                if let Some(last) = pending.last_mut() { last.name = name; }
-            }
+    }
+    if let Some(name) = name {
+        if !name.is_empty() {
+            if let Some(last) = pending.last_mut() { last.name = name; }
         }
-        if let Some(args_frag) = extract_json_string(tc_json, "arguments") {
-            if let Some(last) = pending.last_mut() { last.arguments.push_str(&args_frag); }
-        }
+    }
+    if let Some(arguments) = arguments {
+        if let Some(last) = pending.last_mut() { last.arguments.push_str(&arguments); }
     }
 
     is_finish
 }
 
 fn extract_openai_delta_content(json: &str) -> Option<String> {
-    let delta_pos = json.find("\"delta\"")?;
-    let after_delta = &json[delta_pos..];
-    let content_pos = after_delta.find("\"content\"")?;
-    let after_content = &after_delta[content_pos..];
-    let colon_pos = after_content.find(':')?;
-    let rest = &after_content[colon_pos + 1..];
-    let trimmed = rest.trim_start();
-    if !trimmed.starts_with('"') { return None; }
-    let value_rest = &trimmed[1..];
-    let mut result = String::new();
-    let mut chars = value_rest.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => break,
-            '\\' => {
-                if let Some(&next) = chars.peek() {
-                    chars.next();
-                    match next {
-                        'n' => result.push('\n'),
-                        'r' => result.push('\r'),
-                        't' => result.push('\t'),
-                        '"' => result.push('"'),
-                        '\\' => result.push('\\'),
-                        _ => { result.push('\\'); result.push(next); }
-                    }
-                }
-            }
-            _ => result.push(c),
-        }
-    }
-    Some(result)
-}
-
-/// Find the byte offset of a JSON key's value, tolerating optional whitespace
-/// between the key and its colon and between the colon and the value (mlx-server's
-/// `json.dumps` defaults insert a space after every colon; ollama's compact
-/// serializer does not — meow must match structure, not byte-exact formatting).
-fn json_value_start(json: &str, key: &str) -> Option<usize> {
-    let key_pattern = format!("\"{}\"", key);
-    let key_pos = json.find(&key_pattern)?;
-    let after_key = &json[key_pos + key_pattern.len()..];
-    let colon_offset = after_key.find(':')?;
-    if !after_key[..colon_offset].trim().is_empty() { return None; }
-    let after_colon = &after_key[colon_offset + 1..];
-    let value_offset = after_colon.len() - after_colon.trim_start().len();
-    Some(key_pos + key_pattern.len() + colon_offset + 1 + value_offset)
-}
-
-/// True if `key`'s value in `json` is the string `value`, tolerating optional
-/// whitespace around the colon (see `json_value_start`).
-fn json_field_is(json: &str, key: &str, value: &str) -> bool {
-    let Some(value_start) = json_value_start(json, key) else { return false };
-    let rest = &json[value_start..];
-    let Some(after_quote) = rest.strip_prefix('"') else { return false };
-    after_quote.strip_prefix(value).is_some_and(|tail| tail.starts_with('"'))
-}
-
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let value_start = json_value_start(json, key)?;
-    if !json[value_start..].starts_with('"') { return None; }
-    let mut result = String::new();
-    let mut chars = json[value_start + 1..].chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => break,
-            '\\' => {
-                if let Some(&next) = chars.peek() {
-                    chars.next();
-                    match next {
-                        'n' => result.push('\n'),
-                        'r' => result.push('\r'),
-                        't' => result.push('\t'),
-                        '"' => result.push('"'),
-                        '\\' => result.push('\\'),
-                        '/' => result.push('/'),
-                        'u' => {
-                            let mut hex = String::new();
-                            for _ in 0..4 { if let Some(h) = chars.next() { hex.push(h); } }
-                            if let Ok(code) = u32::from_str_radix(&hex, 16) { if let Some(ch) = char::from_u32(code) { result.push(ch); } }
-                        }
-                        _ => { result.push('\\'); result.push(next); }
-                    }
-                }
-            }
-            _ => result.push(c),
-        }
-    }
-    Some(result)
+    crate::json::string_at(json, &["choices", "0", "delta", "content"])
 }
 
 fn find_header_end(data: &[u8]) -> Option<usize> {
