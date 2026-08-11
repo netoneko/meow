@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 use alloc::format;
 use libakuma::net::{TcpStream, resolve};
+use libakuma_tls::{find_headers_end, parse_status_line, parse_url};
 
 use super::mod_types::ToolResult;
 
@@ -9,7 +10,7 @@ const MAX_FETCH_SIZE: usize = 64 * 1024;
 
 /// HTTP/HTTPS GET fetch tool
 pub fn tool_http_fetch(url: &str) -> ToolResult {
-    let parsed = match parse_http_url(url) {
+    let parsed = match parse_url(url) {
         Some(p) => p,
         None => return ToolResult::err("Invalid URL format. Use: http(s)://host[:port]/path"),
     };
@@ -46,16 +47,11 @@ pub fn tool_http_fetch(url: &str) -> ToolResult {
         };
 
         let request = format!(
-            "GET {} HTTP/1.0
-
-             Host: {}
-
-             User-Agent: meow/1.0 (Akuma)
-
-             Connection: close
-
-             
-",
+            "GET {} HTTP/1.0\r\n\
+             Host: {}\r\n\
+             User-Agent: meow/1.0 (Akuma)\r\n\
+             Connection: close\r\n\
+             \r\n",
             parsed.path,
             parsed.host
         );
@@ -117,60 +113,9 @@ pub fn tool_http_fetch(url: &str) -> ToolResult {
     }
 }
 
-struct ParsedUrl<'a> {
-    is_https: bool,
-    host: &'a str,
-    port: u16,
-    path: &'a str,
-}
-
-fn parse_http_url(url: &str) -> Option<ParsedUrl<'_>> {
-    let (is_https, rest) = if let Some(r) = url.strip_prefix("https://") {
-        (true, r)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        (false, r)
-    } else {
-        return None;
-    };
-    
-    let default_port = if is_https { 443 } else { 80 };
-    
-    let (host_port, path) = match rest.find('/') {
-        Some(pos) => (&rest[..pos], &rest[pos..]),
-        None => (rest, "/"),
-    };
-    
-    let (host, port) = match host_port.rfind(':') {
-        Some(pos) => {
-            let h = &host_port[..pos];
-            let p = host_port[pos + 1..].parse::<u16>().ok()?;
-            (h, p)
-        }
-        None => (host_port, default_port),
-    };
-    
-    Some(ParsedUrl { is_https, host, port, path })
-}
-
 fn parse_http_response(data: &[u8]) -> Option<(u16, &[u8])> {
     let headers_end = find_headers_end(data)?;
     let header_str = core::str::from_utf8(&data[..headers_end]).ok()?;
-    let first_line = header_str.lines().next()?;
-    
-    let mut parts = first_line.split_whitespace();
-    let _version = parts.next()?;
-    let status: u16 = parts.next()?.parse().ok()?;
-    
+    let status = parse_status_line(header_str)?;
     Some((status, &data[headers_end..]))
-}
-
-fn find_headers_end(data: &[u8]) -> Option<usize> {
-    for i in 0..data.len().saturating_sub(3) {
-        if &data[i..i + 4] == b"
-
-" {
-            return Some(i + 4);
-        }
-    }
-    None
 }

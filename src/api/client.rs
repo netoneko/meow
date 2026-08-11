@@ -8,7 +8,7 @@ use crate::linux_net::resolve;
 #[cfg(not(feature = "linux-net"))]
 use libakuma::net::resolve;
 use libakuma::net::TcpStream;
-use libakuma_tls::{HttpHeaders, HttpStreamTls, StreamResult, TLS_RECORD_SIZE};
+use libakuma_tls::{HttpHeaders, HttpStreamTls, StreamResult, TLS_RECORD_SIZE, find_headers_end, parse_status_line};
 use crate::util::{StackBuffer, json_escape_to};
 use core::fmt::Write;
 use crate::ui::tui::layout::Stdout;
@@ -637,12 +637,12 @@ fn read_streaming_response_with_progress(
                 read_attempts = 0;
                 pending_data.extend_from_slice(&buf[..n]);
                 if !headers_parsed {
-                    if let Some(pos) = find_header_end(&pending_data) {
-                        let header_str = core::str::from_utf8(&pending_data[..pos]).unwrap_or("");
-                        if !header_str.contains(" 200 ") {
+                    if let Some(body_start) = find_headers_end(&pending_data) {
+                        let header_str = core::str::from_utf8(&pending_data[..body_start]).unwrap_or("");
+                        let status = parse_status_line(header_str).unwrap_or(0);
+                        if status != 200 {
                             if tui_app::DEBUG_MODE.load(Ordering::SeqCst) {
                                 let status_line = header_str.lines().next().unwrap_or("?");
-                                let body_start = pos + 4;
                                 let body_preview_end = (body_start + 512).min(pending_data.len());
                                 let body_snippet = core::str::from_utf8(&pending_data[body_start..body_preview_end]).unwrap_or("(non-utf8)");
                                 let mut stdout = Stdout;
@@ -656,7 +656,7 @@ fn read_streaming_response_with_progress(
                             let _ = write!(stdout, "\n[meow:debug] response: {}\n", status_line);
                         }
                         headers_parsed = true;
-                        pending_data.drain(..pos + 4);
+                        pending_data.drain(..body_start);
                     }
                     continue;
                 }
@@ -804,11 +804,6 @@ fn accumulate_tool_call_delta(line: &str, pending: &mut Vec<ToolCallData>) -> bo
 
 fn extract_openai_delta_content(json: &str) -> Option<String> {
     crate::json::string_at(json, &["choices", "0", "delta", "content"])
-}
-
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    for i in 0..data.len().saturating_sub(3) { if &data[i..i + 4] == b"\r\n\r\n" { return Some(i); } }
-    None
 }
 
 fn print_elapsed(ms: u64) {
