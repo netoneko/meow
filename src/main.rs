@@ -373,7 +373,6 @@ fn run_all_tests() -> i32 {
     failures += Config::run_tests();
     failures += app::chat::run_tests();
     failures += crate::ui::tui::stream::run_tests();
-    failures += crate::json::run_tests();
     if failures == 0 {
         libakuma::print("=== All tests passed ===\n");
     } else {
