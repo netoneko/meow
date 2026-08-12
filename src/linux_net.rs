@@ -16,16 +16,6 @@ pub fn uptime_us() -> u64 {
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000
 }
 
-fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
-    let mut parts = s.splitn(5, '.');
-    let a = parts.next()?.parse::<u8>().ok()?;
-    let b = parts.next()?.parse::<u8>().ok()?;
-    let c = parts.next()?.parse::<u8>().ok()?;
-    let d = parts.next()?.parse::<u8>().ok()?;
-    if parts.next().is_some() { return None; }
-    Some([a, b, c, d])
-}
-
 fn get_nameserver() -> [u8; 4] {
     let fd = libakuma::open("/etc/resolv.conf", libakuma::open_flags::O_RDONLY);
     if fd < 0 { return [8, 8, 8, 8]; }
@@ -36,7 +26,7 @@ fn get_nameserver() -> [u8; 4] {
     let text = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
     for line in text.lines() {
         if let Some(rest) = line.trim().strip_prefix("nameserver ") {
-            if let Some(ip) = parse_ipv4(rest.trim()) {
+            if let Some(ip) = SocketAddrV4::parse_ip(rest.trim()) {
                 return ip;
             }
         }
@@ -118,7 +108,7 @@ fn check_hosts_file(hostname: &str) -> Option<[u8; 4]> {
         if line.starts_with('#') || line.is_empty() { continue; }
         let mut cols = line.split_whitespace();
         let ip_str = cols.next()?;
-        let ip = parse_ipv4(ip_str)?;
+        let ip = SocketAddrV4::parse_ip(ip_str)?;
         for name in cols {
             if name == hostname { return Some(ip); }
         }
@@ -132,7 +122,7 @@ fn check_hosts_file(hostname: &str) -> Option<[u8; 4]> {
 /// syscalls — the exact same syscalls the rump sysproxy intercepts in the box.
 pub fn resolve(hostname: &str) -> Result<[u8; 4], Error> {
     // Fast path: already an IP literal
-    if let Some(ip) = parse_ipv4(hostname) {
+    if let Some(ip) = SocketAddrV4::parse_ip(hostname) {
         return Ok(ip);
     }
 
