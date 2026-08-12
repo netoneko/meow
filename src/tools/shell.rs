@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::format;
 use core::fmt::Write;
-use libakuma::{spawn, waitpid, read_fd, close, open, open_flags};
+use libakuma::{spawn, waitpid, read_fd, close, open, open_flags, kill_signal, SIGTERM};
 
 use crate::config::{TOOL_BUFFER_SIZE, USE_PRETEND_SHELL};
 use super::mod_types::ToolResult;
@@ -85,7 +85,7 @@ where
         let n = read_fd(result.stdout_fd as i32, &mut buf);
         if n > 0 {
             if let Err(e) = on_chunk(&buf[..n as usize]) {
-                let _ = libakuma::kill(result.pid);
+                let _ = kill_signal(result.pid, SIGTERM);
                 close(result.stdout_fd as i32);
                 return Err(e);
             }
@@ -114,7 +114,7 @@ where
         libakuma::sleep_ms(50);
         waited_ms += 50;
         if waited_ms >= max_wait_ms {
-            let _ = libakuma::kill(result.pid);
+            let _ = kill_signal(result.pid, SIGTERM);
             close(result.stdout_fd as i32);
             return Err(String::from("Command timed out after 30 seconds"));
         }

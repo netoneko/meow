@@ -239,8 +239,8 @@ fn probe_terminal_size() -> (u16, u16) {
 pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config, conversation: &mut Conversation, context_window: usize, system_prompt: &str) -> Result<(), &'static str> {
     let _guard = TuiGuard::new();
     let mut old_mode: u64 = 0;
-    get_terminal_attributes(fd::STDIN, &mut old_mode as *mut u64 as u64);
-    set_terminal_attributes(fd::STDIN, 0, mode_flags::RAW_MODE_ENABLE);
+    get_terminal_attributes(fd::STDIN as u64, &mut old_mode as *mut u64 as u64);
+    set_terminal_attributes(fd::STDIN as u64, 0, mode_flags::RAW_MODE_ENABLE);
 
     let (w, h) = probe_terminal_size();
     TERM_WIDTH.store(w, Ordering::SeqCst); TERM_HEIGHT.store(h, Ordering::SeqCst);
@@ -326,7 +326,7 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
     // Alternate screen exit restores the previous terminal content automatically,
     // so we must NOT clear_screen() after this.
     akuma_write(fd::STDOUT, b"\x1b[<u\x1b[?1049l");
-    set_terminal_attributes(fd::STDIN, 0, old_mode);
+    set_terminal_attributes(fd::STDIN as u64, 0, old_mode);
     show_cursor();
     Ok(())
 }
