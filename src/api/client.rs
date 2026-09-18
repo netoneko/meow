@@ -33,6 +33,100 @@ fn debug_print(msg: &str) {
 const MAX_RETRIES: u32 = 10;
 const DEFAULT_MAX_TOKENS: usize = 16384;
 
+/// Hard ceiling on one streamed response, in bytes.
+///
+/// The reader had **no** bound of its own on a chatty server. `read_attempts`
+/// is reset to 0 by every successful read, so the `read_attempts > 6000`
+/// timeout only ever catches a *silent* peer; a model that streams forever is
+/// never cut off. The only real bound was the server honouring
+/// [`DEFAULT_MAX_TOKENS`], and in `--no-tui`/`-c` mode there is no cancel path
+/// either ([`tui_app::tui_handle_input`] returns immediately when the TUI is
+/// not active, so `tui_is_cancelled` can never become true). A model that fell
+/// into a repetition cycle therefore printed for minutes with no way to stop
+/// it — the reported symptom.
+const MAX_RESPONSE_BYTES: usize = 512 * 1024;
+
+/// Window scanned for a repetition cycle, the needle taken from its tail, and
+/// how many times that needle must occur inside it to count as degenerate.
+const GUARD_WINDOW_BYTES: usize = 8192;
+const GUARD_NEEDLE_BYTES: usize = 128;
+const GUARD_MIN_HITS: usize = 4;
+/// Bytes of growth between two repetition scans, so the scan is amortised
+/// rather than run per chunk.
+const GUARD_STEP_BYTES: usize = 4096;
+
+/// Last `n` bytes of `s`, rounded forward to a `char` boundary.
+fn tail(s: &str, n: usize) -> &str {
+    if s.len() <= n {
+        return s;
+    }
+    let mut i = s.len() - n;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    &s[i..]
+}
+
+/// True when the tail of `s` is a model stuck in a repetition cycle.
+///
+/// Deliberately looks for a repeated *tail*, not a repeated whole response: a
+/// degenerate stream starts with real content and only later falls into a
+/// 2-cycle, so anchoring on the end is what catches it while the unique prefix
+/// is still intact.
+fn looks_degenerate(s: &str) -> bool {
+    if s.len() < GUARD_WINDOW_BYTES {
+        return false;
+    }
+    let window = tail(s, GUARD_WINDOW_BYTES);
+    let needle = tail(window, GUARD_NEEDLE_BYTES);
+    if needle.len() < GUARD_NEEDLE_BYTES {
+        return false;
+    }
+    window.matches(needle).count() >= GUARD_MIN_HITS
+}
+
+/// Amortised runaway detector for one stream. `check` returns the reason to
+/// stop, or `None` to keep reading.
+struct RunawayGuard {
+    next_check: usize,
+}
+
+impl RunawayGuard {
+    fn new() -> Self {
+        RunawayGuard { next_check: GUARD_WINDOW_BYTES }
+    }
+
+    fn check(&mut self, s: &str) -> Option<&'static str> {
+        if s.len() >= MAX_RESPONSE_BYTES {
+            return Some("response exceeded 512KB");
+        }
+        if s.len() < self.next_check {
+            return None;
+        }
+        self.next_check = s.len() + GUARD_STEP_BYTES;
+        if looks_degenerate(s) {
+            return Some("model stuck in a repetition loop");
+        }
+        None
+    }
+}
+
+/// Announce that the reader cut a stream off itself, then hand back the text
+/// gathered so far as a completed response — which is what stops `chat_once`
+/// re-asking for it (`StreamResponse::Complete` is its only terminating arm).
+fn cut_off(reason: &str, is_tui: bool) {
+    if is_tui {
+        tui_app::finish_streaming();
+    }
+    tui_app::clear_streaming_status();
+    libakuma::print("\n");
+    libakuma::print(crate::config::COLOR_YELLOW);
+    libakuma::print("     --- Stream cut off: ");
+    libakuma::print(reason);
+    libakuma::print("\n");
+    libakuma::print(crate::config::COLOR_RESET);
+}
+
 /// Serialize the chat request body to a temp file, stream it to the provider
 /// with retries, then remove the file. Serializing to disk (rather than into a
 /// single growing `String`) keeps the whole conversation from ever being
@@ -451,6 +545,7 @@ fn read_streaming_with_http_stream_tls(
     let mut ttft_us = 0;
     let mut stream_start_us = 0;
     let mut pending_tool_calls: Vec<ToolCallData> = Vec::new();
+    let mut guard = RunawayGuard::new();
 
     loop {
         tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
@@ -487,6 +582,14 @@ fn read_streaming_with_http_stream_tls(
                                     tui_app::tui_print_assistant(&content);
                                 }
                                 full_response.push_str(&content);
+                                if let Some(reason) = guard.check(&full_response) {
+                                    cut_off(reason, is_tui);
+                                    let stats = StreamStats { ttft_us, stream_us: now_us() - stream_start_us, total_bytes: full_response.len() };
+                                    if !pending_tool_calls.is_empty() {
+                                        return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
+                                    }
+                                    return Ok(StreamResponse::Complete(full_response, stats));
+                                }
                             }
                             if done {
                                 if is_tui { tui_app::finish_streaming(); }
@@ -534,6 +637,14 @@ fn read_streaming_with_http_stream_tls(
                                 tui_app::tui_print(&content);
                             }
                             full_response.push_str(&content);
+                            if let Some(reason) = guard.check(&full_response) {
+                                cut_off(reason, is_tui);
+                                let stats = StreamStats { ttft_us, stream_us: now_us() - stream_start_us, total_bytes: full_response.len() };
+                                if !pending_tool_calls.is_empty() {
+                                    return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
+                                }
+                                return Ok(StreamResponse::Complete(full_response, stats));
+                            }
                         }
                         if done {
                             if is_tui { tui_app::finish_streaming(); }
@@ -586,6 +697,7 @@ fn read_streaming_response_with_progress(
     let mut ttft_us = 0;
     let mut stream_start_us = 0;
     let mut pending_tool_calls: Vec<ToolCallData> = Vec::new();
+    let mut guard = RunawayGuard::new();
 
     loop {
         tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
@@ -621,6 +733,14 @@ fn read_streaming_response_with_progress(
                                     tui_app::tui_print_assistant(&content);
                                 }
                                 full_response.push_str(&content);
+                                if let Some(reason) = guard.check(&full_response) {
+                                    cut_off(reason, is_tui);
+                                    let stats = StreamStats { ttft_us, stream_us: now_us() - stream_start_us, total_bytes: full_response.len() };
+                                    if !pending_tool_calls.is_empty() {
+                                        return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
+                                    }
+                                    return Ok(StreamResponse::Complete(full_response, stats));
+                                }
                             }
                             if done {
                                 if is_tui { tui_app::finish_streaming(); }
@@ -689,6 +809,14 @@ fn read_streaming_response_with_progress(
                                     tui_app::tui_print_assistant(&content);
                                 }
                                 full_response.push_str(&content);
+                                if let Some(reason) = guard.check(&full_response) {
+                                    cut_off(reason, is_tui);
+                                    let stats = StreamStats { ttft_us, stream_us: now_us() - stream_start_us, total_bytes: full_response.len() };
+                                    if !pending_tool_calls.is_empty() {
+                                        return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
+                                    }
+                                    return Ok(StreamResponse::Complete(full_response, stats));
+                                }
                             }
                             if done {
                                 if is_tui { tui_app::finish_streaming(); }
@@ -733,13 +861,36 @@ fn read_streaming_response_with_progress(
     Ok(StreamResponse::Complete(full_response, stats))
 }
 
+/// Parse one SSE line into `(content, stream_is_over)`.
+///
+/// **A non-null `finish_reason` ends the stream, not just `data: [DONE]`.**
+/// Keying the end solely off the `[DONE]` sentinel was wrong twice over:
+///
+/// * Not every OpenAI-compatible server sends one. When none arrives the reader
+///   falls out of its loop with `stream_completed` still false, and the tail of
+///   [`read_streaming_response_with_progress`] classifies a perfectly complete
+///   answer as [`StreamResponse::Partial`]. That is invisible on a tool-call
+///   turn — the `!pending_tool_calls.is_empty()` arm returns first — so it bites
+///   only on the **final, tool-free turn**, where `chat_once` appends
+///   "[System: Your response was cut off mid-stream…]" and re-asks, reprinting
+///   the finished answer up to `MAX_TOOL_ITERATIONS` times.
+/// * `data: [DONE]\n\n` is **14 bytes**, which is exactly the terminating chunk
+///   that `docs/archive/AKUMA_AMD64_STREAM_END_STALL.md` measured arriving 60 s
+///   after the body it terminates. Ending on `finish_reason` means the answer is
+///   already complete and returned by the time that chunk is late, so the stall
+///   costs meow nothing even while the kernel-side defect is open.
+///
+/// `finish_reason` is `null` on every chunk but the last, and `string_at`
+/// returns `None` for a JSON null, so this only fires on the real final chunk.
 fn parse_streaming_line(line: &str) -> Option<(String, bool)> {
     let line = line.trim();
     if line == "data: [DONE]" { return Some((String::new(), true)); }
     if !line.starts_with("data:") { return Some((String::new(), false)); }
     let json = line.strip_prefix("data:")?.trim();
     if json.is_empty() || json == "[DONE]" { return Some((String::new(), json == "[DONE]")); }
-    Some((extract_openai_delta_content(json).unwrap_or_default(), false))
+    let content = extract_openai_delta_content(json).unwrap_or_default();
+    let finished = crate::json::string_at(json, &["choices", "0", "finish_reason"]).is_some();
+    Some((content, finished))
 }
 
 /// Accumulate a tool_call delta from an OpenAI SSE line into the pending list.
