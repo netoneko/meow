@@ -41,6 +41,59 @@ fn auto_compact_if_needed(conversation: &mut Conversation, system_prompt: &str) 
     );
 }
 
+fn announce_tool_call(tc: &ToolCallData) {
+    let args_trimmed = tc.arguments.trim();
+    let call_line = if args_trimmed.is_empty() || args_trimmed == "{}" {
+        format!("ToolCalled: {}", tc.name)
+    } else {
+        format!("ToolCalled: {} | Arguments {}", tc.name, args_trimmed)
+    };
+    print_notification(COLOR_YELLOW, &call_line, 0);
+    if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
+        tui_app::render_status_now(&format!("[TOOL] Running: {}", tc.name));
+    }
+}
+
+fn report_and_append_tool_result(conversation: &mut Conversation, tc: &ToolCallData, tool_result: tools::ToolResult, duration_us: u64) {
+    let (color, status) = if tool_result.success { (COLOR_GREEN_LIGHT, "Success") } else { (COLOR_PEARL, "Failed") };
+    let status_content = format!("Tool Status: {}", status);
+
+    if tool_result.success {
+        print_msg(COLOR_RESET, "\n");
+        print_msg(COLOR_GRAY_BRIGHT, &tool_result.output);
+        print_msg(COLOR_RESET, "\n\n");
+        print_notification(color, &status_content, duration_us);
+        print_msg(COLOR_RESET, "\n");
+    } else {
+        print_notification(color, &status_content, duration_us);
+        print_msg(COLOR_RESET, "\n");
+        print_msg(COLOR_GRAY_BRIGHT, &tool_result.output);
+        print_msg(COLOR_RESET, "\n\n");
+    }
+
+    let current_cwd = tools::get_working_dir();
+    let result_content = if tool_result.success {
+        format!("{}\n[Current Directory: {}]", tool_result.output, current_cwd)
+    } else {
+        format!("Tool failed: {}\n[Current Directory: {}]\n\nPlease analyze the failure and try again.", tool_result.output, current_cwd)
+    };
+    let mut result_msg = Message::new("tool", &result_content);
+    result_msg.tool_call_id = Some(tc.id.clone());
+    conversation.append(&result_msg);
+}
+
+// A fork-based parallel tool-call dispatcher (run Shell/HttpFetch calls in
+// forked children, reap via wait_any(), collect results from tempfiles) was
+// prototyped here and reverted: forking from *inside* an already-forked
+// child (Shell's own `spawn()` forks again internally) left the outer child
+// dying before it could even create its result tempfile, in every run tried
+// in this session's Docker/Alpine test environment. Not root-caused — could
+// be the custom allocator, could be something else about nested fork() in
+// that environment — and an unresolved bug in a default-enabled core-loop
+// change is not something to ship. Sequential tool execution below is the
+// verified-correct baseline; revisit parallel dispatch as its own
+// investigation, not bundled into an unrelated debugging session.
+
 pub fn chat_once(
     model: &str,
     provider: &Provider,
@@ -111,47 +164,12 @@ pub fn chat_once(
                         continue;
                     }
 
-                    let args_trimmed = tc.arguments.trim();
-                    let call_line = if args_trimmed.is_empty() || args_trimmed == "{}" {
-                        format!("ToolCalled: {}", tc.name)
-                    } else {
-                        format!("ToolCalled: {} | Arguments {}", tc.name, args_trimmed)
-                    };
-                    print_notification(COLOR_YELLOW, &call_line, 0);
-                    if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
-                        tui_app::render_status_now(&format!("[TOOL] Running: {}", tc.name));
-                    }
-
+                    announce_tool_call(tc);
                     let tool_start = crate::util::now_us();
                     let tool_result = tools::execute_tool_by_name(&tc.name, &tc.arguments)
                         .unwrap_or_else(|| tools::ToolResult::err("Unknown or unsupported tool"));
                     let tool_duration_us = crate::util::now_us() - tool_start;
-
-                    let (color, status) = if tool_result.success { (COLOR_GREEN_LIGHT, "Success") } else { (COLOR_PEARL, "Failed") };
-                    let status_content = format!("Tool Status: {}", status);
-
-                    if tool_result.success {
-                        print_msg(COLOR_RESET, "\n");
-                        print_msg(COLOR_GRAY_BRIGHT, &tool_result.output);
-                        print_msg(COLOR_RESET, "\n\n");
-                        print_notification(color, &status_content, tool_duration_us);
-                        print_msg(COLOR_RESET, "\n");
-                    } else {
-                        print_notification(color, &status_content, tool_duration_us);
-                        print_msg(COLOR_RESET, "\n");
-                        print_msg(COLOR_GRAY_BRIGHT, &tool_result.output);
-                        print_msg(COLOR_RESET, "\n\n");
-                    }
-
-                    let current_cwd = tools::get_working_dir();
-                    let result_content = if tool_result.success {
-                        format!("{}\n[Current Directory: {}]", tool_result.output, current_cwd)
-                    } else {
-                        format!("Tool failed: {}\n[Current Directory: {}]\n\nPlease analyze the failure and try again.", tool_result.output, current_cwd)
-                    };
-                    let mut result_msg = Message::new("tool", &result_content);
-                    result_msg.tool_call_id = Some(tc.id.clone());
-                    conversation.append(&result_msg);
+                    report_and_append_tool_result(conversation, tc, tool_result, tool_duration_us);
                 }
 
                 auto_compact_if_needed(conversation, system_prompt);

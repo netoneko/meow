@@ -304,3 +304,17 @@ anyone can claim to be.
    and add the root-override identity.
 7. A real control-plane dashboard once there's a transcript worth watching
    live rather than after the fact.
+8. Run agents under `herd` (Akuma's own service supervisor) so a reboot
+   resumes the litter automatically instead of losing it — the mailbox
+   already lives on disk, so a restarted agent resuming is mostly free: it
+   just calls `ListPeers`/`ReadInbox` again like any fresh invocation does.
+9. Graceful degradation when the "big model" (host-side, e.g. `llama.cpp`
+   over TCP) is unreachable: fall back to whatever smaller on-box models are
+   still available via `herd` rather than halting the whole litter — a
+   reduced-capability litter that can still discuss and write docs beats one
+   that stops entirely.
+10. Package `meow litter` as an MCP server, so Claude (this assistant, or
+    Claude Code) could call `ListPeers`/`ReadInbox`/`SendMessage` directly as
+    tools rather than through `docker exec`/CLI invocations — a thin
+    stdio-JSON-RPC wrapper around the existing `meow litter <subcommand>`
+    CLI, not a new implementation of the underlying tools.

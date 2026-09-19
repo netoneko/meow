@@ -38,7 +38,13 @@ pub extern "C" fn main() {
 
     let mut cgi_mode = false;
 
+    #[cfg(feature = "litter")]
+    if let Some(ref name) = app_config.litter_agent_name {
+        tools::litter::set_agent_name(name.clone());
+    }
+
     let mut i = 1;
+    #[cfg_attr(not(feature = "litter"), allow(unused_mut))]
     let mut litter_chase = false;
     if argc() > 1 {
         if let Some(first_arg) = arg(1) {
@@ -64,13 +70,14 @@ pub extern "C" fn main() {
                         litter_chase = true;
                         i = 3; // resume normal flag parsing after "litter chase"
                     }
+                    Some("send") => exit(run_litter_send()),
                     Some(other) => {
                         libakuma::print(&format!("meow: unknown 'meow litter' subcommand '{}'\n", other));
-                        libakuma::print("Usage: meow litter {peers|inbox|chase} [-c \"task\"]\n");
+                        libakuma::print("Usage: meow litter {peers|inbox|send|chase} [args]\n");
                         exit(1);
                     }
                     None => {
-                        libakuma::print("Usage: meow litter {peers|inbox|chase} [-c \"task\"]\n");
+                        libakuma::print("Usage: meow litter {peers|inbox|send|chase} [args]\n");
                         exit(1);
                     }
                 }
@@ -160,11 +167,6 @@ pub extern "C" fn main() {
 
     if let Some(ref p) = personality_override {
         app_config.current_personality = p.clone();
-    }
-
-    #[cfg(feature = "litter")]
-    if let Some(ref name) = app_config.litter_agent_name {
-        tools::litter::set_agent_name(name.clone());
     }
 
     let current_provider = app_config
@@ -556,6 +558,45 @@ fn run_litter_inspect(result: tools::ToolResult) -> i32 {
     libakuma::print(&result.output);
     libakuma::print("\n");
     if result.success { 0 } else { 1 }
+}
+
+/// `meow litter send --to <name> --body "<text>" [--round N]`: the operator's
+/// own direct line into a peer's mailbox, using the exact same
+/// `tool_send_message` an agent's `SendMessage` tool call reaches — this
+/// process is not itself a litter agent (`litter_agent_name` need not be set),
+/// so `from` is fixed to `"root"` rather than read from config.
+#[cfg(feature = "litter")]
+fn run_litter_send() -> i32 {
+    let mut to: Option<String> = None;
+    let mut body: Option<String> = None;
+    let mut round: i64 = 0;
+    let mut j = 3;
+    while j < argc() {
+        match arg(j) {
+            Some("--to") => { j += 1; to = arg(j).map(String::from); }
+            Some("--body") => { j += 1; body = arg(j).map(String::from); }
+            Some("--round") => {
+                j += 1;
+                round = arg(j).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+
+    let (to, body) = match (to, body) {
+        (Some(t), Some(b)) => (t, b),
+        _ => {
+            libakuma::print("Usage: meow litter send --to <name> --body \"<text>\" [--round N]\n");
+            return 1;
+        }
+    };
+
+    // Send as a fixed "root" identity rather than requiring
+    // `litter_agent_name` to be configured for this invocation — the operator
+    // issuing a command is not, itself, one of the litter's agents.
+    tools::litter::set_agent_name(String::from("root"));
+    run_litter_inspect(tools::litter::tool_send_message(&to, &body, round))
 }
 
 fn run_init(config: &mut Config) -> i32 {
