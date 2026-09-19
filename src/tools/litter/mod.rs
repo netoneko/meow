@@ -17,7 +17,16 @@
 //! `/etc/meow/config`, which is what makes this "optional": an agent nobody
 //! configured for the litter gets a clear error instead of silently reading or
 //! writing someone else's mailbox.
+//!
+//! If `litter_hub_addr` is also set, all three transparently switch to the
+//! `litter-hub` TCP relay (`hub` submodule) instead of this filesystem
+//! mailbox — same tool surface, same `LitterMessage`-shaped output, only the
+//! transport underneath changes. See `docs/LITTER_EXPERIMENT.md` "Where this
+//! is headed" for why: a shared Docker volume works for agents on one host,
+//! but the filesystem mailbox has no answer for agents that aren't sharing
+//! one, and it was always the v0.
 
+pub mod hub;
 pub mod raft;
 
 use alloc::string::String;
@@ -114,6 +123,10 @@ pub fn tool_send_message(to: &str, body: &str, round: i64) -> ToolResult {
         return ToolResult::err("Message body too large (max 32KB)");
     }
 
+    if let Some(addr) = hub::hub_addr() {
+        return hub::tool_send_message(&addr, &from, to, body, round);
+    }
+
     let dir = inbox_dir(to);
     mkdir_p(&dir);
 
@@ -142,6 +155,11 @@ pub fn tool_read_inbox() -> ToolResult {
         Ok(n) => n,
         Err(e) => return e,
     };
+
+    if let Some(addr) = hub::hub_addr() {
+        return hub::tool_read_inbox(&addr, &me);
+    }
+
     let dir = inbox_dir(&me);
     mkdir_p(&dir);
 
@@ -197,6 +215,10 @@ pub fn tool_read_inbox() -> ToolResult {
 }
 
 pub fn tool_list_peers() -> ToolResult {
+    if let Some(addr) = hub::hub_addr() {
+        return hub::tool_list_peers(&addr);
+    }
+
     let path = format!("{}/roster.json", LITTER_ROOT);
     let fd = open(&path, open_flags::O_RDONLY);
     if fd < 0 {
@@ -311,5 +333,6 @@ pub fn run_tests() -> i32 {
     }
 
     libakuma::print(&format!("  result: {}/{}\n", passed, total));
-    if passed == total { 0 } else { 1 }
+    let mailbox_failures = if passed == total { 0 } else { 1 };
+    mailbox_failures + hub::run_tests()
 }

@@ -327,6 +327,13 @@ name = "litter-raft"
 version = "0.1.0"
 
 [[package]]
+name = "litter-wire"
+version = "0.1.0"
+dependencies = [
+ "nojson",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -342,8 +349,15 @@ dependencies = [
  "libakuma",
  "libakuma-tls",
  "litter-raft",
+ "litter-wire",
  "picojson",
 ]
+
+[[package]]
+name = "nojson"
+version = "0.3.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d7473c448719d0214889f9ff75d4cdb6cf96582e4a9058e6eb2a52dc8d342ae"
 
 [[package]]
 name = "opaque-debug"

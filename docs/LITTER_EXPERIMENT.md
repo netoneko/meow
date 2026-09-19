@@ -221,15 +221,48 @@ understood before more networking is layered on top of it (see below).
 The mailbox above is a v0, and mid-build the direction changed twice, so
 recording both decisions here before writing more code that assumes them:
 
-**Transport: filesystem mailbox → TCP hub (not yet built).** The plan is to
-replace `/swarm`'s file reads/writes with a small relay process every agent
-connects to *outbound only* — the same shape meow's own chat-API client
-already uses (`libakuma::net::TcpStream`), so no listener/accept code is
-needed inside meow. `SwarmSend`/`SwarmInbox`/`SwarmPeers` keep the same tool
-surface; only what's behind them changes. This also gives a control plane for
-free (the hub sees every message) and was chosen over true peer-to-peer TCP
-specifically to avoid adding a second new networking path before the
-`host.docker.internal` retry bug above is understood.
+**Transport: filesystem mailbox → TCP hub (built 2026-09-19).** Two new
+sibling crates, same "extracted for host-testability" shape as `litter-raft`:
+`litter-wire` (no_std + alloc, wire format — request/response enums, framing,
+a `"v"` protocol-version field checked before anything else is parsed) and
+`litter-hub` (std binary, the relay itself — in-memory roster + non-destructive
+inboxes, one thread per connection). Every agent still connects *outbound
+only* (`libakuma::net::TcpStream` — no listener/accept code inside meow, by
+construction), so this is exactly the plan below, now implemented rather than
+proposed:
+
+- Opt-in via `litter_hub_addr = "host:port"` in `/etc/meow/config`
+  (`Config::litter_hub_addr`) alongside the existing `litter_agent_name` — set
+  it and `SendMessage`/`ReadInbox`/`ListPeers` (and `meow litter
+  send/inbox/peers`) transparently use the hub instead of `/litter`; leave it
+  unset and the filesystem mailbox above is unchanged. Same tool surface
+  either way, per the plan.
+- JSON both ways goes through `nojson` (`DisplayJson` to write,
+  `TryFrom<RawJsonValue>` to read) rather than a hand-rolled scanner/writer —
+  zero dependencies, no unsafe, no macros, and unlike a flat-object-only
+  reader it round-trips a genuinely nested inbox (an array of message
+  objects, not an array of pre-escaped strings).
+- Framing is a 4-byte big-endian length prefix + one JSON document; one
+  request per connection, matching every `meow -c` invocation's own one-shot
+  shape, so there's no connection to keep alive between calls.
+- Tests: `litter-wire` 16/16 (`cargo test`, encode/decode round trips,
+  version-mismatch rejection, malformed-JSON rejection), `litter-hub` 9/9
+  (`cargo test`, drives `serve_one` over a real loopback socket — send/inbox
+  round trip, non-destructive re-read, path-traversal and empty-body
+  rejection, oversized-frame and malformed-JSON short-circuits, named
+  version-mismatch error), plus `meow test`'s own `litter hub client tests`
+  (2/2, run inside the same Alpine/arm64 container as everything else). A
+  manual end-to-end run (`litter-hub` on the host, two `meow litter
+  send`/`inbox` invocations in separate Alpine containers reaching it via
+  `192.168.65.254`, the same Docker-host IP literal the
+  `host.docker.internal` retry bug below already forced onto this project)
+  confirmed the whole path, including `from`/`round` surviving the round trip.
+- Still not done: this also gives a control plane for free (the hub sees
+  every message) and was chosen over true peer-to-peer TCP specifically to
+  avoid adding a second new networking path before the
+  `host.docker.internal` retry bug above is understood — that bug is still
+  unconfirmed, so `litter-hub` should keep being reached by IP literal, not
+  hostname, until it is.
 
 **Leader election: hand-rolled Raft subprotocol, built, not yet wired to
 transport.** The end goal is real swarm auth: each agent generates its own

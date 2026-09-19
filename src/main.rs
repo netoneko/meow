@@ -42,6 +42,8 @@ pub extern "C" fn main() {
     if let Some(ref name) = app_config.litter_agent_name {
         tools::litter::set_agent_name(name.clone());
     }
+    #[cfg(feature = "litter")]
+    tools::litter::hub::set_hub_addr(app_config.litter_hub_addr.clone());
 
     let mut i = 1;
     #[cfg_attr(not(feature = "litter"), allow(unused_mut))]
@@ -560,16 +562,19 @@ fn run_litter_inspect(result: tools::ToolResult) -> i32 {
     if result.success { 0 } else { 1 }
 }
 
-/// `meow litter send --to <name> --body "<text>" [--round N]`: the operator's
-/// own direct line into a peer's mailbox, using the exact same
+/// `meow litter send --to <name> --body "<text>" [--round N] [--from <name>]`:
+/// the operator's own direct line into a peer's mailbox, using the exact same
 /// `tool_send_message` an agent's `SendMessage` tool call reaches — this
 /// process is not itself a litter agent (`litter_agent_name` need not be set),
-/// so `from` is fixed to `"root"` rather than read from config.
+/// so `from` defaults to `"root"` rather than being read from config, unless
+/// overridden with `--from` (e.g. to send as one specific litter agent from
+/// the operator's shell without configuring that agent's identity).
 #[cfg(feature = "litter")]
 fn run_litter_send() -> i32 {
     let mut to: Option<String> = None;
     let mut body: Option<String> = None;
     let mut round: i64 = 0;
+    let mut from = String::from("root");
     let mut j = 3;
     while j < argc() {
         match arg(j) {
@@ -579,6 +584,10 @@ fn run_litter_send() -> i32 {
                 j += 1;
                 round = arg(j).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
             }
+            Some("--from") => {
+                j += 1;
+                if let Some(f) = arg(j) { from = String::from(f); }
+            }
             _ => {}
         }
         j += 1;
@@ -587,15 +596,12 @@ fn run_litter_send() -> i32 {
     let (to, body) = match (to, body) {
         (Some(t), Some(b)) => (t, b),
         _ => {
-            libakuma::print("Usage: meow litter send --to <name> --body \"<text>\" [--round N]\n");
+            libakuma::print("Usage: meow litter send --to <name> --body \"<text>\" [--round N] [--from <name>]\n");
             return 1;
         }
     };
 
-    // Send as a fixed "root" identity rather than requiring
-    // `litter_agent_name` to be configured for this invocation — the operator
-    // issuing a command is not, itself, one of the litter's agents.
-    tools::litter::set_agent_name(String::from("root"));
+    tools::litter::set_agent_name(from);
     run_litter_inspect(tools::litter::tool_send_message(&to, &body, round))
 }
 

@@ -62,6 +62,11 @@ libakuma-tls = { path = "../libakuma-tls" }
 # sibling crate (not inline) specifically so `cargo test` can exercise it
 # natively on macOS, unlike the rest of meow — see litter-raft/src/lib.rs.
 litter-raft = { path = "../litter-raft" }
+# Wire format for the `litter-hub` TCP transport (tools/litter/hub.rs) — see
+# litter-wire/src/lib.rs. Same "sibling crate for host-testability" reasoning
+# as litter-raft, and shared with `litter-hub` itself so the two ends of the
+# wire can't independently drift.
+litter-wire = { path = "../litter-wire" }
 # JSON. no_std, allocation-free, non-recursive pull parser — same choice and
 # feature set `box` already made (see userspace/box/Cargo.toml): no floats
 # needed for chat-API/tool-call JSON, and float-skip steps over one rather

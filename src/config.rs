@@ -190,6 +190,12 @@ pub struct Config {
     /// no default name, since a wrong guess would let one agent silently
     /// answer for another's inbox.
     pub litter_agent_name: Option<String>,
+    /// `host:port` of a `litter-hub` TCP relay (see `tools::litter::hub` and
+    /// `docs/LITTER_EXPERIMENT.md` "Where this is headed"). `None` (the
+    /// default) means the Litter* tools use the `/litter` filesystem mailbox
+    /// instead — the hub is opt-in, not a replacement, so an install with no
+    /// hub configured keeps working exactly as before.
+    pub litter_hub_addr: Option<String>,
 }
 
 impl Default for Config {
@@ -202,6 +208,7 @@ impl Default for Config {
             exit_on_escape: false,
             render_markdown: false,
             litter_agent_name: None,
+            litter_hub_addr: None,
         }
     }
 }
@@ -271,6 +278,7 @@ impl Config {
             exit_on_escape: false,
             render_markdown: true,
             litter_agent_name: None,
+            litter_hub_addr: None,
         };
 
         let mut current_provider: Option<Provider> = None;
@@ -328,6 +336,11 @@ impl Config {
                         "litter_agent_name" => {
                             if !value.is_empty() {
                                 config.litter_agent_name = Some(String::from(value));
+                            }
+                        }
+                        "litter_hub_addr" => {
+                            if !value.is_empty() {
+                                config.litter_hub_addr = Some(String::from(value));
                             }
                         }
                         _ => {}
@@ -399,6 +412,12 @@ impl Config {
         if let Some(ref name) = self.litter_agent_name {
             content.push_str("litter_agent_name=");
             content.push_str(name);
+            content.push('\n');
+        }
+
+        if let Some(ref addr) = self.litter_hub_addr {
+            content.push_str("litter_hub_addr=");
+            content.push_str(addr);
             content.push('\n');
         }
 
@@ -510,6 +529,25 @@ impl Config {
                 libakuma::print(&format!(
                     "  [!] litter_agent_name: empty={:?} set={:?} blank={:?}\n",
                     empty.litter_agent_name, set.litter_agent_name, blank.litter_agent_name
+                ));
+            }
+        }
+
+        // litter_hub_addr: same absent/round-trip contract as litter_agent_name.
+        total += 1;
+        {
+            let empty = Config::parse("current_model=testmodel\n");
+            let set = Config::parse("litter_hub_addr=192.168.65.254:7700\n");
+            let blank = Config::parse("litter_hub_addr=\n");
+            if empty.litter_hub_addr.is_none()
+                && set.litter_hub_addr.as_deref() == Some("192.168.65.254:7700")
+                && blank.litter_hub_addr.is_none()
+                && set.serialize().contains("litter_hub_addr=192.168.65.254:7700")
+            { passed += 1; }
+            else {
+                libakuma::print(&format!(
+                    "  [!] litter_hub_addr: empty={:?} set={:?} blank={:?}\n",
+                    empty.litter_hub_addr, set.litter_hub_addr, blank.litter_hub_addr
                 ));
             }
         }
