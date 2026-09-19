@@ -3,6 +3,7 @@
 //! Handles loading and saving configuration from /etc/meow/config
 //! Uses a simple key-value format (no TOML parser needed for no_std)
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -213,15 +214,52 @@ impl Default for Config {
     }
 }
 
-/// Config file path
+/// The effective config file path, scope applied — for callers outside this
+/// module (`meow init`'s existence check in `main.rs`).
+pub fn config_path() -> String {
+    scoped(CONFIG_PATH)
+}
+
+/// Config file path (scope-relative — always go through `scoped()`)
 const CONFIG_PATH: &str = "/etc/meow/config";
 const CONFIG_DIR: &str = "/etc/meow";
+
+/// `MEOW_HOME` scopes every state directory meow reads or writes — the config
+/// file, the persona (`MEOW.md`), the filesystem litter mailbox — the way
+/// `TMPDIR` scopes temp files: set it and every absolute state path gains the
+/// prefix; unset it and meow behaves exactly as before (rooted at `/`). This
+/// is what lets several *resident* agents share one container's filesystem
+/// without fighting over the single global `/etc/meow/config`: each agent
+/// runs with its own `MEOW_HOME=/agents/<name>` (see `tools::litter::live`
+/// and `litter/yard_init.sh`).
+///
+/// Returns the trimmed value with trailing slashes stripped, or an empty
+/// string for "no scoping" — `scoped()` on an empty scope is identity.
+pub fn scope() -> &'static str {
+    match libakuma::env("MEOW_HOME") {
+        Some(dir) => dir.trim_matches('/'),
+        None => "",
+    }
+}
+
+/// Prefix an absolute state path with the scope dir. `/etc/meow/config`
+/// under `MEOW_HOME=/agents/sherlock` becomes
+/// `/agents/sherlock/etc/meow/config`; with no scope set it is unchanged.
+pub fn scoped(path: &str) -> String {
+    let dir = scope();
+    if dir.is_empty() {
+        String::from(path)
+    } else {
+        format!("{}/{}", dir, path.trim_start_matches('/'))
+    }
+}
 
 impl Config {
     /// Load configuration from disk
     /// Returns default config if file doesn't exist
     pub fn load() -> Self {
-        let fd = open(CONFIG_PATH, open_flags::O_RDONLY);
+        let config_path = scoped(CONFIG_PATH);
+        let fd = open(&config_path, open_flags::O_RDONLY);
         if fd < 0 {
             return Self::default();
         }
@@ -365,11 +403,11 @@ impl Config {
     /// Save configuration to disk
     pub fn save(&self) -> Result<(), &'static str> {
         // Create directory if needed
-        libakuma::mkdir_p(CONFIG_DIR);
+        libakuma::mkdir_p(&scoped(CONFIG_DIR));
 
         let content = self.serialize();
 
-        let fd = open(CONFIG_PATH, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+        let fd = open(&scoped(CONFIG_PATH), open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
         if fd < 0 {
             return Err("Failed to open config file for writing");
         }

@@ -48,7 +48,9 @@ pub use nojson::JsonParseError;
 /// Bumped whenever a request or response's JSON shape changes in a way an
 /// older decoder can't safely ignore (a field removed, a meaning changed —
 /// not a field added, since every decode here already ignores unknown keys).
-pub const PROTOCOL_VERSION: i64 = 1;
+/// v2: `Peers` became the pulse (event-bearing, cursor-aware) and `History`
+/// added paged reads.
+pub const PROTOCOL_VERSION: i64 = 2;
 
 /// Sanity cap on a single frame's declared length, checked against the 4-byte
 /// header before a caller allocates a buffer for it — generous enough for a
@@ -121,7 +123,14 @@ pub enum Request {
     Join { name: String },
     Send { from: String, to: String, body: String, round: i64 },
     Inbox { name: String },
-    Peers,
+    /// The pulse: doubles as heartbeat observation (any answer = leader
+    /// alive), roster fetch, and change feed. `since` is the caller's last
+    /// seen event epoch; the response carries everything newer.
+    Peers { since: u64 },
+    /// Paged history read for a cold-starting agent: messages for `name`
+    /// with `ts < before`, newest first, at most `limit` of them. The agent
+    /// pages back until a batch contains the `"[compacted: …]"` marker.
+    History { name: String, before: u64, limit: u32 },
 }
 
 impl DisplayJson for Request {
@@ -145,9 +154,17 @@ impl DisplayJson for Request {
                 f.member("op", "inbox")?;
                 f.member("name", name)
             }),
-            Request::Peers => f.object(|f| {
+            Request::Peers { since } => f.object(|f| {
                 f.member("v", PROTOCOL_VERSION)?;
-                f.member("op", "peers")
+                f.member("op", "peers")?;
+                f.member("since", *since)
+            }),
+            Request::History { name, before, limit } => f.object(|f| {
+                f.member("v", PROTOCOL_VERSION)?;
+                f.member("op", "history")?;
+                f.member("name", name)?;
+                f.member("before", *before)?;
+                f.member("limit", *limit)
             }),
         }
     }
@@ -158,7 +175,11 @@ pub enum Response {
     Joined,
     Sent { bytes: usize },
     Inbox { messages: Vec<Message> },
-    Peers { names: Vec<String> },
+    /// The pulse response: current roster, leader identity and raft term
+    /// (status quo), the hub's event-log epoch, and every event newer than
+    /// the caller's `since` cursor — elections, joins, leaves, task
+    /// requeues. Consumed at tick level, surfaced to the model as context.
+    Peers { names: Vec<String>, term: u64, leader: Option<String>, epoch: u64, events: Vec<String> },
     Error { message: String },
 }
 
@@ -182,11 +203,20 @@ impl DisplayJson for Response {
                 f.member("op", "inbox")?;
                 f.member("messages", messages)
             }),
-            Response::Peers { names } => f.object(|f| {
+            Response::Peers { names, term, leader, epoch, events } => f.object(|f| {
                 f.member("v", PROTOCOL_VERSION)?;
                 f.member("ok", true)?;
                 f.member("op", "peers")?;
-                f.member("names", names)
+                f.member("names", names)?;
+                f.member("term", *term)?;
+                // `leader` is simply absent while no one leads (decode
+                // already treats a missing member as None); nojson's null
+                // doesn't round-trip into Option, so don't emit it.
+                if let Some(l) = leader {
+                    f.member("leader", l)?;
+                }
+                f.member("epoch", *epoch)?;
+                f.member("events", events)
             }),
             Response::Error { message } => f.object(|f| {
                 f.member("v", PROTOCOL_VERSION)?;
@@ -252,7 +282,16 @@ pub fn decode_request(json: &str) -> Result<Request, WireError> {
             let name: String = value.to_member("name")?.required()?.try_into()?;
             Ok(Request::Inbox { name })
         }
-        "peers" => Ok(Request::Peers),
+        "peers" => {
+            let since: Option<u64> = value.to_member("since")?.try_into()?;
+            Ok(Request::Peers { since: since.unwrap_or(0) })
+        }
+        "history" => {
+            let name: String = value.to_member("name")?.required()?.try_into()?;
+            let before: Option<u64> = value.to_member("before")?.try_into()?;
+            let limit: Option<u32> = value.to_member("limit")?.try_into()?;
+            Ok(Request::History { name, before: before.unwrap_or(0), limit: limit.unwrap_or(32) })
+        }
         _ => Err(value.invalid("unknown 'op'").into()),
     }
 }
@@ -285,7 +324,17 @@ pub fn decode_response(json: &str) -> Result<Response, WireError> {
         }
         "peers" => {
             let names: Vec<String> = value.to_member("names")?.required()?.try_into()?;
-            Ok(Response::Peers { names })
+            let term: Option<u64> = value.to_member("term")?.try_into()?;
+            let leader: Option<String> = value.to_member("leader")?.try_into()?;
+            let epoch: Option<u64> = value.to_member("epoch")?.try_into()?;
+            let events: Option<Vec<String>> = value.to_member("events")?.try_into()?;
+            Ok(Response::Peers {
+                names,
+                term: term.unwrap_or(0),
+                leader,
+                epoch: epoch.unwrap_or(0),
+                events: events.unwrap_or_default(),
+            })
         }
         _ => Err(value.invalid("unknown response 'op'").into()),
     }
@@ -371,7 +420,8 @@ mod tests {
         let inbox = Request::Inbox { name: String::from("hercules") };
         assert_eq!(decode_request(&encode_request(&inbox)).expect("decode"), inbox);
 
-        let peers = Request::Peers;
+        let peers = Request::Peers { since: 0 };
+        assert_eq!(decode_request(&encode_request(&peers)).expect("decode"), peers);
         assert_eq!(decode_request(&encode_request(&peers)).expect("decode"), peers);
     }
 
@@ -407,11 +457,36 @@ mod tests {
 
     #[test]
     fn peers_response_round_trips_including_empty_list() {
-        let r = Response::Peers { names: alloc::vec![String::from("sherlock"), String::from("hercules")] };
-        assert_eq!(decode_response(&encode_response(&r)).expect("decode"), r);
+        let r = Response::Peers {
+            names: alloc::vec![String::from("sherlock"), String::from("hercules")],
+            term: 3,
+            leader: Some(String::from("sherlock")),
+            epoch: 7,
+            events: alloc::vec![String::from("[event] hercules joined the litter")],
+        };
+        let json = encode_response(&r);
+        assert!(json.contains(r#""term":3"#) && json.contains(r#""leader":"sherlock""#));
+        assert_eq!(decode_response(&json).expect("decode"), r);
 
-        let empty = Response::Peers { names: Vec::new() };
+        let empty = Response::Peers { names: Vec::new(), term: 0, leader: None, epoch: 0, events: Vec::new() };
         assert_eq!(decode_response(&encode_response(&empty)).expect("decode"), empty);
+    }
+
+    #[test]
+    fn history_request_round_trips_with_defaults() {
+        let r = Request::History { name: String::from("ressler"), before: 999, limit: 16 };
+        assert_eq!(decode_request(&encode_request(&r)).expect("decode"), r);
+
+        let bare = decode_request("{\"v\":2,\"op\":\"history\",\"name\":\"ressler\"}").expect("decode");
+        assert_eq!(bare, Request::History { name: String::from("ressler"), before: 0, limit: 32 });
+    }
+
+    #[test]
+    fn peers_request_carries_event_cursor() {
+        let r = Request::Peers { since: 42 };
+        assert_eq!(decode_request(&encode_request(&r)).expect("decode"), r);
+        let bare = decode_request("{\"v\":2,\"op\":\"peers\"}").expect("decode");
+        assert_eq!(bare, Request::Peers { since: 0 });
     }
 
     #[test]

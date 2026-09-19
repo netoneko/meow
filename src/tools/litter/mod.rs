@@ -27,8 +27,10 @@
 //! one, and it was always the v0.
 
 pub mod hub;
+pub mod live;
 pub mod observe;
 pub mod raft;
+pub mod serve;
 
 use alloc::string::String;
 use alloc::format;
@@ -41,6 +43,13 @@ use crate::util::json_escape_to;
 use super::mod_types::ToolResult;
 
 pub const LITTER_ROOT: &str = "/litter";
+
+/// The mailbox root, honoroing `MEOW_HOME` (`config::scope`) so several
+/// resident agents sharing one filesystem each get their own
+/// `<MEOW_HOME>/litter` instead of trampling one global `/litter`.
+pub fn litter_root() -> String {
+    crate::config::scoped(LITTER_ROOT)
+}
 const MAX_MESSAGE_SIZE: usize = 32 * 1024;
 
 static AGENT_NAME_INIT: AtomicBool = AtomicBool::new(false);
@@ -100,7 +109,7 @@ fn is_valid_name(name: &str) -> bool {
 }
 
 fn inbox_dir(agent: &str) -> String {
-    format!("{}/inbox/{}", LITTER_ROOT, agent)
+    format!("{}/inbox/{}", litter_root(), agent)
 }
 
 fn require_agent_name() -> Result<String, ToolResult> {
@@ -220,7 +229,7 @@ pub fn tool_list_peers() -> ToolResult {
         return hub::tool_list_peers(&addr);
     }
 
-    let path = format!("{}/roster.json", LITTER_ROOT);
+    let path = format!("{}/roster.json", litter_root());
     let fd = open(&path, open_flags::O_RDONLY);
     if fd < 0 {
         return ToolResult::err(format!(
@@ -259,7 +268,7 @@ pub fn tool_list_peers() -> ToolResult {
 /// filesystem to scan, so it uses `hub::peers` (the hub's own roster) instead
 /// — see `run_litter_observe` in `main.rs`.
 pub fn list_inbox_participants() -> Vec<String> {
-    let dir = format!("{}/inbox", LITTER_ROOT);
+    let dir = format!("{}/inbox", litter_root());
     match read_dir(&dir) {
         Some(entries) => {
             let mut names: Vec<String> = entries.into_iter().filter(|e| e.is_dir).map(|e| e.name).collect();
@@ -406,5 +415,5 @@ pub fn run_tests() -> i32 {
 
     libakuma::print(&format!("  result: {}/{}\n", passed, total));
     let mailbox_failures = if passed == total { 0 } else { 1 };
-    mailbox_failures + hub::run_tests() + observe::run_tests()
+    mailbox_failures + hub::run_tests() + observe::run_tests() + serve::run_tests()
 }

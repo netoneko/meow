@@ -57,6 +57,8 @@ pub extern "C" fn main() {
     let mut i = 1;
     #[cfg_attr(not(feature = "litter"), allow(unused_mut))]
     let mut litter_chase = false;
+    #[cfg_attr(not(feature = "litter"), allow(unused_mut))]
+    let mut litter_live = false;
     if argc() > 1 {
         if let Some(first_arg) = arg(1) {
             if first_arg == "init" {
@@ -81,15 +83,19 @@ pub extern "C" fn main() {
                         litter_chase = true;
                         i = 3; // resume normal flag parsing after "litter chase"
                     }
+                    Some("live") => {
+                        litter_live = true;
+                        i = 3; // resume normal flag parsing after "litter live"
+                    }
                     Some("send") => exit(run_litter_send()),
                     Some("observe") => exit(run_litter_observe()),
                     Some(other) => {
                         libakuma::print(&format!("meow: unknown 'meow litter' subcommand '{}'\n", other));
-                        libakuma::print("Usage: meow litter {peers|inbox|send|chase|observe} [args]\n");
+                        libakuma::print("Usage: meow litter {peers|inbox|send|chase|live|observe} [args]\n");
                         exit(1);
                     }
                     None => {
-                        libakuma::print("Usage: meow litter {peers|inbox|send|chase|observe} [args]\n");
+                        libakuma::print("Usage: meow litter {peers|inbox|send|chase|live|observe} [args]\n");
                         exit(1);
                     }
                 }
@@ -203,8 +209,22 @@ pub extern "C" fn main() {
     if litter_chase {
         system_prompt.push_str("\n\nYou are one member of a litter of meow agents working the same task. Before anything else, call ListPeers to see who else is here and ReadInbox to see what's already been said. Do the task, then call SendMessage to share your findings with the litter — don't just answer in isolation.");
     }
+    #[cfg(feature = "litter")]
+    if litter_live {
+        // Same preamble as chase: a live turn IS a chase turn, just woken by
+        // inbox activity instead of the command line (see `tools::litter::live`).
+        system_prompt.push_str("\n\nYou are one member of a litter of meow agents working the same task. Before anything else, call ListPeers to see who else is here and ReadInbox to see what's already been said. Do the task, then call SendMessage to share your findings with the litter — don't just answer in isolation.");
+    }
     #[cfg(not(feature = "litter"))]
     let _ = litter_chase;
+    #[cfg(not(feature = "litter"))]
+    let _ = litter_live;
+
+    #[cfg(feature = "litter")]
+    if litter_live {
+        // Resident mode: never returns (see `tools::litter::live`).
+        tools::litter::live::run(model.clone(), current_provider.clone(), system_prompt.clone());
+    }
 
     system_prompt.push_str("\n\n");
 
@@ -505,11 +525,23 @@ fn get_active_personality(config: &Config, no_personality: bool) -> &'static cra
 }
 
 fn load_local_prompt() -> Option<String> {
-    let fd = open("MEOW.md", open_flags::O_RDONLY);
+    // Scoped MEOW.md (`$MEOW_HOME/MEOW.md`) wins over the CWD's, so a
+    // resident agent sharing a filesystem with its litter-mates can carry its
+    // own persona without each one needing a different working directory.
+    let path = config::scoped("MEOW.md");
+    let fd = open(&path, open_flags::O_RDONLY);
     if fd < 0 {
-        return None;
+        // Fall back to the CWD's MEOW.md — the pre-scoping behavior.
+        let fd = open("MEOW.md", open_flags::O_RDONLY);
+        if fd < 0 {
+            return None;
+        }
+        return read_prompt_fd(fd);
     }
+    read_prompt_fd(fd)
+}
 
+fn read_prompt_fd(fd: i32) -> Option<String> {
     let stat = match fstat(fd) {
         Ok(s) => s,
         Err(_) => {
@@ -645,6 +677,13 @@ fn run_litter_observe() -> i32 {
                 }
             }
         }
+        // Group fan-out (a Send addressed to `litter` lands in every
+        // member's inbox — see `serve::GROUP_NAME`) means one message exists
+        // several times; the transcript shows each distinct message once.
+        if !entries.is_empty() {
+            entries.sort_by(|a, b| (&a.from, a.round, &a.body).cmp(&(&b.from, b.round, &b.body)));
+            entries.dedup_by(|a, b| a.from == b.from && a.round == b.round && a.body == b.body);
+        }
     } else {
         for name in tools::litter::list_inbox_participants() {
             for m in tools::litter::read_inbox_messages(&name) {
@@ -671,13 +710,14 @@ fn run_init(config: &mut Config) -> i32 {
     libakuma::print("meow init - Provider Configuration\n\nCurrent providers:\n");
 
     // Try to create the config file if it's missing
-    let fd = libakuma::open("/etc/meow/config", libakuma::open_flags::O_RDONLY);
+    let config_path = config::config_path();
+    let fd = libakuma::open(&config_path, libakuma::open_flags::O_RDONLY);
     if fd < 0 {
         libakuma::print("  [*] Config file missing, initializing with defaults...\n");
         if let Err(e) = config.save() {
             libakuma::print(&format!("  [!] Failed to save default config: {}\n", e));
         } else {
-            libakuma::print("  [*] Default config created at /etc/meow/config\n");
+            libakuma::print(&format!("  [*] Default config created at {}\n", config_path));
         }
     } else {
         libakuma::close(fd);
@@ -699,8 +739,8 @@ fn run_init(config: &mut Config) -> i32 {
         }
     }
     libakuma::print(&format!(
-        "\n  Current model: {}\n  Current personality: {}\n  Config file: /etc/meow/config\n\nTo add a provider, edit /etc/meow/config:\n   [provider:name]\n   base_url=http://host:port\n   api_key=your-key-here (optional)\n\n",
-        config.current_model, config.current_personality
+        "\n  Current model: {}\n  Current personality: {}\n  Config file: {}\n\nTo add a provider, edit the config file:\n   [provider:name]\n   base_url=http://host:port\n   api_key=sk-test (optional)\n\n",
+        config.current_model, config.current_personality, config_path
     ));
     0
 }
