@@ -21,6 +21,7 @@ mod util;
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use app::{Message, Conversation};
 use config::{Config, DEFAULT_CONTEXT_WINDOW, NO_PERSONA, PERSONALITIES, Provider};
@@ -44,6 +45,14 @@ pub extern "C" fn main() {
     }
     #[cfg(feature = "litter")]
     tools::litter::hub::set_hub_addr(app_config.litter_hub_addr.clone());
+    // Bootstrap: a hub-backed litter member joins the hub's roster as part of
+    // its own startup, every invocation — see `tools::litter::hub::bootstrap`.
+    // Filesystem-mode litter (no `litter_hub_addr`) needs no equivalent step:
+    // `roster.json` is the launcher's file, never meow's to write.
+    #[cfg(feature = "litter")]
+    if let (Some(ref name), Some(ref addr)) = (&app_config.litter_agent_name, &app_config.litter_hub_addr) {
+        tools::litter::hub::bootstrap(addr, name);
+    }
 
     let mut i = 1;
     #[cfg_attr(not(feature = "litter"), allow(unused_mut))]
@@ -73,13 +82,14 @@ pub extern "C" fn main() {
                         i = 3; // resume normal flag parsing after "litter chase"
                     }
                     Some("send") => exit(run_litter_send()),
+                    Some("observe") => exit(run_litter_observe()),
                     Some(other) => {
                         libakuma::print(&format!("meow: unknown 'meow litter' subcommand '{}'\n", other));
-                        libakuma::print("Usage: meow litter {peers|inbox|send|chase} [args]\n");
+                        libakuma::print("Usage: meow litter {peers|inbox|send|chase|observe} [args]\n");
                         exit(1);
                     }
                     None => {
-                        libakuma::print("Usage: meow litter {peers|inbox|send|chase} [args]\n");
+                        libakuma::print("Usage: meow litter {peers|inbox|send|chase|observe} [args]\n");
                         exit(1);
                     }
                 }
@@ -603,6 +613,58 @@ fn run_litter_send() -> i32 {
 
     tools::litter::set_agent_name(from);
     run_litter_inspect(tools::litter::tool_send_message(&to, &body, round))
+}
+
+/// `meow litter observe`: print every participant's messages merged into one
+/// transcript, each with a small colored avatar per sender (see
+/// `tools::litter::observe`). Read-only, no LLM call, no agent identity
+/// required — this is the operator watching the litter, not a litter member.
+#[cfg(feature = "litter")]
+fn run_litter_observe() -> i32 {
+    use tools::litter::observe::Entry;
+
+    let mut entries: Vec<Entry> = Vec::new();
+
+    if let Some(addr) = tools::litter::hub::hub_addr() {
+        let names = match tools::litter::hub::peers(&addr) {
+            Ok(names) => names,
+            Err(e) => {
+                libakuma::print(&format!("observe: failed to list peers: {}\n", e));
+                return 1;
+            }
+        };
+        for name in names {
+            match tools::litter::hub::inbox_messages(&addr, &name) {
+                Ok(messages) => {
+                    for m in messages {
+                        entries.push(Entry { from: m.from, round: m.round, body: m.body });
+                    }
+                }
+                Err(e) => {
+                    libakuma::print(&format!("observe: failed to read inbox for '{}': {}\n", name, e));
+                }
+            }
+        }
+    } else {
+        for name in tools::litter::list_inbox_participants() {
+            for m in tools::litter::read_inbox_messages(&name) {
+                entries.push(Entry { from: m.from, round: m.round, body: m.body });
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        libakuma::print("No litter messages found yet.\n");
+        return 0;
+    }
+
+    let entries = tools::litter::observe::merge_chronological(entries);
+    let mut colors = tools::litter::observe::ColorAssigner::new();
+    for entry in &entries {
+        let color = colors.color_for(&entry.from);
+        libakuma::print(&tools::litter::observe::render(entry, color));
+    }
+    0
 }
 
 fn run_init(config: &mut Config) -> i32 {

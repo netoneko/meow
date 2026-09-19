@@ -1,8 +1,12 @@
-//! `litter-hub --port 7700 --roster sherlock,hercules,zenigata,ressler`
+//! `litter-hub --port 7700 [--roster sherlock,hercules,zenigata,ressler]`
 //!
 //! Thin CLI wrapper around `HubState` (see `lib.rs`) — all the logic worth
 //! testing lives there and is exercised by `cargo test` without this binary
-//! or a real socket loop at all.
+//! or a real socket loop at all. `--roster` only *seeds* the membership now
+//! (e.g. names known before any agent has run); every hub-backed `meow`
+//! invocation also `Join`s itself at its own startup, so an empty or omitted
+//! `--roster` is a legitimate way to start a hub that learns its whole
+//! roster from the litter bootstrapping itself.
 
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -33,7 +37,7 @@ fn main() {
                 }
             }
             "--help" | "-h" => {
-                println!("Usage: litter-hub --port <PORT> --roster <name1,name2,...>");
+                println!("Usage: litter-hub --port <PORT> [--roster <name1,name2,...>]");
                 return;
             }
             other => {
@@ -44,10 +48,6 @@ fn main() {
         i += 1;
     }
 
-    if roster.is_empty() {
-        eprintln!("litter-hub: refusing to start with an empty --roster (ListPeers would have nothing to report)");
-        std::process::exit(1);
-    }
     for name in &roster {
         if !litter_wire::is_valid_name(name) {
             eprintln!("litter-hub: invalid agent name in --roster: '{}'", name);

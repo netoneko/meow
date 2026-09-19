@@ -81,6 +81,60 @@ pub fn format_inbox(who: &str, messages: &[Message]) -> String {
     out
 }
 
+/// Called once at startup (`main.rs`, right after `set_hub_addr`) when both
+/// `litter_hub_addr` and `litter_agent_name` are configured — this IS the
+/// bootstrap process for a new litter member: a `meow -c` invocation has no
+/// separate "join the litter" step distinct from "start running" (it's
+/// one-shot; see `docs/LITTER_EXPERIMENT.md`'s "Debate protocol"), so
+/// ensuring the hub knows this agent happens right where that startup
+/// already is. `Join` is idempotent, so paying this one round trip on every
+/// invocation (not just literally the first) is what lets a hub started with
+/// no `--roster` at all still answer `ListPeers` correctly from the very
+/// first agent that ever runs.
+///
+/// Best-effort and non-fatal: a hub that's briefly unreachable shouldn't stop
+/// an agent from doing whatever else it was invoked to do (which may not
+/// touch the litter at all). If the hub is genuinely down, the *real* error
+/// surfaces naturally the moment `SendMessage`/`ReadInbox`/`ListPeers` is
+/// actually used — this only prints a diagnostic so a persistently-failing
+/// join isn't silent.
+pub fn bootstrap(addr: &str, name: &str) {
+    match call(addr, &Request::Join { name: String::from(name) }) {
+        Ok(Response::Joined) => {}
+        Ok(Response::Error { message }) => {
+            libakuma::print(&format!("litter: hub join failed: {}\n", message));
+        }
+        Ok(other) => {
+            libakuma::print(&format!("litter: hub returned an unexpected response to 'join': {:?}\n", other));
+        }
+        Err(e) => {
+            libakuma::print(&format!("litter: could not reach hub at '{}' to join: {}\n", addr, e));
+        }
+    }
+}
+
+/// Structured (not pre-formatted) reads, shared by the `tool_*` wrappers
+/// below and by `meow litter observe` (`main.rs::run_litter_observe`), which
+/// needs every participant's messages merged, not one agent's inbox
+/// formatted for the LLM.
+pub fn peers(addr: &str) -> Result<Vec<String>, String> {
+    match call(addr, &Request::Peers) {
+        Ok(Response::Peers { names }) => Ok(names),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(other) => Err(format!("hub returned an unexpected response to 'peers': {:?}", other)),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn inbox_messages(addr: &str, name: &str) -> Result<Vec<Message>, String> {
+    match call(addr, &Request::Inbox { name: String::from(name) }) {
+        Ok(Response::Inbox { messages }) => Ok(messages),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(other) => Err(format!("hub returned an unexpected response to 'inbox': {:?}", other)),
+        Err(e) => Err(e),
+    }
+}
+
 pub fn tool_send_message(addr: &str, from: &str, to: &str, body: &str, round: i64) -> ToolResult {
     let req = Request::Send {
         from: String::from(from),
@@ -97,18 +151,15 @@ pub fn tool_send_message(addr: &str, from: &str, to: &str, body: &str, round: i6
 }
 
 pub fn tool_read_inbox(addr: &str, me: &str) -> ToolResult {
-    let req = Request::Inbox { name: String::from(me) };
-    match call(addr, &req) {
-        Ok(Response::Inbox { messages }) => ToolResult::ok(format_inbox(me, &messages)),
-        Ok(Response::Error { message }) => ToolResult::err(message),
-        Ok(other) => ToolResult::err(format!("hub returned an unexpected response to 'inbox': {:?}", other)),
+    match inbox_messages(addr, me) {
+        Ok(messages) => ToolResult::ok(format_inbox(me, &messages)),
         Err(e) => ToolResult::err(e),
     }
 }
 
 pub fn tool_list_peers(addr: &str) -> ToolResult {
-    match call(addr, &Request::Peers) {
-        Ok(Response::Peers { names }) => {
+    match peers(addr) {
+        Ok(names) => {
             let mut out = String::from("{\"agents\":[");
             for (i, n) in names.iter().enumerate() {
                 if i > 0 {
@@ -121,8 +172,6 @@ pub fn tool_list_peers(addr: &str) -> ToolResult {
             out.push_str("]}");
             ToolResult::ok(out)
         }
-        Ok(Response::Error { message }) => ToolResult::err(message),
-        Ok(other) => ToolResult::err(format!("hub returned an unexpected response to 'peers': {:?}", other)),
         Err(e) => ToolResult::err(e),
     }
 }

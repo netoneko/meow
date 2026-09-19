@@ -113,6 +113,12 @@ impl<'text, 'raw> TryFrom<RawJsonValue<'text, 'raw>> for Message {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
+    /// Sent once at every hub-backed `meow` invocation's startup (its
+    /// "bootstrap" — there's no separate long-lived join step, since a `meow
+    /// -c` invocation is one-shot; see `docs/LITTER_EXPERIMENT.md`'s "Debate
+    /// protocol"). Idempotent: joining a name already in the roster is a
+    /// no-op, not an error, so re-sending it on every invocation is free.
+    Join { name: String },
     Send { from: String, to: String, body: String, round: i64 },
     Inbox { name: String },
     Peers,
@@ -121,6 +127,11 @@ pub enum Request {
 impl DisplayJson for Request {
     fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> core::fmt::Result {
         match self {
+            Request::Join { name } => f.object(|f| {
+                f.member("v", PROTOCOL_VERSION)?;
+                f.member("op", "join")?;
+                f.member("name", name)
+            }),
             Request::Send { from, to, body, round } => f.object(|f| {
                 f.member("v", PROTOCOL_VERSION)?;
                 f.member("op", "send")?;
@@ -144,6 +155,7 @@ impl DisplayJson for Request {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
+    Joined,
     Sent { bytes: usize },
     Inbox { messages: Vec<Message> },
     Peers { names: Vec<String> },
@@ -153,6 +165,11 @@ pub enum Response {
 impl DisplayJson for Response {
     fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> core::fmt::Result {
         match self {
+            Response::Joined => f.object(|f| {
+                f.member("v", PROTOCOL_VERSION)?;
+                f.member("ok", true)?;
+                f.member("op", "joined")
+            }),
             Response::Sent { bytes } => f.object(|f| {
                 f.member("v", PROTOCOL_VERSION)?;
                 f.member("ok", true)?;
@@ -220,6 +237,10 @@ pub fn decode_request(json: &str) -> Result<Request, WireError> {
 
     let op: String = value.to_member("op")?.required()?.try_into()?;
     match op.as_str() {
+        "join" => {
+            let name: String = value.to_member("name")?.required()?.try_into()?;
+            Ok(Request::Join { name })
+        }
         "send" => {
             let from: String = value.to_member("from")?.required()?.try_into()?;
             let to: String = value.to_member("to")?.required()?.try_into()?;
@@ -253,6 +274,7 @@ pub fn decode_response(json: &str) -> Result<Response, WireError> {
 
     let op: String = value.to_member("op")?.required()?.try_into()?;
     match op.as_str() {
+        "joined" => Ok(Response::Joined),
         "sent" => {
             let bytes: usize = value.to_member("bytes")?.required()?.try_into()?;
             Ok(Response::Sent { bytes })
@@ -323,6 +345,13 @@ mod tests {
         let m = decode_message("{\"from\":\"a\",\"body\":\"hi\"}").expect("decode");
         assert_eq!(m.round, 0);
         assert_eq!(m.ts, 0);
+    }
+
+    #[test]
+    fn join_request_and_joined_response_round_trip() {
+        let r = Request::Join { name: String::from("sherlock") };
+        assert_eq!(decode_request(&encode_request(&r)).expect("decode"), r);
+        assert_eq!(decode_response(&encode_response(&Response::Joined)).expect("decode"), Response::Joined);
     }
 
     #[test]

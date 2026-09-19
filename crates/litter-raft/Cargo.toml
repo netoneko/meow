@@ -1,14 +1,19 @@
-[workspace]
-
 [package]
 name = "litter-raft"
 version = "0.1.0"
 edition = "2021"
 
 # no_std + alloc, zero dependencies — see src/lib.rs. `std` is pulled in only
-# under `cfg(test)`, which is what makes `cargo test` here a genuine native
+# under `cfg(test)`, which is what makes `cargo test -p litter-raft` (run from
+# anywhere in the `meow` workspace, including this directory) a genuine native
 # macOS run: meow itself can't do that (raw Linux syscalls throughout
 # libakuma), but this crate has no libakuma dependency at all, so it's the one
 # piece of the litter that can be host-tested directly instead of through the
-# aarch64-linux-musl-in-Docker path every other meow test needs.
+# aarch64-linux-musl-in-Docker path every other meow test needs. Lives under
+# `meow/crates/` (moved here 2026-09-19; previously sat beside `meow` in
+# `userspace/`, its only consumer, for no real reason). A member of the `meow`
+# workspace rather than its own separate one, since a path dependency can't be
+# both a nested subdirectory of its consumer's workspace root and a separate
+# workspace root of its own — that combination is what "multiple workspace
+# roots found in the same workspace" means if you hit it.
 [dependencies]

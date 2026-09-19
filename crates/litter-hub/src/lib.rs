@@ -6,16 +6,25 @@
 //! process in the picture and the one place that can hold state across
 //! `meow`'s otherwise one-shot `-c` invocations.
 //!
-//! `HubState` is the whole server: an in-memory roster (fixed at startup —
-//! same "an external launcher decides who's in the litter" contract the
-//! filesystem `roster.json` always had, `tools::litter::tool_list_peers`'s
-//! doc comment) and in-memory, non-destructive inboxes (`ReadInbox` leaves
-//! messages in place, matching the filesystem mailbox's own behavior — see
-//! that module's doc comment for why). `serve_one` handles exactly one
-//! framed request/response over an already-accepted connection, which is
-//! what `cargo test` drives directly against an in-process `HubState` with no
-//! actual socket involved, and what `run_forever` wraps with the real
-//! `TcpListener` accept loop.
+//! `HubState` is the whole server: an in-memory roster, seeded at startup
+//! from `--roster` and grown at runtime by `Request::Join` — every hub-backed
+//! `meow` invocation sends one as part of its own startup (its "bootstrap";
+//! see `main.rs::bootstrap_litter` in `meow`), so a brand-new litter member
+//! doesn't need the hub restarted with an updated `--roster` just to be seen
+//! by `ListPeers`. Join is still an explicit, named operation rather than
+//! inference from `Send`/`Inbox` traffic — unlike the filesystem mailbox's
+//! `roster.json`, which an external launcher wrote and `meow` only ever read
+//! (`tools::litter::tool_list_peers`'s doc comment), a TCP hub CAN tell who
+//! just spoke to it, but doing so silently would let any client claim
+//! membership by sending one `Send`/`Inbox` call under a name it never
+//! joined; requiring the separate `Join` call keeps "who is in the litter" an
+//! auditable, deliberate action even though it's now dynamic. Inboxes are
+//! in-memory and non-destructive (`ReadInbox` leaves messages in place,
+//! matching the filesystem mailbox's own behavior — see that module's doc
+//! comment for why). `serve_one` handles exactly one framed request/response
+//! over an already-accepted connection, which is what `cargo test` drives
+//! directly against an in-process `HubState` with no actual socket involved,
+//! and what `run_forever` wraps with the real `TcpListener` accept loop.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -28,23 +37,28 @@ use litter_wire::{
     Message, Request, Response, MAX_FRAME_LEN,
 };
 
+/// Hard cap on how many distinct names `Join` will add to the roster — a
+/// litter is at most a handful of agents, so this is a sanity bound against a
+/// misbehaving or hostile client growing the roster unboundedly, not a limit
+/// anyone should ever plan to approach.
+const MAX_ROSTER_SIZE: usize = 256;
+
 /// The whole server's state. `Mutex` rather than a lock-free structure: a
 /// litter is at most a handful of agents taking turns, not a high-throughput
 /// service, so contention is a non-issue and a plain lock keeps `serve_one`
 /// straightforward.
 pub struct HubState {
-    roster: Vec<String>,
+    roster: Mutex<Vec<String>>,
     inboxes: Mutex<HashMap<String, Vec<Message>>>,
 }
 
 impl HubState {
-    /// `roster` is the fixed, external answer to `ListPeers` — the hub never
-    /// grows it from a `Send`/`Inbox` call it happens to see, on the same
-    /// principle the filesystem mailbox's `roster.json` was never written by
-    /// meow itself: who's in the litter is a launch-time decision, not
-    /// something inferred from traffic.
+    /// `roster` seeds the initial membership (e.g. the operator's own `root`
+    /// identity, or agents known in advance); `Request::Join` grows it from
+    /// there. An empty seed is fine — a hub can start knowing no one and
+    /// learn its whole roster from the litter bootstrapping itself.
     pub fn new(roster: Vec<String>) -> Self {
-        Self { roster, inboxes: Mutex::new(HashMap::new()) }
+        Self { roster: Mutex::new(roster), inboxes: Mutex::new(HashMap::new()) }
     }
 
     fn now_us() -> u64 {
@@ -59,6 +73,19 @@ impl HubState {
     /// exercises directly without a socket.
     pub fn handle(&self, req: Request) -> Response {
         match req {
+            Request::Join { name } => {
+                if !is_valid_name(&name) {
+                    return Response::Error { message: String::from("'name' must be a plain agent name") };
+                }
+                let mut roster = self.roster.lock().unwrap();
+                if !roster.iter().any(|n| n == &name) {
+                    if roster.len() >= MAX_ROSTER_SIZE {
+                        return Response::Error { message: String::from("roster is full") };
+                    }
+                    roster.push(name);
+                }
+                Response::Joined
+            }
             Request::Send { from, to, body, round } => {
                 if !is_valid_name(&from) {
                     return Response::Error { message: String::from("'from' must be a plain agent name") };
@@ -81,7 +108,7 @@ impl HubState {
                 let messages = self.inboxes.lock().unwrap().get(&name).cloned().unwrap_or_default();
                 Response::Inbox { messages }
             }
-            Request::Peers => Response::Peers { names: self.roster.clone() },
+            Request::Peers => Response::Peers { names: self.roster.lock().unwrap().clone() },
         }
     }
 
@@ -189,13 +216,51 @@ mod tests {
     }
 
     #[test]
-    fn peers_returns_the_fixed_roster() {
+    fn peers_returns_the_seeded_roster() {
         let state = HubState::new(vec![String::from("sherlock"), String::from("hercules")]);
         let resp = round_trip(&state, &Request::Peers);
         assert_eq!(
             resp,
             Response::Peers { names: vec![String::from("sherlock"), String::from("hercules")] }
         );
+    }
+
+    #[test]
+    fn join_adds_a_new_member_visible_to_peers() {
+        let state = HubState::new(vec![String::from("sherlock")]);
+        let joined = round_trip(&state, &Request::Join { name: String::from("hercules") });
+        assert_eq!(joined, Response::Joined);
+
+        let resp = round_trip(&state, &Request::Peers);
+        assert_eq!(
+            resp,
+            Response::Peers { names: vec![String::from("sherlock"), String::from("hercules")] }
+        );
+    }
+
+    #[test]
+    fn join_is_idempotent() {
+        let state = HubState::new(Vec::new());
+        for _ in 0..3 {
+            assert_eq!(round_trip(&state, &Request::Join { name: String::from("sherlock") }), Response::Joined);
+        }
+        assert_eq!(
+            round_trip(&state, &Request::Peers),
+            Response::Peers { names: vec![String::from("sherlock")] }
+        );
+    }
+
+    #[test]
+    fn join_rejects_an_invalid_name() {
+        let state = HubState::new(Vec::new());
+        let resp = round_trip(&state, &Request::Join { name: String::from("../../etc") });
+        assert!(matches!(resp, Response::Error { .. }));
+    }
+
+    #[test]
+    fn hub_can_start_with_an_empty_seed_roster() {
+        let state = HubState::new(Vec::new());
+        assert_eq!(round_trip(&state, &Request::Peers), Response::Peers { names: Vec::new() });
     }
 
     #[test]

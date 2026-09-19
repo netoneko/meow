@@ -27,6 +27,7 @@
 //! one, and it was always the v0.
 
 pub mod hub;
+pub mod observe;
 pub mod raft;
 
 use alloc::string::String;
@@ -250,6 +251,77 @@ pub fn tool_list_peers() -> ToolResult {
     }
 }
 
+/// Every agent name that currently has an inbox directory under
+/// `/litter/inbox/` — the filesystem-mode participant list for `meow litter
+/// observe`, discovered from what's actually there rather than trusting
+/// `roster.json`'s contents (which might list an agent that never sent
+/// anything, or omit one added after the launcher wrote it). Hub mode has no
+/// filesystem to scan, so it uses `hub::peers` (the hub's own roster) instead
+/// — see `run_litter_observe` in `main.rs`.
+pub fn list_inbox_participants() -> Vec<String> {
+    let dir = format!("{}/inbox", LITTER_ROOT);
+    match read_dir(&dir) {
+        Some(entries) => {
+            let mut names: Vec<String> = entries.into_iter().filter(|e| e.is_dir).map(|e| e.name).collect();
+            names.sort();
+            names
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Structured (not pre-formatted) read of one agent's inbox — the data half
+/// `tool_read_inbox` formats for the LLM and `meow litter observe` instead
+/// merges across every participant. Filesystem mode only; hub mode reads
+/// structured messages directly via `hub::inbox_messages`.
+pub fn read_inbox_messages(agent: &str) -> Vec<LitterMessage> {
+    let dir = inbox_dir(agent);
+    let entries = match read_dir(&dir) {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+    let mut names: Vec<String> = entries
+        .into_iter()
+        .filter(|e| !e.is_dir && e.name.ends_with(".json"))
+        .map(|e| e.name)
+        .collect();
+    names.sort();
+
+    let mut out = Vec::new();
+    for name in &names {
+        let path = format!("{}/{}", dir, name);
+        let fd = open(&path, open_flags::O_RDONLY);
+        if fd < 0 {
+            continue;
+        }
+        let size = match fstat(fd) {
+            Ok(s) => s.st_size as usize,
+            Err(_) => {
+                close(fd);
+                continue;
+            }
+        };
+        if size == 0 || size > MAX_MESSAGE_SIZE {
+            close(fd);
+            continue;
+        }
+        let mut buf = alloc::vec![0u8; size];
+        let n = read_fd(fd, &mut buf);
+        close(fd);
+        if n <= 0 {
+            continue;
+        }
+        let text = match core::str::from_utf8(&buf[..n as usize]) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if let Some(m) = LitterMessage::parse(text) {
+            out.push(m);
+        }
+    }
+    out
+}
+
 #[cfg(feature = "tests")]
 pub fn run_tests() -> i32 {
     let mut passed = 0usize;
@@ -334,5 +406,5 @@ pub fn run_tests() -> i32 {
 
     libakuma::print(&format!("  result: {}/{}\n", passed, total));
     let mailbox_failures = if passed == total { 0 } else { 1 };
-    mailbox_failures + hub::run_tests()
+    mailbox_failures + hub::run_tests() + observe::run_tests()
 }

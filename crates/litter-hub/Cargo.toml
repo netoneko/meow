@@ -1,5 +1,3 @@
-[workspace]
-
 [package]
 name = "litter-hub"
 version = "0.1.0"
@@ -7,12 +5,22 @@ edition = "2021"
 
 # Ordinary std binary. It is NOT part of a litter — it's the relay process
 # every meow agent connects *outbound* to (see `litter-wire`'s module doc and
-# `userspace/meow/docs/LITTER_EXPERIMENT.md` "Where this is headed"), so it
-# runs on the host (or wherever is reachable from every agent container),
-# alongside `ollama`/`llama-server`, not inside Akuma. Split into `lib.rs` +
-# a thin `main.rs` so `cargo test` can drive a real `HubState` and a real
-# `std::net::TcpListener` on an OS-assigned port, end to end, with no Docker
-# and no meow binary involved — same reason `sshd`/`box` split their pure
-# logic into a `--lib` half (root CLAUDE.md "Testing").
+# `docs/LITTER_EXPERIMENT.md` "Where this is headed"), so it runs on the host
+# (or wherever is reachable from every agent container), alongside
+# `ollama`/`llama-server`, not inside Akuma. Split into `lib.rs` + a thin
+# `main.rs` so `cargo test -p litter-hub` can drive a real `HubState` and a
+# real `std::net::TcpListener` on an OS-assigned port, end to end, with no
+# Docker and no meow binary involved — same reason `sshd`/`box` split their
+# pure logic into a `--lib` half (root CLAUDE.md "Testing").
+#
+# A member of the `meow` workspace, but excluded from its `default-members`
+# (see meow's own Cargo.toml): it's a `std` binary and meow's own build is
+# `-Zbuild-std=core,alloc` against a `no_std` target, which has no `std` to
+# link against at all. Listing it as a member (rather than its own separate
+# workspace, which a nested path dependency can't be — see `litter-raft`'s
+# Cargo.toml) still gets `cargo test -p litter-hub`/`cargo build -p litter-hub
+# --target <host>` from anywhere in the workspace; excluding it from
+# `default-members` is what stops a bare `cargo build`/`test` at meow's own
+# root from trying to cross-compile a `std` binary for a target with no `std`.
 [dependencies]
 litter-wire = { path = "../litter-wire" }

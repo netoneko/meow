@@ -1,4 +1,14 @@
 [workspace]
+members = ["crates/litter-raft", "crates/litter-wire", "crates/litter-hub"]
+# `.` (meow itself) only — NOT the litter-* members above — so a bare
+# `cargo build`/`test` at this root (meow's own recipe: nightly,
+# `-Zbuild-std=core,alloc`, `--target aarch64-unknown-linux-musl`) doesn't
+# also try to cross-compile them for a target that has no `std` at all.
+# `litter-hub` in particular is an ordinary `std` binary and would fail
+# outright; run `cargo test -p <name> --target <host-triple>` (or `cd` into
+# that crate's own directory and run `cargo test --target <host-triple>`) to
+# test any of them natively instead — see each one's own Cargo.toml.
+default-members = ["."]
 
 [package]
 name = "meow"
