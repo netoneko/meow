@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::format;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::Ordering;
 
 use crate::config::{Provider, DEFAULT_CONTEXT_WINDOW, COLOR_PEARL, COLOR_GREEN_LIGHT, COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, TOKEN_LIMIT_FOR_COMPACTION};
 use crate::util::json_escape_to;
@@ -11,19 +11,34 @@ use super::history::{Message, Conversation, MAX_HISTORY_SIZE};
 
 const MAX_TOOL_ITERATIONS: usize = 20;
 
-/// Warn once per session when history hits the cap. Auto-compaction at this
-/// threshold is not yet implemented; for now we just surface the condition.
-static HISTORY_LIMIT_WARNED: AtomicBool = AtomicBool::new(false);
-fn warn_if_history_full(count: usize) {
-    if count >= MAX_HISTORY_SIZE && !HISTORY_LIMIT_WARNED.swap(true, Ordering::SeqCst) {
-        print_msg(
-            COLOR_YELLOW,
-            &format!(
-                "\n[!] History reached {} messages. Autocompact at this limit is not yet implemented \u{2014} it will be added in a future version.\n",
-                MAX_HISTORY_SIZE
-            ),
-        );
+/// Recovery path for a session nobody is babysitting (e.g. an unattended swarm
+/// agent): once history crosses the message-count or token cap, drop it and
+/// reseed with a placeholder rather than let the request grow without bound or
+/// overflow the model's context window forever. Unlike the LLM-invoked
+/// `CompactContext` tool below, this carries no semantic summary — it fires
+/// whether or not anything asked for one, so it must stay cheap and unconditional.
+fn auto_compact_if_needed(conversation: &mut Conversation, system_prompt: &str) {
+    if conversation.len() < MAX_HISTORY_SIZE && conversation.tokens() < TOKEN_LIMIT_FOR_COMPACTION {
+        return;
     }
+    let count_before = conversation.len();
+    let tokens_before = conversation.tokens();
+    let compact_msg = format!(
+        "[Auto-compaction] {} messages ({} tokens) were dropped after hitting the history/token limit. No summary was generated \u{2014} continue the task with what remains; re-read files or ask if you need the earlier detail.",
+        count_before, tokens_before
+    );
+    conversation.reseed(&[
+        Message::new("system", system_prompt),
+        Message::new("user", &compact_msg),
+        Message::new("assistant", "Understood, continuing."),
+    ]);
+    print_msg(
+        COLOR_YELLOW,
+        &format!(
+            "\n[*] Auto-compacted: {} msgs/{} tokens -> {} msgs/{} tokens\n",
+            count_before, tokens_before, conversation.len(), conversation.tokens()
+        ),
+    );
 }
 
 pub fn chat_once(
@@ -34,7 +49,7 @@ pub fn chat_once(
     context_window: Option<usize>,
     system_prompt: &str,
 ) -> Result<(), &'static str> {
-    warn_if_history_full(conversation.len());
+    auto_compact_if_needed(conversation, system_prompt);
     conversation.append(&Message::new("user", user_message));
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
@@ -139,7 +154,7 @@ pub fn chat_once(
                     conversation.append(&result_msg);
                 }
 
-                warn_if_history_full(conversation.len());
+                auto_compact_if_needed(conversation, system_prompt);
                 continue;
             }
 
@@ -148,7 +163,7 @@ pub fn chat_once(
                 if !assistant_response.is_empty() {
                     conversation.append(&Message::new("assistant", &assistant_response));
                 }
-                warn_if_history_full(conversation.len());
+                auto_compact_if_needed(conversation, system_prompt);
                 if let Some(ctx_window) = context_window {
                     let current_tokens = conversation.tokens();
                     if current_tokens > TOKEN_LIMIT_FOR_COMPACTION && current_tokens < ctx_window {

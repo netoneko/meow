@@ -5,6 +5,7 @@ pub mod shell;
 pub mod pretend_shell;
 pub mod helpers;
 pub mod mod_types;
+pub mod swarm;
 
 use alloc::string::String;
 use alloc::format;
@@ -90,6 +91,14 @@ pub fn execute_tool_by_name(name: &str, args_json: &str) -> Option<ToolResult> {
         "Pwd" => {
             Some(fs::tool_pwd())
         }
+        "SwarmSend" => {
+            let to = extract_string_field(args_json, "to")?;
+            let body = extract_string_field(args_json, "body")?;
+            let round = crate::json::number_at(args_json, &["round"]).unwrap_or(0);
+            Some(swarm::tool_swarm_send(&to, &body, round))
+        }
+        "SwarmInbox" => Some(swarm::tool_swarm_inbox()),
+        "SwarmPeers" => Some(swarm::tool_swarm_peers()),
         _ => None,
     }
 }

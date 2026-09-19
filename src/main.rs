@@ -140,6 +140,10 @@ pub extern "C" fn main() {
         app_config.current_personality = p.clone();
     }
 
+    if let Some(ref name) = app_config.swarm_agent_name {
+        tools::swarm::set_agent_name(name.clone());
+    }
+
     let current_provider = app_config
         .get_current_provider()
         .cloned()
@@ -501,6 +505,7 @@ fn run_all_tests() -> i32 {
     failures += Config::run_tests();
     failures += app::chat::run_tests();
     failures += crate::ui::tui::stream::run_tests();
+    failures += tools::swarm::run_tests();
     if failures == 0 {
         libakuma::print("=== All tests passed ===\n");
     } else {

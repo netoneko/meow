@@ -146,12 +146,16 @@ pub fn tool_file_list(path: &str) -> ToolResult {
 }
 
 pub fn tool_file_delete(filename: &str) -> ToolResult {
-    let _resolved = match resolve_path_or_err(filename) {
+    let resolved = match resolve_path_or_err(filename) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    // Note: libakuma doesn't have unlink syscall yet
-    ToolResult::err(format!("Delete not yet implemented for: {}", filename))
+    let result = libakuma::unlink(&resolved);
+    if result == 0 {
+        ToolResult::ok(format!("Deleted '{}'", filename))
+    } else {
+        ToolResult::err(format!("Failed to delete '{}': error {}", filename, result))
+    }
 }
 
 pub fn tool_folder_create(path: &str) -> ToolResult {
