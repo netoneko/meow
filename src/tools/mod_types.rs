@@ -38,7 +38,7 @@ pub fn create_tool_tempfile() -> Option<(i32, String)> {
 
     let _ = mkdir(&tmp_dir);
 
-    let timestamp = libakuma::uptime();
+    let timestamp = crate::util::now_us();
     let filename = format!("{}/meow_tool_{}.txt", tmp_dir, timestamp);
 
     let fd = open(&filename, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);

@@ -29,7 +29,7 @@ pub fn generate_session_id() -> String {
     let stamp = if micros != 0 {
         micros / 1_000_000
     } else {
-        libakuma::uptime() / 1_000_000
+        crate::util::now_us() / 1_000_000
     };
     format!("{:x}-{:x}", stamp, pid)
 }

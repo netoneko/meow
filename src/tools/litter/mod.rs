@@ -1,22 +1,24 @@
-//! Optional inter-agent mailbox for a swarm of meow instances sharing one
+//! Optional inter-agent mailbox for a litter of meow instances sharing one
 //! filesystem (e.g. a mounted Docker volume). This IS the whole "network":
 //! no sockets, no discovery protocol of our own — it deliberately mirrors the
 //! property that gave rise to it, that Akuma boxes on the same host do not
-//! get network isolation from each other (see docs/SWARM_EXPERIMENT.md).
+//! get network isolation from each other (see docs/LITTER_EXPERIMENT.md).
 //!
-//! `SwarmSend` drops a JSON envelope into a peer's inbox directory.
-//! `SwarmInbox` reads every envelope currently in your own and leaves them in
+//! `SendMessage` drops a JSON envelope into a peer's inbox directory.
+//! `ReadInbox` reads every envelope currently in your own and leaves them in
 //! place (unlike `fs::tool_file_delete`, which does remove files — see
-//! `docs/SWARM_EXPERIMENT.md` for why this module doesn't reuse that path),
+//! `docs/LITTER_EXPERIMENT.md` for why this module doesn't reuse that path),
 //! so a round's messages just accumulate and the caller judges what's new
-//! from the `round` field it wrote. `SwarmPeers` reads a roster file that an
+//! from the `round` field it wrote. `ListPeers` reads a roster file that an
 //! external launcher — not meow — is responsible for writing; meow never
 //! resolves a peer name to an address itself.
 //!
-//! All three refuse to run until `swarm_agent_name` is set in
+//! All three refuse to run until `litter_agent_name` is set in
 //! `/etc/meow/config`, which is what makes this "optional": an agent nobody
-//! configured for the swarm gets a clear error instead of silently reading or
+//! configured for the litter gets a clear error instead of silently reading or
 //! writing someone else's mailbox.
+
+pub mod raft;
 
 use alloc::string::String;
 use alloc::format;
@@ -28,7 +30,7 @@ use libakuma::{open, close, read_fd, write_fd, fstat, read_dir, mkdir_p, open_fl
 use crate::util::json_escape_to;
 use super::mod_types::ToolResult;
 
-pub const SWARM_ROOT: &str = "/swarm";
+pub const LITTER_ROOT: &str = "/litter";
 const MAX_MESSAGE_SIZE: usize = 32 * 1024;
 
 static AGENT_NAME_INIT: AtomicBool = AtomicBool::new(false);
@@ -36,7 +38,7 @@ static AGENT_NAME_INIT: AtomicBool = AtomicBool::new(false);
 // same pattern as tools::context's SANDBOX/CURRENT.
 static mut AGENT_NAME: Option<String> = None;
 
-/// Called once at startup from `Config::swarm_agent_name`.
+/// Called once at startup from `Config::litter_agent_name`.
 pub fn set_agent_name(name: String) {
     unsafe { *core::ptr::addr_of_mut!(AGENT_NAME) = Some(name); }
     AGENT_NAME_INIT.store(true, Ordering::Release);
@@ -52,13 +54,13 @@ pub fn agent_name() -> Option<String> {
 
 /// A single mailbox entry. `round` is caller-supplied context (which debate
 /// round produced it), not a sequence number the mailbox itself assigns.
-pub struct SwarmMessage {
+pub struct LitterMessage {
     pub from: String,
     pub round: i64,
     pub body: String,
 }
 
-impl SwarmMessage {
+impl LitterMessage {
     pub fn write_json(&self, out: &mut String) {
         out.push_str("{\"from\":\"");
         json_escape_to(&self.from, out);
@@ -69,18 +71,18 @@ impl SwarmMessage {
         out.push_str("\"}");
     }
 
-    pub fn parse(json: &str) -> Option<SwarmMessage> {
+    pub fn parse(json: &str) -> Option<LitterMessage> {
         let from = crate::json::string_at(json, &["from"])?;
         let body = crate::json::string_at(json, &["body"])?;
         let round = crate::json::number_at(json, &["round"]).unwrap_or(0);
-        Some(SwarmMessage { from, round, body })
+        Some(LitterMessage { from, round, body })
     }
 }
 
 /// `to` is LLM-supplied and never sandbox-checked the way `tools::fs` paths
-/// are (this module intentionally lives outside that sandbox, in `/swarm`),
+/// are (this module intentionally lives outside that sandbox, in `/litter`),
 /// so it must be a bare token — without this, `to = "../../etc"` would let
-/// SwarmSend write anywhere `mkdir_p`/`open` can reach.
+/// SendMessage write anywhere `mkdir_p`/`open` can reach.
 fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -88,16 +90,16 @@ fn is_valid_name(name: &str) -> bool {
 }
 
 fn inbox_dir(agent: &str) -> String {
-    format!("{}/inbox/{}", SWARM_ROOT, agent)
+    format!("{}/inbox/{}", LITTER_ROOT, agent)
 }
 
 fn require_agent_name() -> Result<String, ToolResult> {
     agent_name().ok_or_else(|| {
-        ToolResult::err("Swarm not configured: set swarm_agent_name in /etc/meow/config")
+        ToolResult::err("Litter not configured: set litter_agent_name in /etc/meow/config")
     })
 }
 
-pub fn tool_swarm_send(to: &str, body: &str, round: i64) -> ToolResult {
+pub fn tool_send_message(to: &str, body: &str, round: i64) -> ToolResult {
     let from = match require_agent_name() {
         Ok(n) => n,
         Err(e) => return e,
@@ -106,7 +108,7 @@ pub fn tool_swarm_send(to: &str, body: &str, round: i64) -> ToolResult {
         return ToolResult::err("'to' must be a plain agent name (letters, digits, '-' or '_')");
     }
     if body.is_empty() {
-        return ToolResult::err("SwarmSend requires a non-empty body");
+        return ToolResult::err("SendMessage requires a non-empty body");
     }
     if body.len() > MAX_MESSAGE_SIZE {
         return ToolResult::err("Message body too large (max 32KB)");
@@ -115,13 +117,13 @@ pub fn tool_swarm_send(to: &str, body: &str, round: i64) -> ToolResult {
     let dir = inbox_dir(to);
     mkdir_p(&dir);
 
-    let msg = SwarmMessage { from: from.clone(), round, body: String::from(body) };
+    let msg = LitterMessage { from: from.clone(), round, body: String::from(body) };
     let mut json = String::new();
     msg.write_json(&mut json);
 
     // `<uptime-us>-<sender>.json` sorts chronologically within one inbox and
     // can't collide between senders writing in the same tick.
-    let ts = libakuma::uptime();
+    let ts = crate::util::now_us();
     let path = format!("{}/{}-{}.json", dir, ts, from);
     let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
     if fd < 0 {
@@ -135,7 +137,7 @@ pub fn tool_swarm_send(to: &str, body: &str, round: i64) -> ToolResult {
     ToolResult::ok(format!("Sent to '{}' ({} bytes)", to, json.len()))
 }
 
-pub fn tool_swarm_inbox() -> ToolResult {
+pub fn tool_read_inbox() -> ToolResult {
     let me = match require_agent_name() {
         Ok(n) => n,
         Err(e) => return e,
@@ -187,15 +189,15 @@ pub fn tool_swarm_inbox() -> ToolResult {
             Ok(s) => s,
             Err(_) => continue,
         };
-        if let Some(m) = SwarmMessage::parse(text) {
+        if let Some(m) = LitterMessage::parse(text) {
             out.push_str(&format!("\n[round {}] {}: {}\n", m.round, m.from, m.body));
         }
     }
     ToolResult::ok(out)
 }
 
-pub fn tool_swarm_peers() -> ToolResult {
-    let path = format!("{}/roster.json", SWARM_ROOT);
+pub fn tool_list_peers() -> ToolResult {
+    let path = format!("{}/roster.json", LITTER_ROOT);
     let fd = open(&path, open_flags::O_RDONLY);
     if fd < 0 {
         return ToolResult::err(format!(
@@ -230,15 +232,15 @@ pub fn tool_swarm_peers() -> ToolResult {
 pub fn run_tests() -> i32 {
     let mut passed = 0usize;
     let mut total = 0usize;
-    libakuma::print("--- swarm tests ---\n");
+    libakuma::print("--- litter tests ---\n");
 
     // write_json / parse round-trip
     total += 1;
     {
-        let msg = SwarmMessage { from: String::from("meow-a"), round: 3, body: String::from("hello peer") };
+        let msg = LitterMessage { from: String::from("meow-a"), round: 3, body: String::from("hello peer") };
         let mut json = String::new();
         msg.write_json(&mut json);
-        match SwarmMessage::parse(&json) {
+        match LitterMessage::parse(&json) {
             Some(back) if back.from == "meow-a" && back.round == 3 && back.body == "hello peer" => passed += 1,
             other => libakuma::print(&format!("  [!] round-trip: got {:?}\n", other.map(|m| (m.from, m.round, m.body)))),
         }
@@ -247,10 +249,10 @@ pub fn run_tests() -> i32 {
     // parse escapes/unescapes a body containing quotes and newlines
     total += 1;
     {
-        let msg = SwarmMessage { from: String::from("meow-b"), round: 0, body: String::from("line1\nline2 \"quoted\"") };
+        let msg = LitterMessage { from: String::from("meow-b"), round: 0, body: String::from("line1\nline2 \"quoted\"") };
         let mut json = String::new();
         msg.write_json(&mut json);
-        match SwarmMessage::parse(&json) {
+        match LitterMessage::parse(&json) {
             Some(back) if back.body == "line1\nline2 \"quoted\"" => passed += 1,
             other => libakuma::print(&format!("  [!] escaping round-trip: got {:?}\n", other.map(|m| m.body))),
         }
@@ -259,14 +261,14 @@ pub fn run_tests() -> i32 {
     // parse rejects a document missing required fields
     total += 1;
     {
-        if SwarmMessage::parse("{\"from\":\"meow-a\"}").is_none() { passed += 1; }
+        if LitterMessage::parse("{\"from\":\"meow-a\"}").is_none() { passed += 1; }
         else { libakuma::print("  [!] parse should reject a message with no body\n"); }
     }
 
     // parse defaults a missing round to 0 rather than failing
     total += 1;
     {
-        match SwarmMessage::parse("{\"from\":\"meow-a\",\"body\":\"hi\"}") {
+        match LitterMessage::parse("{\"from\":\"meow-a\",\"body\":\"hi\"}") {
             Some(m) if m.round == 0 => passed += 1,
             other => libakuma::print(&format!("  [!] missing round should default to 0: {:?}\n", other.map(|m| m.round))),
         }
@@ -293,16 +295,16 @@ pub fn run_tests() -> i32 {
         if ok { passed += 1; }
     }
 
-    // Swarm* tools refuse to run before an agent name is configured. This
+    // Litter* tools refuse to run before an agent name is configured. This
     // must be the LAST test in the module: it does not reset AGENT_NAME_INIT
     // afterward (there is no reset primitive, by design — see set_agent_name),
     // so any test added below this point would observe a configured agent.
     total += 1;
     {
         if !AGENT_NAME_INIT.load(Ordering::Acquire) {
-            let r = tool_swarm_inbox();
+            let r = tool_read_inbox();
             if !r.success && r.output.contains("not configured") { passed += 1; }
-            else { libakuma::print(&format!("  [!] unconfigured SwarmInbox should fail clearly: success={} {:?}\n", r.success, r.output)); }
+            else { libakuma::print(&format!("  [!] unconfigured ReadInbox should fail clearly: success={} {:?}\n", r.success, r.output)); }
         } else {
             libakuma::print("  [!] skipped unconfigured-agent test: an earlier test already set an agent name\n");
         }

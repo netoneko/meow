@@ -1,6 +1,20 @@
 use alloc::string::String;
 use core::fmt::{self, Write};
 
+/// Monotonic microsecond clock. Under `linux-net`, `libakuma::uptime()` issues
+/// Akuma-custom syscall 319, which doesn't exist on real Linux and returns an
+/// error — cast to `u64` that becomes `u64::MAX`, not a small growing number.
+/// This was previously duplicated as a private `now_us()` in `api::client`
+/// only; every OTHER caller of `libakuma::uptime()` in a timing-sensitive spot
+/// (`tools::litter`'s inbox-file timestamps, `app::chat`'s tool-duration
+/// stats, the TUI's frame timing, `app::session`'s session-id derivation,
+/// `tools::mod_types`'s temp-file naming) had the same bug under `linux-net`
+/// until this got promoted here and those call sites switched to it.
+#[cfg(feature = "linux-net")]
+pub fn now_us() -> u64 { crate::linux_net::uptime_us() }
+#[cfg(not(feature = "linux-net"))]
+pub fn now_us() -> u64 { libakuma::uptime() }
+
 pub fn json_escape_to(s: &str, out: &mut String) {
     for c in s.chars() {
         match c {

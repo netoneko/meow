@@ -54,7 +54,7 @@ pub fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
         0x0A => (InputEvent::ShiftEnter, 1),
         0x1B => {
             if buf.len() == 1 {
-                let now = libakuma::uptime();
+                let now = crate::util::now_us();
                 if now.saturating_sub(LAST_INPUT_TIME.load(Ordering::Relaxed)) > 50000 { return (InputEvent::Esc, 1); }
                 else { return (InputEvent::Unknown, 0); }
             }
@@ -158,7 +158,7 @@ pub fn parse_input(buf: &[u8]) -> (InputEvent, usize) {
 }
 
 pub fn update_last_input_time() {
-    LAST_INPUT_TIME.store(libakuma::uptime(), Ordering::Relaxed);
+    LAST_INPUT_TIME.store(crate::util::now_us(), Ordering::Relaxed);
 }
 
 pub fn calculate_input_cursor(input: &str, idx: usize, prompt_width: usize, width: usize) -> (u64, u64) {

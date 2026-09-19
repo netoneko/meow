@@ -5,7 +5,8 @@ pub mod shell;
 pub mod pretend_shell;
 pub mod helpers;
 pub mod mod_types;
-pub mod swarm;
+#[cfg(feature = "litter")]
+pub mod litter;
 
 use alloc::string::String;
 use alloc::format;
@@ -91,14 +92,17 @@ pub fn execute_tool_by_name(name: &str, args_json: &str) -> Option<ToolResult> {
         "Pwd" => {
             Some(fs::tool_pwd())
         }
-        "SwarmSend" => {
+        #[cfg(feature = "litter")]
+        "SendMessage" => {
             let to = extract_string_field(args_json, "to")?;
             let body = extract_string_field(args_json, "body")?;
             let round = crate::json::number_at(args_json, &["round"]).unwrap_or(0);
-            Some(swarm::tool_swarm_send(&to, &body, round))
+            Some(litter::tool_send_message(&to, &body, round))
         }
-        "SwarmInbox" => Some(swarm::tool_swarm_inbox()),
-        "SwarmPeers" => Some(swarm::tool_swarm_peers()),
+        #[cfg(feature = "litter")]
+        "ReadInbox" => Some(litter::tool_read_inbox()),
+        #[cfg(feature = "litter")]
+        "ListPeers" => Some(litter::tool_list_peers()),
         _ => None,
     }
 }

@@ -9,18 +9,13 @@ use crate::linux_net::resolve;
 use libakuma::net::resolve;
 use libakuma::net::TcpStream;
 use libakuma_tls::{HttpHeaders, HttpStreamTls, StreamResult, TLS_RECORD_SIZE, find_headers_end, parse_status_line};
-use crate::util::{StackBuffer, json_escape_to};
+use crate::util::{StackBuffer, json_escape_to, now_us};
 use core::fmt::Write;
 use crate::ui::tui::layout::Stdout;
 
 use crate::config::{Provider, OPENAI_TOOLS_JSON};
 use crate::tui_app;
 use super::types::{StreamResponse, StreamStats, ToolCallData};
-
-#[cfg(feature = "linux-net")]
-fn now_us() -> u64 { crate::linux_net::uptime_us() }
-#[cfg(not(feature = "linux-net"))]
-fn now_us() -> u64 { libakuma::uptime() }
 
 fn debug_print(msg: &str) {
     if tui_app::DEBUG_MODE.load(Ordering::SeqCst) {

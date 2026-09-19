@@ -122,10 +122,10 @@ pub fn chat_once(
                         tui_app::render_status_now(&format!("[TOOL] Running: {}", tc.name));
                     }
 
-                    let tool_start = libakuma::uptime();
+                    let tool_start = crate::util::now_us();
                     let tool_result = tools::execute_tool_by_name(&tc.name, &tc.arguments)
                         .unwrap_or_else(|| tools::ToolResult::err("Unknown or unsupported tool"));
-                    let tool_duration_us = libakuma::uptime() - tool_start;
+                    let tool_duration_us = crate::util::now_us() - tool_start;
 
                     let (color, status) = if tool_result.success { (COLOR_GREEN_LIGHT, "Success") } else { (COLOR_PEARL, "Failed") };
                     let status_content = format!("Tool Status: {}", status);

@@ -10,12 +10,23 @@ name = "meow"
 path = "src/main.rs"
 
 [features]
-default = ["compact-tools"]
+default = ["compact-tools", "litter"]
 
 # Drop every per-tool `description` from the OpenAI tools schema (~930 fewer
 # tokens on every request). ON by default; disable with `--no-default-features`
 # to ship the descriptive schema. See config.rs OPENAI_TOOLS_JSON.
 compact-tools = []
+
+# The inter-agent mailbox tools (LitterSend/LitterInbox/LitterPeers,
+# tools/litter.rs) and the Raft-derived leader-election state machine
+# (election.rs) — "litter" as in a litter of kittens, the group spawned
+# together from one launch. ON by default — both are inert until
+# `litter_agent_name` is set in /etc/meow/config, so shipping them costs
+# schema tokens but no behavior change for a non-litter install. Disable with
+# `--no-default-features` (or explicitly `--no-default-features --features
+# compact-tools`) to drop them from the binary entirely. See
+# docs/LITTER_EXPERIMENT.md.
+litter = []
 
 # Compile the in-binary self-test suite (`meow test`) and its capture hooks.
 # OFF by default — the tests are dead weight in shipped builds. Enable with
@@ -47,6 +58,10 @@ overflow-checks = false
 [dependencies]
 libakuma = { path = "../libakuma", features = ["chunked-allocator"] }
 libakuma-tls = { path = "../libakuma-tls" }
+# Raft's leader-election subprotocol, no_std + zero dependencies. Kept as a
+# sibling crate (not inline) specifically so `cargo test` can exercise it
+# natively on macOS, unlike the rest of meow — see litter-raft/src/lib.rs.
+litter-raft = { path = "../litter-raft" }
 # JSON. no_std, allocation-free, non-recursive pull parser — same choice and
 # feature set `box` already made (see userspace/box/Cargo.toml): no floats
 # needed for chat-API/tool-call JSON, and float-skip steps over one rather

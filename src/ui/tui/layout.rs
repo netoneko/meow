@@ -86,7 +86,7 @@ impl PaneLayout {
         if self.status_text != text || self.status_start_us == 0 {
             self.status_text = String::from(text);
             self.status_dots = if dots > 0 { dots } else { 1 };
-            self.status_start_us = libakuma::uptime();
+            self.status_start_us = crate::util::now_us();
             self.repaint_counter = 0;
             self.status_color = if text.contains("error") || text.contains("failed") || text.contains("retry") || text.contains("cancelled") {
                 "\x1b[38;5;203m"

@@ -167,7 +167,7 @@ pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
     let (w, h) = (layout.term_width as usize, layout.term_height as u64);
     layout.repaint_counter = layout.repaint_counter.wrapping_add(1) % 10000;
     let is_streaming = STREAMING.load(Ordering::SeqCst);
-    let uptime = libakuma::uptime();
+    let uptime = crate::util::now_us();
     layout.status_dots = ((uptime / 250_000) % 5 + 1) as u8;
     if !is_streaming && layout.status_text.is_empty() { layout.update_status("[MEOW] awaiting user input", 0, None); }
 
@@ -251,7 +251,7 @@ pub fn render_footer(current_tokens: usize, token_limit: usize, mem_kb: usize) {
             let ms = if let Some(ms) = layout.status_time_ms { 
                 Some(ms) 
             } else if layout.status_start_us > 0 && !layout.status_text.contains("awaiting") { 
-                Some((libakuma::uptime() - layout.status_start_us) / 1000) 
+                Some((crate::util::now_us() - layout.status_start_us) / 1000) 
             } else { 
                 None 
             };

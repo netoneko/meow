@@ -39,6 +39,7 @@ pub extern "C" fn main() {
     let mut cgi_mode = false;
 
     let mut i = 1;
+    let mut litter_chase = false;
     if argc() > 1 {
         if let Some(first_arg) = arg(1) {
             if first_arg == "init" {
@@ -51,6 +52,27 @@ pub extern "C" fn main() {
                 {
                     libakuma::print("meow: built without the test suite (rebuild with --features tests)\n");
                     exit(1);
+                }
+            }
+            #[cfg(feature = "litter")]
+            if first_arg == "litter" {
+                let sub = arg(2);
+                match sub {
+                    Some("peers") => exit(run_litter_inspect(tools::litter::tool_list_peers())),
+                    Some("inbox") => exit(run_litter_inspect(tools::litter::tool_read_inbox())),
+                    Some("chase") => {
+                        litter_chase = true;
+                        i = 3; // resume normal flag parsing after "litter chase"
+                    }
+                    Some(other) => {
+                        libakuma::print(&format!("meow: unknown 'meow litter' subcommand '{}'\n", other));
+                        libakuma::print("Usage: meow litter {peers|inbox|chase} [-c \"task\"]\n");
+                        exit(1);
+                    }
+                    None => {
+                        libakuma::print("Usage: meow litter {peers|inbox|chase} [-c \"task\"]\n");
+                        exit(1);
+                    }
                 }
             }
         }
@@ -140,8 +162,9 @@ pub extern "C" fn main() {
         app_config.current_personality = p.clone();
     }
 
-    if let Some(ref name) = app_config.swarm_agent_name {
-        tools::swarm::set_agent_name(name.clone());
+    #[cfg(feature = "litter")]
+    if let Some(ref name) = app_config.litter_agent_name {
+        tools::litter::set_agent_name(name.clone());
     }
 
     let current_provider = app_config
@@ -161,6 +184,13 @@ pub extern "C" fn main() {
     } else {
         system_prompt.push_str(get_active_personality(&app_config, no_personality).description);
     }
+
+    #[cfg(feature = "litter")]
+    if litter_chase {
+        system_prompt.push_str("\n\nYou are one member of a litter of meow agents working the same task. Before anything else, call ListPeers to see who else is here and ReadInbox to see what's already been said. Do the task, then call SendMessage to share your findings with the litter — don't just answer in isolation.");
+    }
+    #[cfg(not(feature = "litter"))]
+    let _ = litter_chase;
 
     system_prompt.push_str("\n\n");
 
@@ -505,13 +535,27 @@ fn run_all_tests() -> i32 {
     failures += Config::run_tests();
     failures += app::chat::run_tests();
     failures += crate::ui::tui::stream::run_tests();
-    failures += tools::swarm::run_tests();
+    #[cfg(feature = "litter")]
+    { failures += tools::litter::run_tests(); }
+    #[cfg(feature = "litter")]
+    { failures += tools::litter::raft::run_tests(); }
     if failures == 0 {
         libakuma::print("=== All tests passed ===\n");
     } else {
         libakuma::print(&format!("=== {} test suite(s) failed ===\n", failures));
     }
     if failures == 0 { 0 } else { 1 }
+}
+
+/// `meow litter peers` / `meow litter inbox`: run one message-tool directly
+/// and print its result, with no LLM call involved. This is the "manage and
+/// inspect" half of `meow litter`; `chase` (handled inline in `main`, since it
+/// needs the full LLM/system-prompt setup) is the "put it to work" half.
+#[cfg(feature = "litter")]
+fn run_litter_inspect(result: tools::ToolResult) -> i32 {
+    libakuma::print(&result.output);
+    libakuma::print("\n");
+    if result.success { 0 } else { 1 }
 }
 
 fn run_init(config: &mut Config) -> i32 {
