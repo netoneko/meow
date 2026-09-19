@@ -264,6 +264,38 @@ proposed:
   unconfirmed, so `litter-hub` should keep being reached by IP literal, not
   hostname, until it is.
 
+**Bootstrap: a new litter member joins the hub itself, not a pre-written
+`--roster` (also built 2026-09-19).** `--roster` was originally required and
+fixed at hub startup — meaning adding a fifth agent later meant restarting the
+hub with an updated list, the exact "the launcher decides who's in the
+litter, in advance" rigidity the filesystem `roster.json` always had, now
+carried over somewhere it didn't need to be (a TCP hub, unlike a file, *can*
+tell who just spoke to it). Fixed with a new `Request::Join { name }` /
+`Response::Joined` pair in `litter-wire`: idempotent, validated the same way
+`Send`/`Inbox` already are, and `meow`'s own startup (`main.rs`, right after
+`set_hub_addr`) sends one automatically whenever both `litter_hub_addr` and
+`litter_agent_name` are configured — that startup *is* the bootstrap, since a
+`meow -c` invocation has no separate "join" lifecycle stage to hang it off of.
+`litter-hub --roster` is now just an optional seed; an empty or omitted one is
+a legitimate way to start a hub that learns its entire membership from the
+litter bootstrapping itself. `HubState`'s roster moved from a plain `Vec` to
+a `Mutex<Vec<String>>`, capped at `MAX_ROSTER_SIZE` (256) against a
+misbehaving client growing it unboundedly. Tests: `litter-wire` 17/17,
+`litter-hub` 13/13 (join-adds-a-member, idempotent-join, invalid-name
+rejection, empty-seed-roster startup).
+
+**`meow litter observe`: a read-only transcript view (also built
+2026-09-19).** Not a tool the LLM calls — an operator-facing CLI subcommand
+that merges every participant's messages (hub: `Peers` then `Inbox` per name;
+filesystem: every subdirectory under `/litter/inbox/`, discovered rather than
+trusted from `roster.json`, then each one's messages) and prints them sorted
+by `round`, each with a small colored ASCII avatar per sender — one of the
+four sizes at `src/akuma_{20,40,79,120}.txt` (the 20-column one; `akuma_40` is
+the size `sshd`/`amd64` already vendor for a one-time banner, too big to
+repeat per chat message), in one of 8 cycling ANSI colors assigned the first
+time a name is seen and reused every time after. Lives in
+`tools::litter::observe`, 4/4 tests (`meow test`).
+
 **Leader election: hand-rolled Raft subprotocol, built, not yet wired to
 transport.** The end goal is real swarm auth: each agent generates its own
 keypair, signs its messages, the swarm elects a leader, and one fixed root
@@ -319,23 +351,53 @@ anyone can claim to be.
 
 ## Next steps, roughly in order
 
-1. Root-cause the `host.docker.internal` connection-retry bug above before
-   adding the TCP hub on top of it.
-2. `docker-compose.yml` + a small round-loop entrypoint script, checked in
-   under `userspace/meow/swarm/`, so the manual `docker run` above becomes
-   `docker compose up`. (Still filesystem-mailbox at this point — the TCP hub
-   is a separate step, not a prerequisite for a first real debate run.)
-3. A second, genuinely different small model in `bootstrap/models/` (the
-   debate is more interesting model-vs-model than weights-vs-themselves).
+1. ~~Root-cause the `host.docker.internal` connection-retry bug above before
+   adding the TCP hub on top of it.~~ Sidestepped rather than root-caused:
+   `litter-hub` cross-compiles as an ordinary `aarch64-unknown-linux-musl`
+   `std` binary with the *stable* toolchain (no `-Zbuild-std`, unlike `meow`
+   itself — it needs no special no_std treatment) and now runs **inside** the
+   same container as the agents it serves, reached over `127.0.0.1`. The bug
+   itself is still unconfirmed and still applies to anything that reaches
+   *out* of the container (Ollama on the host, still via the
+   `192.168.65.254` IP literal).
+2. ~~`docker-compose.yml` + a small round-loop entrypoint script~~ →
+   `swarm/run_litter.sh` (2026-09-19): one `sh` script, no `docker-compose`
+   needed since hub + all four agents now share one container. Starts
+   `litter-hub` in the background, then runs one `meow litter chase` round per
+   `swarm/personas/*.md`, sequentially (never in parallel — see the script's
+   own comment on `OLLAMA_MAX_LOADED_MODELS=2`), each against a different
+   Ollama model, ending with `meow litter observe`. One-liner:
+   ```bash
+   docker run --platform linux/arm64 --rm \
+     -v "$PWD/target/aarch64-unknown-linux-musl/release/meow:/bin/meow:ro" \
+     -v "$PWD/target/aarch64-unknown-linux-musl/release/litter-hub:/bin/litter-hub:ro" \
+     -v "$PWD/swarm/run_litter.sh:/run_litter.sh:ro" \
+     -v "$PWD/swarm/personas:/personas:ro" \
+     -v "/path/to/akuma:/akuma-src:ro" \
+     alpine:3.20 sh /run_litter.sh
+   ```
+   Not yet a *persistent* setup — the container is `--rm` and the hub dies
+   with it, so this is "run one debate and print the transcript," not
+   "stand up a litter you can keep sending tasks to." That's the natural next
+   half-step before item 7 below.
+3. ~~A second, genuinely different small model~~ → done implicitly:
+   `run_litter.sh` already points all four personas at four different Ollama
+   models (`qwen3:4b`, `gemma4-yolo-4b:latest`, `gemma4:e4b`, `qwen3.5:0.8b`)
+   rather than one model instantiated four times.
 4. A report-diff script: read both `/swarm/reports/*.md`, ask a model (or a
    human) to summarize agreement/disagreement — this is "read their report and
-   see where they disagreed" from the original ask.
-5. The TCP hub described above, replacing the filesystem mailbox; the hub is
-   also where election-timeout ticking naturally lives, since it's the one
-   long-running process in the picture (every meow invocation is one-shot).
+   see where they disagreed" from the original ask. `meow litter observe`
+   (above) covers "watch the transcript"; it does not yet summarize agreement.
+5. ~~The TCP hub described above, replacing the filesystem mailbox~~ — done
+   (see "Bootstrap" above); the hub is also where election-timeout ticking
+   naturally lives, since it's the one long-running process in the picture
+   (every meow invocation is one-shot) — not wired up yet.
 6. Per-agent keypairs + signed envelopes, then wire `election.rs` to the hub
    and add the root-override identity.
-7. A real control-plane dashboard once there's a transcript worth watching
+7. A persistent hub + a way to send it new tasks on demand (not just re-run
+   `run_litter.sh` from scratch) — the natural next step once someone wants
+   to keep a litter running and drop in work rather than run one fixed batch.
+8. A real control-plane dashboard once there's a transcript worth watching
    live rather than after the fact.
 8. Run agents under `herd` (Akuma's own service supervisor) so a reboot
    resumes the litter automatically instead of losing it — the mailbox
