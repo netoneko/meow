@@ -250,7 +250,26 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
     let layout = get_pane_layout();
     layout.term_width = w; layout.term_height = h; layout.recalculate(4);
     
-    akuma_write(fd::STDOUT, b"\x1b[>1u\x1b[?1049h");
+    // Kitty keyboard enhancement, save the terminal's *alternate scroll* setting,
+    // turn it off, then enter the alternate screen buffer.
+    //
+    // `?1007` (alternate scroll) is the terminal translating wheel events into
+    // **arrow keys** while an application is in the alternate screen. iTerm2 and
+    // Terminal.app enable it by default, and the effect is that scrolling the
+    // wheel up is byte-for-byte `\x1b[A` — indistinguishable from pressing Up,
+    // which this TUI binds to history recall. So a user reaching for the
+    // scrollback silently started editing their previous prompt instead.
+    //
+    // `?1007s` saves whatever the terminal had and `?1007r` on the way out
+    // restores it (XTSAVE/XTRESTORE), rather than assuming a default and handing
+    // the shell back a setting it did not start with.
+    //
+    // Deliberately NOT done instead: enabling mouse reporting (`?1000h`/`?1006h`)
+    // to receive the wheel as a distinct event. That works, but it makes the
+    // application grab the mouse, which breaks click-drag text selection in most
+    // terminals — a worse regression than the bug, for a pane this TUI cannot
+    // scroll anyway (see the note on `set_scroll_region`).
+    akuma_write(fd::STDOUT, b"\x1b[>1u\x1b[?1007s\x1b[?1007l\x1b[?1049h");
     clear_screen();
     layout.set_scroll_region();
     render::print_greeting();
@@ -325,7 +344,10 @@ pub fn run_tui(model: &mut String, provider: &mut Provider, config: &mut Config,
     // Exit kitty keyboard enhancement, then exit alternate screen buffer.
     // Alternate screen exit restores the previous terminal content automatically,
     // so we must NOT clear_screen() after this.
-    akuma_write(fd::STDOUT, b"\x1b[<u\x1b[?1049l");
+    // Exit kitty keyboard enhancement, exit the alternate screen, then restore
+    // the alternate-scroll setting we saved on the way in (`?1007r`) — after the
+    // alt-screen exit, so the restored setting applies to the shell's screen.
+    akuma_write(fd::STDOUT, b"\x1b[<u\x1b[?1049l\x1b[?1007r");
     set_terminal_attributes(fd::STDIN as u64, 0, old_mode);
     show_cursor();
     Ok(())

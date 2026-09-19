@@ -52,3 +52,15 @@ libakuma-tls = { path = "../libakuma-tls" }
 # needed for chat-API/tool-call JSON, and float-skip steps over one rather
 # than failing the whole document.
 picojson = { version = "0.2", default-features = false, features = ["int64", "float-skip"] }
+
+# meow is its own workspace root (`[workspace]` at the top), so it does NOT
+# inherit `userspace/Cargo.toml`'s `[patch.crates-io]` even though it depends on
+# `libakuma-tls` by path. Without this line meow builds the shipped TLS stack
+# against unpatched `embedded-tls` from the registry, and every HTTPS request to
+# a host whose `supported_groups` hint contains an unknown code point — such as
+# `api.z.ai` — fails with `TlsError::DecodeError`. Keep this rev identical to the
+# one in `userspace/Cargo.toml`; two different revs is worse than one wrong one,
+# because the two binaries would then disagree about TLS.
+# `docs/archive/AMD64_TRASHCAN_ISSUES.md` §5.2.
+[patch.crates-io]
+embedded-tls = { git = "https://github.com/netoneko/embedded-tls", rev = "6721038ba5874587b432fd82011168e85fa166b5" }

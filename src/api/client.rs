@@ -186,7 +186,25 @@ fn send_with_retry_inner(
     {
         let mut buf_data = [0u8; 256];
         let mut buf = StackBuffer::new(&mut buf_data);
-        let _ = write!(buf, "POST {}{}", provider.base_url, path);
+        // Scheme + host + path, NOT `base_url + path`: `path` already contains
+        // the base URL's path component (`build_request_path` derives it from
+        // `provider.base_path()`), so concatenating the two printed the path
+        // twice — e.g.
+        // `https://api.z.ai/api/coding/paas/v4/api/coding/paas/v4/chat/completions`
+        // for a perfectly correct request. Display-only, but the one line whose
+        // whole job is to tell you where the request went is the worst place to
+        // be wrong: it reads as a URL-building bug that isn't there.
+        let scheme = if provider.is_https() { "https://" } else { "http://" };
+        match provider.host_port() {
+            Some((h, _)) => {
+                let _ = write!(buf, "POST {}{}{}", scheme, h, path);
+            }
+            // Keep the raw value visible rather than printing nothing: an
+            // unparseable base_url is itself worth seeing here.
+            None => {
+                let _ = write!(buf, "POST <unparseable base_url: {}>", provider.base_url);
+            }
+        }
         debug_print(buf.as_str());
     }
 

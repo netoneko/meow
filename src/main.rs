@@ -225,7 +225,15 @@ pub extern "C" fn main() {
         }
     }
 
-    if use_tui || one_shot_message.is_none() {
+    // `use_tui` alone, NOT `use_tui || one_shot_message.is_none()`.
+    //
+    // That `||` made `--no-tui` silently ineffective: without `-c` the
+    // `is_none()` arm was true, so the flag was accepted, ignored, and the full
+    // TUI started anyway — alternate screen, scroll region and all. A flag that
+    // reports nothing and does nothing is worse than one that errors. The
+    // `else` arms below now cover both remaining cases: a one-shot message, or
+    // an interactive line-mode session.
+    if use_tui {
         let session_id = app::session::generate_session_id();
         let mut conversation = Conversation::new_session(session_id);
         conversation.append(&Message::new("system", &system_prompt));
@@ -315,7 +323,127 @@ pub extern "C" fn main() {
         };
     }
 
+    // Interactive, line-mode: `meow --no-tui` with no `-c`.
+    //
+    // This is what makes the terminal's own scrollback work. The TUI cannot
+    // scroll back at all — it runs in the alternate screen (no scrollback by
+    // definition) and paints the transcript inside a DECSTBM scroll region,
+    // and lines scrolled out of a region are *discarded* rather than kept. Here
+    // there is no alternate screen, no scroll region and no raw mode, so output
+    // is ordinary terminal output: scrollback, mouse-wheel scrolling and
+    // click-drag selection are the terminal's job and all simply work.
+    //
+    // It is also the quiet mode. The terminal does the line editing, so meow
+    // writes nothing per keystroke and repaints nothing — which matters on this
+    // kernel well beyond tidiness: every syscall takes the BKL at entry on
+    // amd64 (`amd64/src/usermode.rs`, no per-syscall opt-out), the console is a
+    // framebuffer, and the netpoll daemon contends for that same lock, so
+    // console traffic measurably costs receive latency.
+    // `docs/archive/AMD64_TRASHCAN_ISSUES.md` §5.5.
+    interactive_line_mode(
+        &model,
+        &current_provider,
+        &app_config,
+        &system_prompt,
+        no_personality,
+    );
     exit(0);
+}
+
+/// Read one line from stdin, stripping the newline. `None` at EOF (Ctrl-D).
+///
+/// No raw mode and no escape parsing: stdin is left in its normal line
+/// discipline, so the kernel returns a whole line on Enter and handles echo and
+/// backspace itself. That is the entire reason this mode is quiet.
+fn read_line_stdin() -> Option<String> {
+    let mut line = String::new();
+    let mut buf = [0u8; 256];
+    loop {
+        let n = libakuma::read(libakuma::fd::STDIN, &mut buf);
+        if n <= 0 {
+            // EOF with nothing buffered is Ctrl-D on an empty prompt; EOF with a
+            // partial line still yields that line.
+            return if line.is_empty() { None } else { Some(line) };
+        }
+        let chunk = &buf[..n as usize];
+        for &b in chunk {
+            if b == b'\n' || b == b'\r' {
+                return Some(line);
+            }
+            // Cooked mode has already applied backspace, but a terminal that
+            // sends DEL through anyway should not leave a stray glyph.
+            if b == 0x7F {
+                line.pop();
+            } else if b >= 0x20 || b == b'\t' {
+                line.push(b as char);
+            }
+        }
+        // A read that filled the buffer without a newline: keep going.
+        if (n as usize) < buf.len() {
+            // Short read with no newline seen — a terminal in line mode should
+            // not do this, but returning what we have beats blocking forever.
+            return Some(line);
+        }
+    }
+}
+
+/// The `--no-tui` interactive loop: read a line, answer it, repeat.
+fn interactive_line_mode(
+    model: &str,
+    provider: &Provider,
+    app_config: &Config,
+    system_prompt: &str,
+    no_personality: bool,
+) {
+    let session_id = app::session::generate_session_id();
+    let mut conversation = Conversation::new_session(session_id.clone());
+    conversation.append(&Message::new("system", system_prompt));
+
+    let initial_cwd = tools::get_working_dir();
+    let sandbox_root = tools::get_sandbox_root();
+    let cwd_context = if sandbox_root == "/" {
+        format!(
+            "[System Context] Current working directory: {}\nNo sandbox restrictions.",
+            initial_cwd
+        )
+    } else {
+        format!(
+            "[System Context] Current working directory: {}\nSandbox root: {} - use relative paths.",
+            initial_cwd, sandbox_root
+        )
+    };
+    conversation.append(&Message::new("user", &cwd_context));
+
+    let persona = get_active_personality(app_config, no_personality);
+    conversation.append(&Message::new("assistant", persona.ack_tui));
+
+    libakuma::print(&format!(
+        "meow (line mode) - session {}\nBlank line or Ctrl-D to quit. Terminal scrollback works here.\n\n",
+        session_id
+    ));
+
+    loop {
+        libakuma::print("> ");
+        let line = match read_line_stdin() {
+            Some(l) => l,
+            None => break,
+        };
+        let msg = line.trim();
+        if msg.is_empty() {
+            break;
+        }
+        if msg == "/quit" || msg == "/exit" {
+            break;
+        }
+        match app::chat_once(model, provider, msg, &mut conversation, None, system_prompt) {
+            Ok(_) => libakuma::print("\n\n"),
+            Err(e) => {
+                let err_msg = persona.error_format.replace("{}", e);
+                libakuma::print(&err_msg);
+                libakuma::print("\n");
+            }
+        }
+    }
 }
 
 fn get_active_personality(config: &Config, no_personality: bool) -> &'static crate::config::Personality {
@@ -361,7 +489,7 @@ fn load_local_prompt() -> Option<String> {
 
 fn print_usage() {
     libakuma::print(
-        "meow - AI assistant\n\nUsage:\n  meow                        Interactive TUI mode (default)\n  meow -c \"message\"           Non-interactive: send message and exit\n  meow init                   Configure providers\n  meow test                   Run built-in tests\n\nOptions:\n  -c, --command <MSG>     Non-interactive: send MSG and print response to stdout\n  -m, --model <NAME>      Override the active model\n  -p, --provider <NAME>   Override the active provider\n  -P, --personality <NAM> Switch persona (default: Meow)\n  -N, --no-personality    Disable the persona; use a neutral assistant prompt\n  --tui                   Force interactive TUI mode\n  --no-tui                Force non-interactive mode (no repainting)\n  --debug                 Log connection and HTTP details (non-TUI only)\n  -h, --help              Show this help\n\nNon-interactive mode (-c) prints streaming output directly to stdout with\nANSI color codes but without cursor repositioning or the 3-pane layout.\nSuitable for scripting, pipes, and low-memory environments.\n\nInteractive Commands (TUI mode):\n  /clear              Wipe memory banks\n  /session            Describe the current session\n  /new                Start a new session\n  /model [NAME]       Check/switch/list models\n  /provider [NAME]    Check/switch providers\n  /personality [NAME] Check/switch personality\n  /tokens             Show current token usage\n  /help               Command list\n  /quit               Quit\n",
+        "meow - AI assistant\n\nUsage:\n  meow                        Interactive TUI mode (default)\n  meow -c \"message\"           Non-interactive: send message and exit\n  meow init                   Configure providers\n  meow test                   Run built-in tests\n\nOptions:\n  -c, --command <MSG>     Non-interactive: send MSG and print response to stdout\n  -m, --model <NAME>      Override the active model\n  -p, --provider <NAME>   Override the active provider\n  -P, --personality <NAM> Switch persona (default: Meow)\n  -N, --no-personality    Disable the persona; use a neutral assistant prompt\n  --tui                   Force interactive TUI mode\n  --no-tui                Line mode: no alt screen, no repainting, so the\n                          terminal's own scrollback and selection work\n  --debug                 Log connection and HTTP details (non-TUI only)\n  -h, --help              Show this help\n\nNon-interactive mode (-c) prints streaming output directly to stdout with\nANSI color codes but without cursor repositioning or the 3-pane layout.\nSuitable for scripting, pipes, and low-memory environments.\n\n--no-tui without -c is an interactive line-mode session: one prompt per\nline, no alternate screen and no scroll region, so scrolling back is the\nterminal's job and works normally. Use it when you want scrollback, text\nselection, or the least possible console traffic.\n\nInteractive Commands (TUI mode):\n  /clear              Wipe memory banks\n  /session            Describe the current session\n  /new                Start a new session\n  /model [NAME]       Check/switch/list models\n  /provider [NAME]    Check/switch providers\n  /personality [NAME] Check/switch personality\n  /tokens             Show current token usage\n  /help               Command list\n  /quit               Quit\n",
     );
 }
 
