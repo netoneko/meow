@@ -197,6 +197,11 @@ pub struct Config {
     /// instead — the hub is opt-in, not a replacement, so an install with no
     /// hub configured keeps working exactly as before.
     pub litter_hub_addr: Option<String>,
+    /// Static peers the raft thread probes on its tick — `name@host:port`
+    /// entries (comma-separated) for agents on other hosts (the
+    /// trashcan/laptop split). First answer registers the peer with a
+    /// discovered event; silence after being online raises a lost event.
+    pub litter_static_peers: Option<String>,
 }
 
 impl Default for Config {
@@ -210,6 +215,7 @@ impl Default for Config {
             render_markdown: false,
             litter_agent_name: None,
             litter_hub_addr: None,
+            litter_static_peers: None,
         }
     }
 }
@@ -317,6 +323,7 @@ impl Config {
             render_markdown: true,
             litter_agent_name: None,
             litter_hub_addr: None,
+            litter_static_peers: None,
         };
 
         let mut current_provider: Option<Provider> = None;
@@ -374,6 +381,11 @@ impl Config {
                         "litter_agent_name" => {
                             if !value.is_empty() {
                                 config.litter_agent_name = Some(String::from(value));
+                            }
+                        }
+                        "litter_static_peers" => {
+                            if !value.is_empty() {
+                                config.litter_static_peers = Some(String::from(value));
                             }
                         }
                         "litter_hub_addr" => {
@@ -453,6 +465,11 @@ impl Config {
             content.push('\n');
         }
 
+        if let Some(ref peers) = self.litter_static_peers {
+            content.push_str("litter_static_peers=");
+            content.push_str(peers);
+            content.push('\n');
+        }
         if let Some(ref addr) = self.litter_hub_addr {
             content.push_str("litter_hub_addr=");
             content.push_str(addr);

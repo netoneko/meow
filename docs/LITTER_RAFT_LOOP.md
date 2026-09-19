@@ -171,6 +171,29 @@ connection:
   (`RequestVote`/`VoteResponse` through the relay) is the term-safety
   layer on top, driven entirely by raft threads.
 
+## Future work (noted, not built)
+
+- **Task tracking as a Raft log.** The in-memory task table maps naturally
+  onto the raft protocol: tasks as appended log entries, assignment/lease
+  renewal/requeue/completion as entries too — then the table replicates to
+  followers for free and survives leadership changes the way raft state
+  does, instead of dying with the leader's process. Same shape for the
+  cluster event log.
+- **Self-issued tasks.** An agent should be able to assign a task to
+  itself — write it into its own table (or a local equivalent) with the
+  same lease/`[done]` bookkeeping — without messaging anyone. Self-directed
+  work with the same accountability as swarm-assigned work; nothing in the
+  table's design assumes the issuer is another agent.
+- **Signed envelopes + the embedded root key.** `litter-raft`'s
+  `is_authorized(sender, root)` already implements the root override but
+  `sender` is still an unauthenticated string. Plan: every `Send`/`Join`
+  carries a signature over the frame (ed25519 via `userspace/akuma-ssh-crypto`,
+  no new dependency class); the operator's trusted key is the same one
+  `sshd`'s `authorized_keys` already holds (`userspace/sshd/src/keys.rs`) —
+  it IS the root identity, so `root`-role messages are verifiable, not
+  claimable. Until then the root role is goodwill plus the hub stamping
+  it at delivery.
+
 ## An agent turn: the tool calls
 
 Woken by inbox growth, the agent runs one `chat_once` turn — persona

@@ -1,142 +1,184 @@
-//! Task memory with lease semantics — the coordinator's shared, on-disk task
-//! table (see `live`). One file per task under `/litter/tasks/<id>.task`:
+//! The litter's task table — in-memory, coordinator-owned (see
+//! `docs/LITTER_STATE_MACHINE.md`). Tasks enter as ordinary messages whose
+//! body starts with `[task]` (operator or peer — the table doesn't care);
+//! completion is a `[done: <id>]` reply from the assigned holder. The
+//! coordinator's tick assigns pending tasks round-robin across the roster
+//! with a lease (`holder`/`until`), requeues expired leases, and turns
+//! completions into cluster events. Everything here is a pure state
+//! transition so the whole table is unit-testable with no socket and no
+//! clock — `now` is always a parameter.
 //!
-//!     holder: sherlock      (or `-` while unassigned)
-//!     until: 1730000000000  (lease expiry, µs; `0` = no lease)
-//!     ---
-//!     the actual task text
-//!
-//! This file table IS the replicated task state: it lives outside any
-//! process, so a leadership takeover (or an operator inspecting the yard)
-//! sees the exact same queue the old leader saw — pending tasks stay
-//! pending, and leases whose worker died simply expire and get requeued.
-//!
-//! Completion protocol: the assigned agent writes `<id>.done` (its result
-//! summary) with its ordinary FileWrite tool. The coordinator compacts each
-//! done pair into `snapshot.log` and deletes both files, so the queue never
-//! grows unbounded and a (re)joining agent streams one compact snapshot
-//! instead of the full history.
+//! Deliberately NOT persisted: the table is leader memory. If the leader
+//! dies mid-queue, unfinished tasks are re-posted by whoever remembers
+//! them; continuity of *knowledge* is the protocol history's job (the
+//! compaction marker carries the folded `[done]` summaries).
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libakuma::{open, close, read_fd, fstat, open_flags, read_dir};
-
-/// How long an assignment may go without the task being finished. Generous
-/// on purpose (an LLM turn can take minutes): a lease that expires while the
-/// worker is alive just means the same task gets re-offered later — assume
-/// good will, accept duplicate work on the margin.
+/// How long an assignment may go without a `[done: <id>]` reply. Generous
+/// on purpose (an LLM turn can take minutes): an expired lease just means
+/// the task is re-offered — assume good will, accept duplicate work on the
+/// margin.
 pub const LEASE_US: u64 = 900 * 1_000_000;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Task {
-    /// File stem — the task id used in messages and the `.done` marker.
-    pub id: String,
+    pub id: u64,
     pub holder: Option<String>,
-    /// Lease expiry in µs since the epoch; `0` = unassigned/unleased.
+    /// Lease expiry (µs since the epoch); 0 = unassigned.
     pub until: u64,
     pub body: String,
 }
 
-pub fn parse(id: &str, text: &str) -> Option<Task> {
-    // Canonical form first; an operator-dropped bare text file (yard.sh
-    // task) is a pending task with no header.
-    let text = text.strip_prefix("\u{feff}").unwrap_or(text);
-    if let Some(rest) = text.strip_prefix("holder: ") {
-        let mut lines = rest.splitn(3, '\n');
-        let holder_line = lines.next()?;
-        let until_line = lines.next()?;
-        let body = lines.next()?;
-        let holder = holder_line.trim();
-        let until = until_line.trim().strip_prefix("until: ")?.trim();
-        return Some(Task {
-            id: String::from(id),
-            holder: if holder == "-" { None } else { Some(String::from(holder)) },
-            until: until.parse::<u64>().unwrap_or(0),
-            body: String::from(body),
-        });
+impl Task {
+    pub fn is_leased(&self, now_us: u64) -> bool {
+        self.holder.is_some() && self.until > now_us
     }
-    Some(Task { id: String::from(id), holder: None, until: 0, body: String::from(text) })
+
+    /// The message an agent receives when this task is assigned to it.
+    pub fn assignment_message(&self) -> String {
+        format!(
+            "[assigned: t{}] {}\
+             \nReply with a message starting `[done: t{}]` when finished.",
+            self.id, self.body, self.id
+        )
+    }
 }
 
-pub fn serialize(task: &Task) -> String {
-    let holder = task.holder.as_deref().unwrap_or("-");
-    format!("holder: {}\nuntil: {}\n---\n{}", holder, task.until, task.body)
+/// One cluster event worth telling every agent about, plus the table's
+/// own bookkeeping. `TaskEvent`s are appended to the hub's event log by
+/// the caller (they belong to the shared feed, not to this table).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableEvent {
+    /// "[event] task t3 assigned to sherlock"
+    Noted,
+    /// "[event] task t3 requeued (lease expired)"
+    Requeued,
+    /// ("[event] task t3 done by hercules: <summary>", summary)
+    Done(String, String),
 }
 
-pub fn is_leased(task: &Task, now_us: u64) -> bool {
-    task.holder.is_some() && task.until > now_us
+pub struct TaskTable {
+    next_id: u64,
+    tasks: Vec<Task>,
 }
 
-/// Everything the coordinator needs from one `read_dir` of the task table:
-/// live tasks (parsed), plus the ids whose `.done` marker exists.
-pub fn scan(dir: &str, now_us: u64) -> (Vec<Task>, Vec<String>) {
-    let mut tasks = Vec::new();
-    let mut done = Vec::new();
-    let entries = match read_dir(dir) {
-        Some(e) => e,
-        None => return (tasks, done),
-    };
-    for entry in entries {
-        if entry.is_dir {
-            continue;
+impl TaskTable {
+    pub fn new() -> Self {
+        Self { next_id: 1, tasks: Vec::new() }
+    }
+
+    pub fn tasks(&self) -> &[Task] {
+        &self.tasks
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    /// Feed one inbound message through the table. `[task] …` opens a task;
+    /// `[done: tN] …` from the task's holder closes it. Everything else is
+    /// ignored. `now_us` stamps new tasks' unassigned state.
+    /// `can_open=false` demotes `[task]` bodies to ordinary chat (peer
+    /// role); `[done: tN]` closes are accepted from the holder regardless.
+    pub fn note_message(&mut self, from: &str, body: &str, now_us: u64, can_open: bool) -> TableEvent {
+        if let Some(rest) = body.trim().strip_prefix("[task]") {
+            if !can_open {
+                return TableEvent::Noted;
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            self.tasks.push(Task {
+                id,
+                holder: None,
+                until: 0,
+                body: String::from(rest.trim()),
+            });
+            let _ = (from, now_us);
+            return TableEvent::Noted;
         }
-        if let Some(id) = entry.name.strip_suffix(".task") {
-            if let Some(text) = read_small_file(&format!("{}/{}", dir, entry.name)) {
-                if let Some(t) = parse(id, &text) {
-                    tasks.push(t);
+        if let Some(rest) = body.trim().strip_prefix("[done:") {
+            let mut parts = rest.splitn(2, ']');
+            let id_part = parts.next().unwrap_or("").trim();
+            let summary = parts.next().unwrap_or("").trim();
+            let id: u64 = match id_part.trim_start_matches('t').parse() {
+                Ok(v) => v,
+                Err(_) => return TableEvent::Noted, // not a well-formed done — ignore
+            };
+            if let Some(pos) = self.tasks.iter().position(|t| t.id == id) {
+                let task = &self.tasks[pos];
+                if task.holder.as_deref() != Some(from) {
+                    // Only the holder can close a task — goodwill plus a
+                    // little bookkeeping discipline.
+                    return TableEvent::Noted;
+                }
+                self.tasks.remove(pos);
+                return TableEvent::Done(
+                    format!("[event] task t{} done by {}: {}", id, from, summary),
+                    String::from(summary),
+                );
+            }
+        }
+        TableEvent::Noted
+    }
+
+    /// One coordinator tick: assign unassigned tasks round-robin over
+    /// `roster`, requeue expired leases, and return (recipient, body)
+    /// messages to deliver plus event-log lines. Idempotent when nothing
+    /// needs doing.
+    pub fn tick(&mut self, roster: &[String], now_us: u64) -> (Vec<(String, String)>, Vec<String>) {
+        let mut messages = Vec::new();
+        let mut events = Vec::new();
+
+        // Requeue expired leases first so they compete for assignment in
+        // the same pass.
+        for t in self.tasks.iter_mut() {
+            if t.holder.is_some() && !t.is_leased(now_us) {
+                events.push(format!("[event] task t{} requeued (lease expired)", t.id));
+                t.holder = None;
+                t.until = 0;
+            }
+        }
+
+        if roster.is_empty() {
+            return (messages, events);
+        }
+
+        // Live load per roster member, computed once: assignment picks the
+        // least-loaded agent, ties broken round-robin, so one busy agent
+        // never accumulates while an idle one starves.
+        let loads: Vec<usize> = roster
+            .iter()
+            .map(|name| {
+                self.tasks
+                    .iter()
+                    .filter(|t| t.holder.as_deref() == Some(name.as_str()) && t.is_leased(now_us))
+                    .count()
+            })
+            .collect();
+        let mut next = 0usize;
+        for t in self.tasks.iter_mut() {
+            if t.holder.is_some() {
+                continue;
+            }
+            let mut best = 0usize;
+            for i in 1..roster.len() {
+                if loads[i] < loads[best] || (loads[i] == loads[best] && i == next) {
+                    best = i;
                 }
             }
-        } else if let Some(id) = entry.name.strip_suffix(".done") {
-            done.push(String::from(id));
+            let holder = roster[best].clone();
+            t.holder = Some(holder.clone());
+            t.until = now_us + LEASE_US;
+            events.push(format!("[event] task t{} assigned to {}", t.id, holder));
+            messages.push((holder, t.assignment_message()));
+            next = (next + 1) % roster.len();
         }
-    }
-    tasks.sort_by(|a, b| a.id.cmp(&b.id));
-    done.sort();
-    let _ = now_us;
-    (tasks, done)
-}
 
-/// Compact one completed task into a snapshot line — the whole history a
-/// (re)joining agent needs, not the full transcript.
-pub fn snapshot_line(id: &str, summary: &str) -> String {
-    let mut line = String::from(summary.trim());
-    if line.len() > 160 {
-        let mut cut = 160;
-        while !line.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        line.truncate(cut);
-        line.push('…');
+        (messages, events)
     }
-    format!("[done: {}] {}\n", id, line)
-}
-
-fn read_small_file(path: &str) -> Option<String> {
-    let fd = open(path, open_flags::O_RDONLY);
-    if fd < 0 {
-        return None;
-    }
-    let stat = match fstat(fd) {
-        Ok(s) => s,
-        Err(_) => {
-            close(fd);
-            return None;
-        }
-    };
-    let size = stat.st_size as usize;
-    if size == 0 || size > 32 * 1024 {
-        close(fd);
-        return None;
-    }
-    let mut buf = alloc::vec![0u8; size];
-    let n = read_fd(fd, &mut buf);
-    close(fd);
-    if n <= 0 {
-        return None;
-    }
-    String::from_utf8(buf[..n as usize].to_vec()).ok()
 }
 
 #[cfg(feature = "tests")]
@@ -145,39 +187,69 @@ pub fn run_tests() -> i32 {
     let mut total = 0usize;
     libakuma::print("--- litter tasks tests ---\n");
 
-    // canonical file round-trip
+    // [task] opens, tick assigns, [done: tN] closes — full life cycle
     total += 1;
     {
-        let t = Task { id: String::from("t1"), holder: Some(String::from("sherlock")), until: 42, body: String::from("audit main.rs") };
-        let back = parse("t1", &serialize(&t));
-        let ok = matches!(&back, Some(b) if *b == t);
-        if ok { passed += 1; } else { libakuma::print(&format!("  [!] round-trip: {:?}\n", back)); }
+        let mut table = TaskTable::new();
+        let roster = [String::from("sherlock"), String::from("hercules")];
+        match table.note_message("root", "[task] audit main.rs", 100, true) {
+            TableEvent::Noted => {}
+            _ => libakuma::print("  [!] [task] should only note\n"),
+        }
+        let (msgs, events) = table.tick(&roster, 100);
+        let assigned_ok = msgs.len() == 1 && msgs[0].0 == "sherlock" && msgs[0].1.contains("[assigned: t1]") && msgs[0].1.contains("audit main.rs");
+        let event_ok = events.iter().any(|e| e.contains("t1 assigned to sherlock"));
+        let done = table.note_message("sherlock", "[done: t1] found 3 issues", 200, true);
+        let done_ok = matches!(done, TableEvent::Done(ref e, ref s) if e.contains("t1 done by sherlock") && s == "found 3 issues");
+        if assigned_ok && event_ok && done_ok && table.is_empty() {
+            passed += 1;
+        } else {
+            libakuma::print(&format!("  [!] lifecycle: assigned_ok={} event_ok={} done_ok={}\n", assigned_ok, event_ok, done_ok));
+        }
     }
 
-    // operator-dropped bare text parses as an unassigned pending task
+    // expired lease requeues and reassigns
     total += 1;
     {
-        let t = parse("t2", "just do the thing\nwith two lines");
-        let ok = matches!(&t, Some(b) if b.holder.is_none() && b.until == 0 && b.body.contains("two lines"));
-        if ok { passed += 1; } else { libakuma::print(&format!("  [!] bare text: {:?}\n", t)); }
+        let mut table = TaskTable::new();
+        let roster = [String::from("sherlock")];
+        table.note_message("root", "[task] slow job", 100, true);
+        table.tick(&roster, 100);
+        let (msgs, events) = table.tick(&roster, 100 + LEASE_US + 1);
+        let requeued = events.iter().any(|e| e.contains("requeued"));
+        let reassigned = msgs.len() == 1 && msgs[0].0 == "sherlock" && msgs[0].1.contains("[assigned: t1]");
+        if requeued && reassigned { passed += 1; }
+        else { libakuma::print(&format!("  [!] requeue: requeued={} reassigned={}\n", requeued, reassigned)); }
     }
 
-    // lease expiry arithmetic
+    // only the holder can close a task
     total += 1;
     {
-        let leased = Task { id: String::from("t"), holder: Some(String::from("a")), until: 100, body: String::new() };
-        let expired = Task { id: String::from("t"), holder: Some(String::from("a")), until: 50, body: String::new() };
-        let unassigned = Task { id: String::from("t"), holder: None, until: 100, body: String::new() };
-        if is_leased(&leased, 99) && !is_leased(&expired, 50) && !is_leased(&unassigned, 1) { passed += 1; }
-        else { libakuma::print("  [!] lease expiry logic wrong\n"); }
+        let mut table = TaskTable::new();
+        let roster = [String::from("sherlock")];
+        table.note_message("root", "[task] secret", 100, true);
+        table.tick(&roster, 100);
+        match table.note_message("hercules", "[done: t1] i did nothing", 150, true) {
+            TableEvent::Noted | TableEvent::Requeued => {}
+            TableEvent::Done(..) => libakuma::print("  [!] non-holder closed a task\n"),
+        }
+        match table.note_message("sherlock", "[done: t1] all clear", 160, true) {
+            TableEvent::Done(..) => passed += 1,
+            other => libakuma::print(&format!("  [!] holder's done was not applied: {:?}\n", other)),
+        }
     }
 
-    // snapshot lines are bounded and newline-terminated
+    // load balancing: with two agents and two tasks, both get one
     total += 1;
     {
-        let long = snapshot_line("t3", &"x".repeat(400));
-        if long.starts_with("[done: t3] ") && long.ends_with("…\n") && long.len() < 200 { passed += 1; }
-        else { libakuma::print(&format!("  [!] snapshot_line: {}\n", long)); }
+        let mut table = TaskTable::new();
+        let roster = [String::from("a"), String::from("b")];
+        table.note_message("root", "[task] one", 10, true);
+        table.note_message("root", "[task] two", 10, true);
+        let (msgs, _) = table.tick(&roster, 10);
+        let holders: Vec<&str> = msgs.iter().map(|(to, _)| to.as_str()).collect();
+        if holders.contains(&"a") && holders.contains(&"b") { passed += 1; }
+        else { libakuma::print(&format!("  [!] balance: {:?}\n", holders)); }
     }
 
     libakuma::print(&format!("  result: {}/{}\n", passed, total));

@@ -14,6 +14,8 @@ mod config;
 mod json;
 #[cfg(feature = "linux-net")]
 mod linux_net;
+#[cfg(feature = "litter")]
+mod rt;
 mod tools;
 mod tui_app;
 mod ui;
@@ -45,6 +47,8 @@ pub extern "C" fn main() {
     }
     #[cfg(feature = "litter")]
     tools::litter::hub::set_hub_addr(app_config.litter_hub_addr.clone());
+    #[cfg(feature = "litter")]
+    tools::litter::set_static_peers_spec(app_config.litter_static_peers.clone());
     // Bootstrap: a hub-backed litter member joins the hub's roster as part of
     // its own startup, every invocation — see `tools::litter::hub::bootstrap`.
     // Filesystem-mode litter (no `litter_hub_addr`) needs no equivalent step:
@@ -585,6 +589,8 @@ fn run_all_tests() -> i32 {
     { failures += tools::litter::run_tests(); }
     #[cfg(feature = "litter")]
     { failures += tools::litter::raft::run_tests(); }
+    #[cfg(feature = "litter")]
+    { failures += crate::rt::run_tests(); }
     if failures == 0 {
         libakuma::print("=== All tests passed ===\n");
     } else {
@@ -653,13 +659,18 @@ fn run_litter_send() -> i32 {
 /// required — this is the operator watching the litter, not a litter member.
 #[cfg(feature = "litter")]
 fn run_litter_observe() -> i32 {
+    use litter_wire::Response;
     use tools::litter::observe::Entry;
 
     let mut entries: Vec<Entry> = Vec::new();
 
     if let Some(addr) = tools::litter::hub::hub_addr() {
-        let names = match tools::litter::hub::peers(&addr) {
-            Ok(names) => names,
+        let names = match tools::litter::hub::peers(&addr, 0) {
+            Ok(Response::Peers { names, .. }) => names,
+            Ok(_) => {
+                libakuma::print("observe: hub returned an unexpected response to 'peers'\n");
+                return 1;
+            }
             Err(e) => {
                 libakuma::print(&format!("observe: failed to list peers: {}\n", e));
                 return 1;
@@ -678,17 +689,13 @@ fn run_litter_observe() -> i32 {
             }
         }
         // Group fan-out (a Send addressed to `litter` lands in every
-        // member's inbox — see `serve::GROUP_NAME`) means one message exists
-        // several times; the transcript shows each distinct message once.
+        // member's inbox — see `serve::GROUP_NAME`) means one message
+        // exists several times; the transcript shows each distinct message
+        // once. Compaction markers are bookkeeping, not conversation —
+        // skip them.
         if !entries.is_empty() {
             entries.sort_by(|a, b| (&a.from, a.round, &a.body).cmp(&(&b.from, b.round, &b.body)));
             entries.dedup_by(|a, b| a.from == b.from && a.round == b.round && a.body == b.body);
-        }
-    } else {
-        for name in tools::litter::list_inbox_participants() {
-            for m in tools::litter::read_inbox_messages(&name) {
-                entries.push(Entry { from: m.from, round: m.round, body: m.body });
-            }
         }
     }
 

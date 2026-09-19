@@ -14,11 +14,11 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use libakuma::net::TcpStream;
 
-use litter_wire::{decode_len_header, decode_response, encode_len_header, encode_request, Message, Request, Response, MAX_FRAME_LEN};
+use litter_wire::{decode_len_header, decode_response, encode_len_header, encode_request, encode_response, Message, Request, Response, MAX_FRAME_LEN};
 
 use crate::tools::mod_types::ToolResult;
 
@@ -27,10 +27,42 @@ static HUB_ADDR_INIT: AtomicBool = AtomicBool::new(false);
 // same pattern as `tools::litter::AGENT_NAME`.
 static mut HUB_ADDR: Option<String> = None;
 
+/// Liveness bookkeeping for the WAYWARD state (`docs/LITTER_STATE_MACHINE.md`):
+/// every successful hub round trip refreshes `LAST_ALIVE_US`; the agent loop
+/// records a probe failure by *not* refreshing it. When `now - LAST_ALIVE`
+/// passes `WAYWARD_TIMEOUT_US`, the tool wrappers fail fast instead of
+/// letting the LLM's SendMessage hang forever in an undrained backlog.
+static LAST_ALIVE_US: AtomicU64 = AtomicU64::new(0);
+static LAST_ALIVE_INIT: AtomicBool = AtomicBool::new(false);
+pub const WAYWARD_TIMEOUT_US: u64 = 15 * 1_000_000;
+
 /// Called once at startup from `Config::litter_hub_addr`.
 pub fn set_hub_addr(addr: Option<String>) {
     unsafe { *core::ptr::addr_of_mut!(HUB_ADDR) = addr; }
     HUB_ADDR_INIT.store(true, Ordering::Release);
+    // Optimistically assume alive until the first probe proves otherwise —
+    // a freshly started agent shouldn't refuse tools for 15s of stale-zero.
+    mark_alive();
+}
+
+pub fn mark_alive() {
+    LAST_ALIVE_US.store(crate::util::now_us(), Ordering::Release);
+    LAST_ALIVE_INIT.store(true, Ordering::Release);
+}
+
+/// True when the hub has been silent past `WAYWARD_TIMEOUT_US`. The leader
+/// (in-process state) never consults this — it can't be wayward about
+/// itself.
+pub fn unresponsive() -> bool {
+    if !LAST_ALIVE_INIT.load(Ordering::Acquire) {
+        return false;
+    }
+    crate::util::now_us().saturating_sub(LAST_ALIVE_US.load(Ordering::Acquire)) > WAYWARD_TIMEOUT_US
+}
+
+/// Seconds since the hub was last heard from — for fail-fast error text.
+pub fn silent_for_secs() -> u64 {
+    crate::util::now_us().saturating_sub(LAST_ALIVE_US.load(Ordering::Acquire)) / 1_000_000
 }
 
 /// `None` until `set_hub_addr` has run, then whatever it was set to
@@ -46,26 +78,43 @@ pub fn hub_addr() -> Option<String> {
 }
 
 fn call(addr: &str, req: &Request) -> Result<Response, String> {
+    call_addr(addr, req)
+}
+
+/// One request/response round trip to an explicit address — the pulse's
+/// static-peer probing targets peers other than the configured hub, so
+/// the address can't always come from config. Deadline-bounded at BOTH
+/// ends: a hub that accepts but never answers costs this client 5s, not
+/// forever, so the tick loop stays alive long enough to go WAYWARD and
+/// re-elect (docs/LITTER_STATE_MACHINE.md).
+pub fn call_addr(addr: &str, req: &Request) -> Result<Response, String> {
     let stream = TcpStream::connect(addr).map_err(|e| format!("hub connect to '{}' failed: {:?}", addr, e.kind()))?;
+    let _ = libakuma::set_nonblocking(stream.as_raw_fd(), true);
 
     let payload = encode_request(req);
-    let mut framed = Vec::with_capacity(4 + payload.len());
-    framed.extend_from_slice(&encode_len_header(payload.len() as u32));
-    framed.extend_from_slice(payload.as_bytes());
-    stream.write_all(&framed).map_err(|e| format!("hub write failed: {:?}", e.kind()))?;
+    let framed = super::serve::deadline::frame(&payload);
+    if !super::serve::deadline::write_all(&stream, &framed, super::serve::deadline::IO_TIMEOUT_US) {
+        return Err(format!("hub at '{}' did not accept the request in time", addr));
+    }
 
     let mut header = [0u8; 4];
-    stream.read_exact(&mut header).map_err(|e| format!("hub read (header) failed: {:?}", e.kind()))?;
+    if !super::serve::deadline::read_exact(&stream, &mut header, super::serve::deadline::IO_TIMEOUT_US) {
+        return Err(format!("hub at '{}' went silent before answering", addr));
+    }
     let len = decode_len_header(header);
     if len > MAX_FRAME_LEN {
         return Err(String::from("hub response frame exceeds MAX_FRAME_LEN"));
     }
 
     let mut body = alloc::vec![0u8; len as usize];
-    stream.read_exact(&mut body).map_err(|e| format!("hub read (body) failed: {:?}", e.kind()))?;
+    if !super::serve::deadline::read_exact(&stream, &mut body, super::serve::deadline::IO_TIMEOUT_US) {
+        return Err(format!("hub at '{}' went silent mid-answer", addr));
+    }
     let text = core::str::from_utf8(&body).map_err(|_| String::from("hub response is not valid UTF-8"))?;
 
-    decode_response(text).map_err(|e| format!("hub response decode failed: {:?}", e))
+    let response = decode_response(text).map_err(|e| format!("hub response decode failed: {:?}", e))?;
+    mark_alive();
+    Ok(response)
 }
 
 /// Shared with `tools::litter::mod`'s filesystem path so `ReadInbox`'s output
@@ -117,11 +166,23 @@ pub fn bootstrap(addr: &str, name: &str) {
 /// below and by `meow litter observe` (`main.rs::run_litter_observe`), which
 /// needs every participant's messages merged, not one agent's inbox
 /// formatted for the LLM.
-pub fn peers(addr: &str) -> Result<Vec<String>, String> {
-    match call(addr, &Request::Peers) {
-        Ok(Response::Peers { names }) => Ok(names),
+/// The pulse: send `Peers { since }`, get the raw wire response back.
+/// No intermediate view struct, no second serializer — callers decode the
+/// `Response` they need and `ListPeers` re-encodes it verbatim (one JSON
+/// shape, one serializer, everywhere).
+pub fn peers(addr: &str, since: u64) -> Result<Response, String> {
+    call(addr, &Request::Peers { since })
+}
+
+/// One page of an inbox, read backwards: messages with `ts < before`
+/// (0 = from the newest end), at most `limit`, delivered ascending. A
+/// cold-starting agent walks these batches back until it hits a `Marker`
+/// kind message — the protocol IS the history source.
+pub fn history(addr: &str, name: &str, before: u64, limit: u32) -> Result<Vec<Message>, String> {
+    match call(addr, &Request::History { name: String::from(name), before, limit }) {
+        Ok(Response::Inbox { messages }) => Ok(messages),
         Ok(Response::Error { message }) => Err(message),
-        Ok(other) => Err(format!("hub returned an unexpected response to 'peers': {:?}", other)),
+        Ok(other) => Err(format!("hub returned an unexpected response to 'history': {:?}", other)),
         Err(e) => Err(e),
     }
 }
@@ -158,20 +219,12 @@ pub fn tool_read_inbox(addr: &str, me: &str) -> ToolResult {
 }
 
 pub fn tool_list_peers(addr: &str) -> ToolResult {
-    match peers(addr) {
-        Ok(names) => {
-            let mut out = String::from("{\"agents\":[");
-            for (i, n) in names.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push('"');
-                out.push_str(n);
-                out.push('"');
-            }
-            out.push_str("]}");
-            ToolResult::ok(out)
-        }
+    match peers(addr, 0) {
+        // The pulse response re-encoded verbatim: roster, leader/term,
+        // epoch, and fresh cluster events — same shape, same serializer as
+        // the wire itself.
+        Ok(response @ Response::Peers { .. }) => ToolResult::ok(encode_response(&response)),
+        Ok(_) => ToolResult::err("hub returned an unexpected response to 'peers'"),
         Err(e) => ToolResult::err(e),
     }
 }
@@ -209,12 +262,15 @@ pub fn run_tests() -> i32 {
     total += 1;
     {
         let empty = format_inbox("hercules", &[]);
-        let populated = format_inbox("hercules", &[Message {
-            from: String::from("sherlock"),
-            round: 2,
-            body: String::from("what have you found?"),
-            ts: 123,
-        }]);
+        let populated = format_inbox(
+            "hercules",
+            &[Message::chat(
+                String::from("sherlock"),
+                2,
+                String::from("what have you found?"),
+                123,
+            )],
+        );
         if empty == "Inbox for 'hercules' is empty"
             && populated.contains("[round 2] sherlock: what have you found?")
         {

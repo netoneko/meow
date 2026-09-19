@@ -1,71 +1,107 @@
-//! `meow litter live`: a *resident* litter agent — the thing that turns the
-//! litter from "a batch script that runs and dies" into "agents that exist".
-//! The process never exits on its own: it sleeps in a low-frequency poll
-//! loop (one second per tick, no busy-waiting), wakes to run a normal
-//! chat-with-tools turn whenever something lands in its inbox, and doubles
-//! as the hub when it wins the bind race:
+//! `meow litter live`: a resident litter agent. One process, two pthread
+//! threads (see `docs/LITTER_STATE_MACHINE.md` + `docs/LITTER_RAFT_LOOP.md`):
 //!
-//! - At startup it tries to bind the hub socket (`litter_hub_addr`). Winner
-//!   becomes the coordinator: it carries the whole litter's state in-process
-//!   (`serve::HubState`, the no_std twin of `litter-hub`) and drains waiting
-//!   hub clients between its own duties. Losers (and every one-shot `meow`
-//!   invocation) are plain hub clients — the same code path as before.
-//!   There is no dedicated hub *process* to babysit: assume good will among
-//!   agents, and if the coordinator dies, the next agent to start simply
-//!   wins the race instead; the roster re-seeds itself through the same
-//!   bootstrap `Join` every agent already sends at startup.
-//! - Everyone polls their own inbox once per tick through the normal client
-//!   path (the leader polls itself over loopback through its own backlog —
-//!   one code path for both roles). New messages wake the agent: one
-//!   `chat_once` turn, persona + tools, exactly like `meow litter chase`,
-//!   where the LLM reads its inbox and answers via `SendMessage`.
-//! - The coordinator additionally checks its *task memory* every
-//!   `TASK_TICKS` ticks: files dropped into `/litter/tasks` by the operator
-//!   (`yard.sh task "..."`). Each still-pending file is broadcast to the
-//!   `litter` group (which fans out to every member's inbox — `serve`) and
-//!   the file is renamed `<name>.dispatched` so it is never sent twice.
-//!   Unfinished tasks simply survive until some leader gets to them.
+//! - **raft/serve thread** (spawned here, only when this process won the
+//!   bind race): owns its tick — drain the listener's backlog, task-table
+//!   duties, static-peer discovery, compaction — and is never blocked by
+//!   inference, which is the concrete "consensus networking strictly
+//!   decoupled from model worker tasks".
+//! - **agent loop** (the main thread): the LEADER/FOLLOWER/WAYWARD state
+//!   machine. It ALSO drains (both threads serve the shared listener; more
+//!   drain points never hurt), pulses `Peers` (the round-trip is the
+//!   heartbeat observation and the event feed), polls its inbox, and wakes
+//!   into a `chat_once` turn on new activity.
 //!
-//! Single-threaded reality, spelled out: while an agent is mid-turn (an LLM
-//! call can take minutes) the leader is not draining its listener, so hub
-//! clients queue in the kernel's listen backlog and are served on the next
-//! drain — nothing is lost, just delayed. One turn at a time per agent, and
-//! agents wake on the same group message at slightly staggered offsets
-//! (their name hashed into the tick count) so a four-model debate doesn't
-//! stampede the Ollama host in lockstep.
+//! Both threads share `PMutex<HubState>` + the listener behind `Arc`s;
+//! critical sections are Vec operations. State is in-memory only — the
+//! filesystem is not a transport, not a store (network-bound by design).
+//!
+//! Bootstrap is self-serve: join, page history back to the last compaction
+//! marker, done. Nobody activates a joining agent from the outside.
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use libakuma::net::TcpListener;
 
-use litter_wire::Request;
+use litter_wire::{Message, MessageKind, Request, Response};
 
-use crate::app::{chat_once, Conversation, Message};
-use crate::config::Provider;
 use crate::app::session;
+use crate::app::{chat_once, Conversation, Message as ChatMessage};
+use crate::config::Provider;
+use crate::rt::{spawn_detached, PMutex};
 
 use super::hub;
-use super::serve;
+use super::serve::{self, HubState};
 
-/// Poll cadence in seconds. One tick = one `sleep(1)`; the loop does at most
-/// two cheap operations per tick (drain the hub backlog, count the inbox),
-/// so an idle litter costs effectively zero CPU.
+/// Poll cadence: one tick = one second of sleep.
 const TICK_SECS: u64 = 1;
+/// Pulse (Peers probe) and task-table cadence, in ticks.
+const PULSE_TICKS: u64 = 5;
+/// History compaction cadence, in ticks (~30s).
+const COMPACT_TICKS: u64 = 30;
+/// How many newest messages per inbox the compaction marker spares.
+const KEEP_RECENT: usize = serve::KEEP_RECENT;
+/// History page size when a cold-starting agent walks back to the marker.
+const HISTORY_PAGE: u32 = 32;
 
-/// Task-memory scan every N ticks (30s at the default cadence). Only the
-/// current coordinator does this, and only between turns.
-const TASK_TICKS: u64 = 30;
+/// One `name@host:port` entry from `litter_static_peers` in the config —
+/// a peer we want to know about even before (or without) it ever joining
+/// on its own: the trashcan/laptop split, where the other host's agent may
+/// be down for a long time and should show up as "discovered"/"lost"
+/// events rather than not exist.
+pub struct StaticPeer {
+    pub name: String,
+    pub addr: String,
+    /// Last probe reached it — drives discovered/lost event transitions.
+    pub online: bool,
+}
 
-/// Where the operator drops task files; deliberately NOT scoped by
-/// `MEOW_HOME` — it is shared litter memory, not per-agent state, and only
-/// the current coordinator ever reads it.
-const TASKS_DIR: &str = "/litter/tasks";
+pub fn parse_static_peers(spec: Option<&str>) -> Vec<StaticPeer> {
+    let mut out = Vec::new();
+    if let Some(spec) = spec {
+        for entry in spec.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            if let Some((name, addr)) = entry.split_once('@') {
+                if litter_wire::is_valid_name(name.trim()) && addr.contains(':') {
+                    out.push(StaticPeer { name: String::from(name.trim()), addr: String::from(addr.trim()), online: false });
+                }
+            }
+        }
+    }
+    out
+}
 
-/// Run forever. `model`/`provider`/`system_prompt` come from the caller in
-/// `main.rs`, already resolved from config exactly the way `litter chase`
-/// resolves them — a live turn IS a chase turn, just triggered by inbox
-/// activity instead of a command line.
+/// The agent loop's state machine. `docs/LITTER_STATE_MACHINE.md` is the
+/// prose; this enum is the code. LEADER is really "this process holds the
+/// socket (and the raft thread)"; FOLLOWER and WAYWARD differ only in
+/// whether the hub is currently answering.
+enum Machine {
+    Leader {
+        listener: Arc<TcpListener>,
+        state: Arc<PMutex<HubState>>,
+    },
+    /// Hub is up (someone else's process) and answering.
+    Follower {
+        epoch: u64,
+        roster: Vec<String>,
+        term: u64,
+    },
+    /// Hub went silent past the heartbeat timeout: no hub calls, tools
+    /// fail fast (hub::unresponsive), re-race the bind every tick.
+    Wayward {
+        epoch: u64,
+        roster: Vec<String>,
+        term: u64,
+    },
+}
+
 pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
     let me = match super::agent_name() {
         Some(n) => n,
@@ -76,172 +112,298 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
     };
     let addr = hub::hub_addr().unwrap_or_else(|| String::from("127.0.0.1:7700"));
 
-    // The race: whoever binds the socket IS the hub. (At this point the
-    // normal startup bootstrap in `main.rs` has already run — if a hub were
-    // up, we joined it there and this bind loses; if not, we win and serve.)
-    let mut state = serve::HubState::new();
-    let listener = match TcpListener::bind(&addr) {
-        Ok(l) => {
-            state.handle(Request::Join { name: me.clone() });
-            libakuma::print(&format!("[live] {} is the hub at {} (won the bind race)\n", me, addr));
-            Some(l)
+    // ---- Bootstrap (self-serve): join, then walk history back to the
+    // marker. Both are plain client calls; if the hub isn't up, they fail
+    // and the bind race below decides who becomes it.
+    hub::bootstrap(&addr, &me);
+    load_history(&addr, &me, &system_prompt);
+
+    // ---- The bind race: connect failed at bootstrap ⇒ either nobody holds
+    // the socket (we try to win it) or someone won it microseconds ago
+    // (our bind fails and we're a plain follower — correct either way).
+    let mut machine = match TcpListener::bind(&addr) {
+        Ok(listener) => {
+            // try_accept is only non-blocking when the socket is: without
+            // this, the first drain parks in accept() holding the state
+            // lock and the hub freezes for the whole litter.
+            let _ = listener.set_nonblocking(true);
+            let listener = Arc::new(listener);
+            let state = Arc::new(PMutex::new(HubState::new()));
+            {
+                let mut st = state.lock();
+                st.handle(Request::Join { name: me.clone() });
+                // Fresh litter = term 1. (A takeover re-race bumps to
+                // last_seen_term + 1 — see WAYWARD handling below.)
+                st.set_leader(&me, 1);
+            }
+            // Static peers from the config: discovered (or declared lost)
+            // by the raft thread; this is how the trashcan/laptop split
+            // shows up as status changes instead of absence.
+            let static_peers = parse_static_peers(super::static_peers_spec().as_deref());
+            start_raft_thread(&listener, &state, static_peers);
+            libakuma::print(&format!("[live] {} holds the hub at {} (won the bind race) — raft thread up\n", me, addr));
+            Machine::Leader { listener, state }
         }
         Err(_) => {
             libakuma::print(&format!("[live] {} joined the litter at {} (hub already up)\n", me, addr));
-            None
+            Machine::Follower { epoch: 0, roster: Vec::new(), term: 0 }
         }
     };
 
-    // Baseline: whatever is already in the inbox predates us — never wake on
-    // history, only on messages that arrive from now on.
-    let mut seen = if listener.is_some() {
-        state_inbox_len(&mut state, &me)
-    } else {
-        inbox_len(&addr, &me)
-    };
+    // Baseline: history predates us — wake only on what arrives from now.
+    let mut seen = inbox_count(&addr, &me);
     libakuma::print(&format!("[live] {} awake; {} message(s) already in history\n", me, seen));
 
     let mut tick: u64 = 0;
+    let mut latest_term: u64 = 0; // highest term any pulse reported
     loop {
-        if let Some(l) = &listener {
-            serve::drain(l, &mut state);
-        }
-
-        // Task memory: coordinator-only, spread across ticks.
-        if listener.is_some() && tick % TASK_TICKS == 0 {
-            dispatch_pending_tasks(&mut state);
-        }
-
-        // IMPORTANT: the leader must count its inbox from its own in-memory
-        // state, never via a loopback client call. A loopback call is served
-        // by *this same loop's* drain — it would sit in our own backlog
-        // waiting for a drain that can't happen until the call returns. That
-        // deadlock is why `state_inbox_len` exists.
-        let total = if listener.is_some() {
-            state_inbox_len(&mut state, &me)
-        } else {
-            inbox_len(&addr, &me)
-        };
-        if total > seen {
-            run_turn(&me, &model, &provider, &system_prompt);
-            // The turn is done; anything that landed in the inbox while we
-            // were thinking (replies addressed to us included) counts as
-            // seen from here — it shaped the transcript the turn already
-            // read, and re-waking on it would just re-hash the same round.
-            seen = if listener.is_some() {
-                state_inbox_len(&mut state, &me)
-            } else {
-                inbox_len(&addr, &me)
-            };
-        }
-
         tick += 1;
+
+        match &mut machine {
+            Machine::Leader { listener, state } => {
+                // The agent loop drains too: two serve points on one
+                // listener, so requests never wait a full raft tick.
+                serve::drain(&listener, &mut state.lock());
+                let count = inbox_count(&addr, &me);
+                if count > seen {
+                    run_turn(&me, &model, &provider, &system_prompt);
+                    seen = inbox_count(&addr, &me);
+                }
+            }
+            Machine::Follower { epoch, roster, term } => {
+                if tick % PULSE_TICKS == 0 {
+                    match hub::peers(&addr, *epoch) {
+                        Ok(Response::Peers { names, term: t, epoch: e, events, .. }) => {
+                            hub::mark_alive();
+                            latest_term = latest_term.max(t);
+                            *term = t;
+                            *roster = names;
+                            for event in events {
+                                libakuma::print(&format!("[live] {} hears: {}\n", me, event));
+                            }
+                            *epoch = e;
+                        }
+                        Ok(_) => {}
+                        Err(_) => { /* probe failed: liveness bookkeeping simply doesn't advance */ }
+                    }
+                    if hub::unresponsive() {
+                        libakuma::print(&format!("[live] {} is WAYWARD: hub silent for {}s\n", me, hub::silent_for_secs()));
+                        machine = Machine::Wayward { epoch: *epoch, roster: core::mem::take(roster), term: *term };
+                        continue;
+                    }
+                }
+                let count = inbox_count(&addr, &me);
+                if count > seen {
+                    run_turn(&me, &model, &provider, &system_prompt);
+                    seen = inbox_count(&addr, &me);
+                }
+            }
+            Machine::Wayward { epoch, roster, term } => {
+                // No hub calls except the one that matters: can we take the
+                // socket? The dead leader's port is free; a merely-hung
+                // leader still holds it and this bind keeps failing.
+                match TcpListener::bind(&addr) {
+                    Ok(listener) => {
+                        let _ = listener.set_nonblocking(true);
+                        let listener = Arc::new(listener);
+                        let state = Arc::new(PMutex::new(HubState::new()));
+                        {
+                            let mut st = state.lock();
+                            st.handle(Request::Join { name: me.clone() });
+                            let new_term = latest_term.max(*term) + 1;
+                            st.set_leader(&me, new_term);
+                        }
+                        let static_peers = parse_static_peers(super::static_peers_spec().as_deref());
+                        start_raft_thread(&listener, &state, static_peers);
+                        libakuma::print(&format!("[live] {} re-raced the bind and WON — leader again (term {})\n", me, latest_term.max(*term) + 1));
+                        machine = Machine::Leader { listener, state };
+                        // State we served before is gone (in-memory by
+                        // design); survivors re-register through their own
+                        // pulses, and history below the last marker is
+                        // compacted knowledge anyway.
+                    }
+                    Err(_) => {
+                        // Socket still held: the old leader hangs on. Keep
+                        // the cached roster, fail fast on tools, keep
+                        // probing the bind. Also re-try a plain Peers: if
+                        // the hub starts answering again we go straight
+                        // back to FOLLOWER.
+                        if tick % PULSE_TICKS == 0 {
+                            if let Ok(Response::Peers { names, term: t, epoch: e, .. }) = hub::peers(&addr, *epoch) {
+                                hub::mark_alive();
+                                libakuma::print(&format!("[live] {} is FOLLOWER again (hub answered after {}s)\n", me, hub::silent_for_secs()));
+                                machine = Machine::Follower { epoch: e, roster: core::mem::take(roster), term: t.max(*term) };
+                                let _ = names;
+                                continue;
+                            }
+                            *roster = core::mem::take(roster); // keep cache; nothing new
+                            let _ = (*epoch, *term);
+                        }
+                    }
+                }
+            }
+        }
+
         libakuma::sleep(TICK_SECS);
     }
 }
 
-/// The leader's inbox count, read directly from the state it serves — never
-/// over loopback (see the deadlock note in `run`).
-fn state_inbox_len(state: &mut serve::HubState, me: &str) -> usize {
-    match state.handle(Request::Inbox { name: String::from(me) }) {
-        litter_wire::Response::Inbox { messages } => messages.len(),
-        _ => 0,
-    }
+/// The raft thread: pure servo, never blocked by inference. Drains the
+/// backlog, runs the task table, probes static peers, compacts history —
+/// on its own 1s cadence.
+/// The raft thread's context, leaked once at spawn: a `fn()`-pointer
+/// spawn can't capture, and the thread lives exactly as long as the
+/// process, so a one-time leak IS the sane ownership story here.
+struct RaftCtx {
+    listener: Arc<TcpListener>,
+    state: Arc<PMutex<HubState>>,
+    /// Behind the same coarse PMutex type as the state: the probe mutates
+    /// `online` transitions, and a fn()-pointer spawn can't hand a `&mut`
+    /// across the clone.
+    peers: PMutex<Vec<StaticPeer>>,
 }
 
-/// Count messages waiting for `me` through the ordinary client path — the
-/// leader polls itself over loopback through its own listener backlog, so
-/// both roles share this one code path. An unreachable hub returns 0 and the
-/// caller's watermark logic simply retries next tick.
-fn inbox_len(addr: &str, me: &str) -> usize {
-    match hub::inbox_messages(addr, me) {
-        Ok(messages) => messages.len(),
-        Err(_) => 0,
+static RAFT_CTX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn raft_entry() {
+    let ptr = RAFT_CTX.load(core::sync::atomic::Ordering::Acquire) as *const RaftCtx;
+    if ptr.is_null() {
+        return;
     }
+    // SAFETY: the ctx was leaked by start_raft_thread before the child was
+    // spawned; the child is its only reader and the process outlives it.
+    let ctx = unsafe { &*ptr };
+    raft_tick_loop(ctx.listener.clone(), ctx.state.clone(), &ctx.peers);
 }
 
-/// One chat-with-tools turn — the same shape as `litter chase` (fresh
-/// conversation, persona system prompt, full tool loop), but the user
-/// message is the wake-up instruction instead of a task.
-fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str) {
-    let session_id = session::generate_session_id();
-    let mut conversation = Conversation::new_session(session_id);
-    conversation.append(&Message::new("system", system_prompt));
-    conversation.append(&Message::new("user", "[System Context] Current working directory: /\nNo sandbox restrictions."));
-    conversation.append(&Message::new("assistant", "Understood."));
-
-    libakuma::print(&format!("\n[live] {} wakes on new inbox activity\n", me));
-    let wake = format!(
-        "You are '{}' in a litter of agents. Your inbox has message(s) you haven't seen. \
-         Use ReadInbox to catch up (ListPeers shows who's here), then do whatever the \
-         newest messages ask of you and reply with SendMessage — to a specific peer, \
-         or to 'litter' to reach everyone. If there is genuinely nothing worth \
-         responding to, just finish without sending anything.",
-        me
-    );
-    if let Err(e) = chat_once(model, provider, &wake, &mut conversation, None, system_prompt) {
-        libakuma::print(&format!("[live] {}'s turn failed: {}\n", me, e));
-    }
+/// Leak the context and spawn the raft thread. Returns false when the
+/// spawn failed (the caller keeps running as leader with its own drain —
+/// degraded, not dead).
+fn start_raft_thread(listener: &Arc<TcpListener>, state: &Arc<PMutex<HubState>>, static_peers: Vec<StaticPeer>) -> bool {
+    let ctx: &'static RaftCtx = Box::leak(Box::new(RaftCtx {
+        listener: listener.clone(),
+        state: state.clone(),
+        peers: PMutex::new(static_peers),
+    }));
+    RAFT_CTX.store(ctx as *const RaftCtx as u64, core::sync::atomic::Ordering::Release);
+    unsafe { crate::rt::spawn_detached(raft_entry) }
 }
 
-/// The coordinator's task memory: every file in `/litter/tasks` that doesn't
-/// end in `.dispatched` gets broadcast to the litter group, then renamed so
-/// it is dispatched exactly once no matter how many coordinators come and
-/// go. Best-effort on purpose — an unreadable file is skipped, not fatal.
-fn dispatch_pending_tasks(state: &mut serve::HubState) {
-    let entries = match libakuma::read_dir(TASKS_DIR) {
-        Some(e) => e,
-        None => return, // no task dir yet = no tasks; not an error
-    };
-    for entry in entries {
-        if entry.is_dir || entry.name.ends_with(".dispatched") {
-            continue;
+fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, static_peers: &PMutex<Vec<StaticPeer>>) {
+    let mut tick: u64 = 0;
+    loop {
+        tick += 1;
+        {
+            let mut st = state.lock();
+            serve::drain(&listener, &mut st);
+            if tick % PULSE_TICKS == 0 {
+                st.task_tick();
+                let mut peers = static_peers.lock();
+                probe_static_peers(&mut st, &mut peers);
+            }
+            if tick % COMPACT_TICKS == 0 {
+                st.compact();
+            }
         }
-        let path = format!("{}/{}", TASKS_DIR, entry.name);
-        let body = match read_small_file(&path) {
-            Some(b) => b,
-            None => continue,
-        };
-        if body.trim().is_empty() {
-            continue;
-        }
-        let sent = state.handle(Request::Send {
-            from: String::from("root"),
-            to: String::from(serve::GROUP_NAME),
-            body: format!("[task: {}] {}", entry.name, body.trim()),
-            round: 0,
-        });
-        if matches!(sent, litter_wire::Response::Sent { .. }) {
-            let done = format!("{}.dispatched", path);
-            if libakuma::rename(&path, &done) < 0 {
-                libakuma::print(&format!("[live] warning: dispatched '{}' but couldn't mark it\n", path));
+        libakuma::sleep(TICK_SECS);
+    }
+}
+
+/// Ask each configured static peer "who's there?" — the trashcan/laptop
+/// discovery loop. First answer registers the peer in the roster (with an
+/// event, so every agent hears about it); silence after being online
+/// raises a "lost" event. The peer's own litter is unaffected: we only
+/// read its public pulse.
+fn probe_static_peers(st: &mut HubState, peers: &mut [StaticPeer]) {
+    // To actually reach a static peer we need a client call; `hub::peers`
+    // targets `hub_addr()`, so for remote peers issue the request directly
+    // through a one-shot connect on the peer's address.
+    for peer in peers {
+        let view = super::hub::call_addr(&peer.addr, &Request::Peers { since: 0 });
+        match view {
+            Ok(Response::Peers { .. }) => {
+                if !peer.online {
+                    peer.online = true;
+                    st.event(format!("[event] static peer {} discovered at {}", peer.name, peer.addr));
+                }
+            }
+            _ => {
+                if peer.online {
+                    peer.online = false;
+                    st.event(format!("[event] static peer {} lost ({})", peer.name, peer.addr));
+                }
             }
         }
     }
 }
 
-fn read_small_file(path: &str) -> Option<String> {
-    let fd = libakuma::open(path, libakuma::open_flags::O_RDONLY);
-    if fd < 0 {
-        return None;
-    }
-    let stat = match libakuma::fstat(fd) {
-        Ok(s) => s,
-        Err(_) => {
-            libakuma::close(fd);
-            return None;
+/// Cold-start history walk: page back in batches until a `Marker` kind
+/// message shows up (or history ends). The marker plus the live tail is
+/// everything a fresh agent needs; nothing older is ever pulled.
+fn load_history(addr: &str, me: &str, system_prompt: &str) {
+    // The prompt is built by the caller before we run; the walk's purpose
+    // is to touch the protocol once so a joining agent starts warm — and
+    // to surface the marker summary in the log for the operator.
+    let mut before: u64 = 0;
+    let mut batches = 0;
+    loop {
+        match hub::history(addr, me, before, HISTORY_PAGE) {
+            Ok(messages) if messages.is_empty() => break,
+            Ok(messages) => {
+                batches += 1;
+                let oldest = messages.first().map(|m: &Message| m.ts).unwrap_or(0);
+                let hit_marker = messages.iter().any(|m| m.kind == MessageKind::Marker);
+                if hit_marker {
+                    libakuma::print(&format!(
+                        "[live] {} sourced history: {} batch(es), reached the compaction marker\n",
+                        me, batches
+                    ));
+                    return;
+                }
+                before = oldest;
+            }
+            Err(_) => return, // hub not up yet; the bind race decides next
         }
-    };
-    let size = stat.st_size as usize;
-    if size == 0 || size > 32 * 1024 {
-        libakuma::close(fd);
-        return None;
     }
-    let mut buf = alloc::vec![0u8; size];
-    let n = libakuma::read_fd(fd, &mut buf);
-    libakuma::close(fd);
-    if n <= 0 {
-        return None;
+    let _ = system_prompt;
+}
+
+fn inbox_count(addr: &str, me: &str) -> usize {
+    match hub::inbox_messages(addr, me) {
+        Ok(messages) => messages.iter().filter(|m| wakeable(m)).count(),
+        Err(_) => 0, // unreachable hub (or WAYWARD) — count simply stalls
     }
-    String::from_utf8(buf[..n as usize].to_vec()).ok()
+}
+
+/// What wakes an agent: real conversation and task assignments. Compaction
+/// markers are bookkeeping (they carry the folded summary the agent will
+/// read on its next real wake); anything else protocol-shaped isn't chat.
+fn wakeable(m: &Message) -> bool {
+    !matches!(m.kind, MessageKind::Marker | MessageKind::Done)
+}
+
+/// One chat-with-tools turn — the same shape as `litter chase` (fresh
+/// conversation, persona system prompt, full tool loop), but the user
+/// message is the wake-up instruction plus fresh cluster context.
+fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str) {
+    let session_id = session::generate_session_id();
+    let mut conversation = Conversation::new_session(session_id);
+    conversation.append(&ChatMessage::new("system", system_prompt));
+    conversation.append(&ChatMessage::new("user", "[System Context] Current working directory: /\nNo sandbox restrictions."));
+    conversation.append(&ChatMessage::new("assistant", "Understood."));
+
+    libakuma::print(&format!("\n[live] {} wakes on new inbox activity\n", me));
+    let wake = format!(
+        "You are '{}' in a litter of agents. Your inbox has message(s) you haven't seen. \
+         Use ListPeers to see who's here (the response also carries recent cluster events), \
+         ReadInbox to catch up, then do whatever the newest messages ask of you and reply \
+         with SendMessage — to a specific peer, or to 'litter' to reach everyone. \
+         Start a message body with `[task] …` to open a tracked task, and answer an \
+         assignment with `[done: tN] …` when finished. If there is genuinely nothing \
+         worth responding to, just finish without sending anything.",
+        me
+    );
+    if let Err(e) = chat_once(model, provider, &wake, &mut conversation, None, system_prompt) {
+        libakuma::print(&format!("[live] {}'s turn failed: {}\n", me, e));
+    }
 }

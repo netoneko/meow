@@ -76,6 +76,75 @@ impl From<JsonParseError> for WireError {
     }
 }
 
+/// What a message IS, on the wire — so coordinator and agents never drift
+/// on body-string conventions. `Chat` is the default (a debate message);
+/// the other kinds are protocol traffic the tick loop and history walks
+/// consume: `Marker` is the compaction boundary (history stops here),
+/// `Assignment` delivers a task lease, `Done` records a completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Chat,
+    Marker,
+    Assignment,
+    Done,
+}
+
+impl MessageKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageKind::Chat => "chat",
+            MessageKind::Marker => "marker",
+            MessageKind::Assignment => "assignment",
+            MessageKind::Done => "done",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "chat" => Some(MessageKind::Chat),
+            "marker" => Some(MessageKind::Marker),
+            "assignment" => Some(MessageKind::Assignment),
+            "done" => Some(MessageKind::Done),
+            _ => None,
+        }
+    }
+}
+
+/// Who a message came from, role-wise — different senders facilitate
+/// different roles, and an agent reading its inbox should be able to tell
+/// operator instructions from leader coordination from ordinary peer chat
+/// without guessing by name. Stamped by the hub at delivery time (the
+/// sender can't claim a role; the wire field is hub-authoritative).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenderRole {
+    /// An ordinary litter member.
+    Peer,
+    /// The current hub holder / raft thread (markers, task assignments,
+    /// compaction bookkeeping — and any chat the leader sends as itself).
+    Leader,
+    /// The operator identity ("root"): instructions that outrank debate.
+    Root,
+}
+
+impl SenderRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SenderRole::Peer => "peer",
+            SenderRole::Leader => "leader",
+            SenderRole::Root => "root",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "peer" => Some(SenderRole::Peer),
+            "leader" => Some(SenderRole::Leader),
+            "root" => Some(SenderRole::Root),
+            _ => None,
+        }
+    }
+}
+
 /// One mailbox entry as it travels over the wire. `ts` is hub-assigned
 /// (microseconds since the Unix epoch, hub-local clock) rather than
 /// client-supplied, precisely so that an inbox's ordering doesn't depend on
@@ -88,6 +157,15 @@ pub struct Message {
     pub round: i64,
     pub body: String,
     pub ts: u64,
+    pub kind: MessageKind,
+    pub role: SenderRole,
+}
+
+impl Message {
+    /// A plain peer chat message (the overwhelmingly common case).
+    pub fn chat(from: String, round: i64, body: String, ts: u64) -> Self {
+        Message { from, round, body, ts, kind: MessageKind::Chat, role: SenderRole::Peer }
+    }
 }
 
 impl DisplayJson for Message {
@@ -96,7 +174,17 @@ impl DisplayJson for Message {
             f.member("from", &self.from)?;
             f.member("round", self.round)?;
             f.member("body", &self.body)?;
-            f.member("ts", self.ts)
+            f.member("ts", self.ts)?;
+            // Absent = the defaults (Chat from a Peer): ordinary debate
+            // messages, the overwhelming majority, stay two fields lighter
+            // on the wire.
+            if self.kind != MessageKind::Chat {
+                f.member("kind", self.kind.as_str())?;
+            }
+            if self.role != SenderRole::Peer {
+                f.member("role", self.role.as_str())?;
+            }
+            Ok(())
         })
     }
 }
@@ -109,7 +197,17 @@ impl<'text, 'raw> TryFrom<RawJsonValue<'text, 'raw>> for Message {
         let body: String = value.to_member("body")?.required()?.try_into()?;
         let round: Option<i64> = value.to_member("round")?.try_into()?;
         let ts: Option<u64> = value.to_member("ts")?.try_into()?;
-        Ok(Message { from, round: round.unwrap_or(0), body, ts: ts.unwrap_or(0) })
+        let kind: Option<String> = value.to_member("kind")?.try_into()?;
+        let kind = match kind.as_deref().map(MessageKind::from_str) {
+            None => MessageKind::Chat,
+            Some(k) => k.ok_or_else(|| value.invalid("unknown message 'kind'"))?,
+        };
+        let role: Option<String> = value.to_member("role")?.try_into()?;
+        let role = match role.as_deref().map(SenderRole::from_str) {
+            None => SenderRole::Peer,
+            Some(r) => r.ok_or_else(|| value.invalid("unknown message 'role'"))?,
+        };
+        Ok(Message { from, round: round.unwrap_or(0), body, ts: ts.unwrap_or(0), kind, role })
     }
 }
 
@@ -427,7 +525,7 @@ mod tests {
 
     #[test]
     fn decode_request_rejects_unknown_op() {
-        let json = "{\"v\":1,\"op\":\"launch_missiles\"}";
+        let json = "{\"v\":2,\"op\":\"launch_missiles\"}";
         assert!(matches!(decode_request(json), Err(WireError::Parse(_))));
     }
 
@@ -506,8 +604,8 @@ mod tests {
 
     #[test]
     fn decode_response_rejects_wrong_version() {
-        let json = "{\"v\":2,\"ok\":true,\"op\":\"peers\",\"names\":[]}";
-        assert!(matches!(decode_response(json), Err(WireError::UnsupportedVersion(2))));
+        let json = "{\"v\":3,\"ok\":true,\"op\":\"peers\",\"names\":[]}";
+        assert!(matches!(decode_response(json), Err(WireError::UnsupportedVersion(3))));
     }
 
     #[test]

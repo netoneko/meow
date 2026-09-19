@@ -1,25 +1,32 @@
 //! The hub, as a state machine any meow can carry — the no_std twin of
-//! `crates/litter-hub`'s `HubState`, minus `std`, `Mutex` and `HashMap`
-//! (meow is single-threaded and `no_std`+`alloc`, so plain `Vec`s are the
-//! whole story). This is what makes a dedicated hub *process* unnecessary:
-//! the first `meow litter live` agent that can bind the hub socket becomes
-//! the coordinator (see `live`), serves framed requests out of this state
-//! between its own turns, and if it dies the next agent to start simply
-//! wins the race instead — the roster re-seeds itself through the same
-//! bootstrap `Join` every agent already sends at startup.
+//! `crates/litter-hub`'s `HubState`, extended to the full coordinator role
+//! (see `docs/LITTER_STATE_MACHINE.md`, `docs/LITTER_RAFT_LOOP.md`):
+//! roster + inboxes, the cluster event log, term/leader status, the task
+//! table (`tasks`), and marker-based history compaction.
 //!
-//! Request handling is a deliberate port of `litter-hub`'s `HubState::handle`
-//! (join/send/inbox/peers, name validation, roster cap) with one deliberate
-//! extension: a `Send` addressed to the reserved name `litter` is a group
-//! broadcast — fanned out into every roster member's inbox — so an agent (or
-//! the operator via `meow litter send --to litter`) can address the whole
-//! litter at once and every member's own-inbox polling wakes on it. That
-//! means one message lives in several inboxes; `meow litter observe` dedups
-//! on `(ts, from, round, body)` for exactly this reason.
+//! Threading: when this process wins the bind race, one `PMutex<HubState>`
+//! is shared between the raft/serve thread (drain + ticks) and the agent
+//! loop's direct reads. Every method takes `&mut self`, so the mutex is
+//! the only synchronization needed; critical sections are a handful of Vec
+//! operations.
+//!
+//! Request handling is a superset of `litter-hub`'s (join/send/inbox/peers,
+//! name validation, roster cap), plus:
+//! - `Send` bodies starting `[task]` / `[done: tN]` feed the task table;
+//!   assignments and completions become cluster events.
+//! - `Peers` is the pulse: roster + `term`/`leader` + event-log entries
+//!   newer than the caller's `since` cursor. Elections, joins, leaves and
+//!   task requeues all reach every agent through this one channel.
+//! - `History { name, before, limit }` pages one inbox backwards so a
+//!   cold-starting agent can walk up to the last `"[compacted: …]"` marker
+//!   without ever pulling more than `limit` messages per round trip.
+//! - `compact()` prunes each inbox past `KEEP_RECENT` recent messages and
+//!   leaves ONE marker message summarizing what was folded — history below
+//!   the marker is gone, and the marker is the boundary every `History`
+//!   walk stops at.
 //!
 //! Like `litter-hub`, one connection carries exactly one framed
-//! request/response pair (`litter-wire` framing), and inboxes are
-//! non-destructive: `Inbox` peeks, nothing consumes.
+//! request/response pair; inboxes are non-destructive (`Inbox` peeks).
 
 use alloc::format;
 use alloc::string::String;
@@ -32,64 +39,84 @@ use litter_wire::{
     Message, Request, Response, MAX_FRAME_LEN,
 };
 
-/// Sanity bound on roster growth, same as `litter-hub`'s — a litter is a
-/// handful of agents; this only exists so a misbehaving client can't grow
-/// the roster unboundedly.
+use super::tasks::{TableEvent, TaskTable};
+
+/// Sanity bound on roster growth, same as `litter-hub`'s.
 const MAX_ROSTER_SIZE: usize = 256;
 
 /// The reserved group name: `Send { to: "litter" }` fans out to every
 /// roster member instead of creating an inbox for a phantom agent.
 pub const GROUP_NAME: &str = "litter";
 
+/// Newest messages per inbox that compaction always preserves.
+pub const KEEP_RECENT: usize = 16;
+
+/// Event-log cap. The epoch keeps rising past drops, so a stale cursor
+/// simply gets "everything we still have" — never a silent gap presented
+/// as fresh news.
+const EVENT_LOG_CAP: usize = 512;
+
+/// Cap on how many folded-message summaries one compaction marker
+/// carries. The marker is a summary, not an archive.
+const MARKER_SUMMARY_LINES: usize = 20;
+
 pub struct HubState {
     roster: Vec<String>,
     inboxes: Vec<(String, Vec<Message>)>,
-    /// Compacted shared knowledge (done tasks, decisions). A joining agent
-    /// receives exactly this as its first inbox message and then sees only
-    /// post-compaction traffic — history before the last compaction is
-    /// deliberately not replayed, which keeps a fresh agent's context small
-    /// instead of filling it with a stale transcript. The same text is
-    /// persisted to `snapshot.log` (see `live`), which is what a leadership
-    /// takeover loads back — the snapshot, not the inboxes, is the state
-    /// that survives a leader dying.
-    pub snapshot: String,
+    /// Raft term. Bumped every time a new binder takes over — monotonic
+    /// across leadership changes so agents can order leaderships they see.
+    pub term: u64,
+    /// Hub-local monotonic ts floor (see stamp()).
+    last_ts: u64,
+    /// Whoever currently owns the hub socket (set by the winner of the
+    /// bind race at startup; it can only change by that process dying).
+    pub leader: Option<String>,
+    /// Cluster event log: (epoch, text), epoch strictly increasing.
+    events: Vec<(u64, String)>,
+    pub tasks: TaskTable,
 }
 
-/// How many newest messages per inbox compaction always preserves — the
-/// live tail of the debate. Anything older is folded into `snapshot` and
-/// dropped from the inboxes.
-const KEEP_RECENT: usize = 16;
-
 impl HubState {
-    /// A hub that knows nobody yet — exactly the "empty seed roster" shape
-    /// `litter-hub --roster` made optional; the litter bootstraps itself.
+    /// A hub that knows nobody yet — the "empty seed roster" shape; the
+    /// litter bootstraps itself.
     pub fn new() -> Self {
-        Self { roster: Vec::new(), inboxes: Vec::new(), snapshot: String::new() }
-    }
-
-    /// Seed the snapshot at startup — a leadership takeover loads the
-    /// previous leader's `snapshot.log` here so continuity survives the
-    /// power cycle.
-    pub fn set_snapshot(&mut self, text: String) {
-        self.snapshot = text;
-    }
-
-    /// Current roster (the coordinator persists it so a takeover can
-    /// restore membership — see `live`).
-    pub fn roster(&self) -> Vec<String> {
-        self.roster.clone()
-    }
-
-    /// Re-add a member WITHOUT the joining snapshot welcome — takeover-time
-    /// roster restoration, for members that were already in the litter.
-    pub fn restore_member(&mut self, name: &str) {
-        if is_valid_name(name) && !self.roster.iter().any(|n| n == name) && self.roster.len() < MAX_ROSTER_SIZE {
-            self.roster.push(String::from(name));
+        Self {
+            roster: Vec::new(),
+            inboxes: Vec::new(),
+            term: 1,
+            last_ts: 0,
+            leader: None,
+            events: Vec::new(),
+            tasks: TaskTable::new(),
         }
+    }
+
+    /// The bind-race winner announces itself. `new_term` is `previous + 1`
+    /// on a takeover, `1` for a fresh litter; either way the announcement
+    /// is the first event every pulse will carry.
+    pub fn set_leader(&mut self, name: &str, new_term: u64) {
+        self.term = new_term;
+        self.leader = Some(String::from(name));
+        self.event(format!("[event] {} is leader (term {})", name, new_term));
     }
 
     fn now_us() -> u64 {
         crate::util::now_us()
+    }
+
+    /// Append one cluster event and bump the epoch. Every status change
+    /// (elections, joins, leaves, task churn) flows through here and from
+    /// here to every agent's next pulse.
+    pub fn event(&mut self, text: String) {
+        let epoch = self.next_epoch();
+        self.events.push((epoch, text));
+        if self.events.len() > EVENT_LOG_CAP {
+            self.events.remove(0);
+        }
+    }
+
+    fn next_epoch(&self) -> u64 {
+        self.events.last().map(|(e, _)| *e + 1).unwrap_or(1)
     }
 
     fn inbox_mut(&mut self, name: &str) -> &mut Vec<Message> {
@@ -106,6 +133,22 @@ impl HubState {
         }
     }
 
+    /// Deliver one message into one inbox (no validation — callers did it).
+    fn deliver(&mut self, to: &str, msg: Message) {
+        self.inbox_mut(to).push(msg);
+    }
+
+    /// Hub-local monotonic timestamp. `util::now_us` alone can collide when
+    /// several messages arrive within one microsecond (a whole round-trip
+    /// batch can), and `History`'s `ts < before` paging is lossy under
+    /// collisions — so the hub guarantees every delivered message carries a
+    /// strictly greater ts than its predecessor.
+    fn stamp(&mut self) -> u64 {
+        let now = crate::util::now_us();
+        self.last_ts = if now <= self.last_ts { self.last_ts + 1 } else { now };
+        self.last_ts
+    }
+
     /// Handle one already-decoded request and produce the response. Pure
     /// state transition, no I/O — the half the test suite drives directly.
     pub fn handle(&mut self, req: Request) -> Response {
@@ -114,21 +157,12 @@ impl HubState {
                 if !is_valid_name(&name) {
                     return Response::Error { message: String::from("'name' must be a plain agent name") };
                 }
-                let is_new = !self.roster.iter().any(|n| n == &name);
-                if is_new {
+                if !self.roster.iter().any(|n| n == &name) {
                     if self.roster.len() >= MAX_ROSTER_SIZE {
                         return Response::Error { message: String::from("roster is full") };
                     }
                     self.roster.push(name.clone());
-                    // A new member skips all history before the last
-                    // compaction: its first inbox message IS the snapshot.
-                    let welcome = Message {
-                        from: String::from(GROUP_NAME),
-                        round: 0,
-                        body: format!("[litter snapshot — history before this was compacted]\n{}[end snapshot]", self.snapshot),
-                        ts: Self::now_us(),
-                    };
-                    self.inbox_mut(&name).push(welcome);
+                    self.event(format!("[event] {} joined the litter", name));
                 }
                 Response::Joined
             }
@@ -142,23 +176,62 @@ impl HubState {
                 if body.is_empty() {
                     return Response::Error { message: String::from("send requires a non-empty body") };
                 }
-                let msg = Message { from, round, body, ts: Self::now_us() };
-                let bytes = msg.body.len();
+                let bytes = body.len();
+                // Sender role is hub-authoritative, stamped at delivery:
+                // the leader's own messages are leader-traffic, the fixed
+                // `root` identity is the operator, everyone else is a peer.
+                let role = if self.leader.as_deref() == Some(from.as_str()) {
+                    litter_wire::SenderRole::Leader
+                } else if from == "root" {
+                    litter_wire::SenderRole::Root
+                } else {
+                    litter_wire::SenderRole::Peer
+                };
+                let msg = Message { role, ..Message::chat(from, round, body, self.stamp()) };
+
+                // Task-table hooks: [task] opens, [done: tN] closes. The
+                // table's outputs are events (and, at tick time,
+                // assignment messages) — the chat copy still lands where it
+                // was addressed, so the debate keeps its transcript.
+                // Only the operator (root) or the leader may OPEN tracked
+                // tasks — otherwise every peer chat that starts with
+                // "[task]" mints work for the whole litter (observed live:
+                // an agent tasking the litter to police the kernel). Any
+                // holder may still CLOSE their task with [done: tN].
+                let can_open = matches!(msg.role, litter_wire::SenderRole::Root | litter_wire::SenderRole::Leader);
+                match self.tasks.note_message(&msg.from, &msg.body, msg.ts, can_open) {
+                    TableEvent::Done(event_text, summary) => {
+                        self.event(event_text);
+                        // Completion knowledge belongs in history: a short
+                        // system line under the group name.
+                        let done_line = Message {
+                            from: String::from(GROUP_NAME),
+                            round: msg.round,
+                            body: format!("[done] {}", summary),
+                            ts: self.stamp(),
+                            kind: litter_wire::MessageKind::Done,
+                            role: litter_wire::SenderRole::Leader,
+                        };
+                        let members = self.roster.clone();
+                        for member in members {
+                            self.deliver(&member, Message { ..done_line.clone() });
+                        }
+                    }
+                    TableEvent::Noted => {}
+                    TableEvent::Requeued => {}
+                }
+
                 if to == GROUP_NAME {
                     // Group broadcast: every roster member gets a copy (the
-                    // sender included — they'll see their own words in their
-                    // inbox next turn, which is the right transcript for a
-                    // debate, and `observe` dedups the copies anyway).
-                    for member in self.roster.clone() {
-                        self.inbox_mut(&member).push(Message {
-                            from: msg.from.clone(),
-                            round: msg.round,
-                            body: msg.body.clone(),
-                            ts: msg.ts,
-                        });
+                    // sender included — their own words in their inbox are
+                    // the right transcript; `observe` dedups anyway).
+                    let members = self.roster.clone();
+                    for member in members {
+                        self.deliver(&member, Message::chat(msg.from.clone(), msg.round, msg.body.clone(), msg.ts));
                     }
                 } else {
-                    self.inbox_mut(&to).push(msg);
+                    let to = to;
+                    self.deliver(&to, msg);
                 }
                 Response::Sent { bytes }
             }
@@ -173,48 +246,166 @@ impl HubState {
                 }
                 Response::Inbox { messages: Vec::new() }
             }
-            Request::Peers => Response::Peers { names: self.roster.clone() },
+            Request::History { name, before, limit } => {
+                if !is_valid_name(&name) {
+                    return Response::Error { message: String::from("'name' must be a plain agent name") };
+                }
+                let limit = (limit as usize).max(1).min(128);
+                let mut batch: Vec<Message> = Vec::new();
+                for (n, msgs) in self.inboxes.iter() {
+                    if n == &name {
+                        batch = msgs
+                            .iter()
+                            .filter(|m| before == 0 || m.ts < before)
+                            .rev() // newest first
+                            .take(limit)
+                            .cloned()
+                            .collect();
+                        batch.reverse(); // deliver ascending: reads naturally
+                        break;
+                    }
+                }
+                Response::Inbox { messages: batch }
+            }
+            Request::Peers { since } => {
+                let events = self
+                    .events
+                    .iter()
+                    .filter(|(e, _)| *e > since)
+                    .map(|(_, text)| text.clone())
+                    .collect();
+                Response::Peers {
+                    names: self.roster.clone(),
+                    term: self.term,
+                    leader: self.leader.clone(),
+                    epoch: self.events.last().map(|(e, _)| *e).unwrap_or(0),
+                    events,
+                }
+            }
         }
     }
 
-    /// Fold inbox history into the snapshot and trim each inbox to its
-    /// newest `KEEP_RECENT` messages. Called periodically by the
-    /// coordinator's tick loop (`live`), never mid-turn, and returns how
-    /// many messages were folded — 0 means "nothing to do". Pure state
-    /// transition, fully testable: the chat-side effect is simply that
-    /// every agent's next ReadInbox shows the snapshot-anchored tail
-    /// instead of an ever-growing transcript.
+    /// One coordinator tick over the task table: requeue expired leases,
+    /// assign unassigned tasks round-robin, deliver the resulting
+    /// assignment messages, and log the events. Cheap; called every few
+    /// ticks by the raft thread.
+    pub fn task_tick(&mut self) {
+        let roster = self.roster.clone();
+        let now = Self::now_us();
+        let (messages, events) = self.tasks.tick(&roster, now);
+        for (to, body) in messages {
+            let members_ok = self.roster.iter().any(|n| n == &to);
+            if members_ok {
+                let ts = self.stamp();
+self.deliver(&to, Message { from: String::from(GROUP_NAME), round: 0, body, ts, kind: litter_wire::MessageKind::Assignment, role: litter_wire::SenderRole::Leader });
+            }
+        }
+        for e in events {
+            self.event(e);
+        }
+    }
+
+    /// Fold inbox history into ONE marker message per inbox: everything
+    /// past the newest `KEEP_RECENT` is summarized into a
+    /// `"[compacted: …]"` marker placed at the head of the inbox, and the
+    /// originals are dropped. Every `History` walk stops at the marker, so
+    /// a fresh agent sources exactly the relevant tail from the protocol —
+    /// never more than the marker plus the live tail. Returns how many
+    /// messages were folded (0 = nothing to do; the call is idempotent).
     pub fn compact(&mut self) -> usize {
-        let mut folded: Vec<String> = Vec::new();
+        let mut folded_total = 0usize;
+        let mut lines: Vec<String> = Vec::new();
+        let mut prior_marker_bodies: Vec<String> = Vec::new();
         for (_, msgs) in self.inboxes.iter_mut() {
-            if msgs.len() <= KEEP_RECENT {
+            // Existing markers are bookkeeping, not history: strip them and
+            // fold their text into the fresh marker, so repeated compaction
+            // doesn't grow the inbox by one marker per pass.
+            let mut idx = 0;
+            while idx < msgs.len() && msgs[idx].kind == litter_wire::MessageKind::Marker {
+                prior_marker_bodies.push(msgs[idx].body.clone());
+                idx += 1;
+            }
+            let tail_len = msgs.len() - idx;
+            if tail_len <= KEEP_RECENT {
+                // Keep any markers seen so far even if nothing else folded.
+                if idx > 0 {
+                    msgs.drain(..idx);
+                    for b in prior_marker_bodies.drain(..) {
+                        msgs.insert(0, Message {
+                            from: String::from(GROUP_NAME),
+                            round: 0,
+                            body: b,
+                            ts: Self::now_us(),
+                            kind: litter_wire::MessageKind::Marker,
+                            role: litter_wire::SenderRole::Leader,
+                        });
+                    }
+                }
                 continue;
             }
-            let cut = msgs.len() - KEEP_RECENT;
-            for m in msgs.drain(..cut) {
-                folded.push(format!("[r{}] {}: {}", m.round, m.from, summarize(&m.body)));
+            let cut = tail_len - KEEP_RECENT;
+            let folded: Vec<Message> = msgs.drain(idx..idx + cut).collect();
+            folded_total += folded.len();
+            for m in &folded {
+                if lines.len() < MARKER_SUMMARY_LINES {
+                    lines.push(format!("[r{}] {}: {}", m.round, m.from, summarize(&m.body)));
+                }
             }
         }
-        if folded.is_empty() {
+        if folded_total == 0 && prior_marker_bodies.is_empty() {
             return 0;
         }
-        self.snapshot.push_str(&format!("[compacted {} message(s)]\n", folded.len()));
-        for line in folded {
-            self.snapshot.push_str(&line);
-            self.snapshot.push('\n');
+
+        let mut body = String::new();
+        if folded_total > 0 {
+            body.push_str(&format!("[compacted: {} earlier message(s) folded. What was said, in brief:]", folded_total));
+            for line in lines {
+                body.push('\n');
+                body.push_str(&line);
+            }
+            if folded_total > MARKER_SUMMARY_LINES {
+                body.push_str(&format!("\n[+ {} more, not summarized]", folded_total - MARKER_SUMMARY_LINES));
+            }
+        } else {
+            // Nothing new folded — carry the most recent old marker forward.
+            body = prior_marker_bodies.last().cloned().unwrap_or_else(|| String::from("[compacted]"));
         }
-        1
+
+        let marker = Message {
+            from: String::from(GROUP_NAME),
+            round: 0,
+            body,
+            ts: Self::now_us(),
+            kind: litter_wire::MessageKind::Marker,
+            role: litter_wire::SenderRole::Leader,
+        };
+        for (_, msgs) in self.inboxes.iter_mut() {
+            // replace any surviving old markers with the single fresh one
+            let idx = {
+                let mut i = 0;
+                while i < msgs.len() && msgs[i].kind == litter_wire::MessageKind::Marker {
+                    i += 1;
+                }
+                i
+            };
+            msgs.drain(..idx);
+            msgs.insert(0, marker.clone());
+        }
+        if folded_total > 0 {
+            self.event(format!("[event] history compacted ({} message(s) folded)", folded_total));
+        }
+        folded_total
     }
 
     /// Serve exactly one framed request/response pair over an already
-    /// accepted connection, then return — the same one-shot shape every
-    /// meow-side client (`hub::call`) already speaks. Returns `false` on a
-    /// transport error (peer hung up mid-frame); protocol-level problems
-    /// still get a well-formed `Response::Error` back, so a misbehaving
-    /// client can tell them apart from a network failure.
+    /// accepted connection. Returns `false` on a transport error; protocol
+    /// problems still get a well-formed `Response::Error` back.
     pub fn serve_one(&mut self, stream: &mut TcpStream) -> bool {
+        // The stream was set nonblocking by drain(); every read/write here
+        // is deadline-bounded so a half-open client can't park the raft
+        // thread (which would hold the state lock and freeze the hub).
         let mut header = [0u8; 4];
-        if stream.read_exact(&mut header).is_err() {
+        if !deadline::read_exact(stream, &mut header, deadline::IO_TIMEOUT_US) {
             return false;
         }
         let len = decode_len_header(header);
@@ -225,7 +416,7 @@ impl HubState {
         }
 
         let mut body = alloc::vec![0u8; len as usize];
-        if stream.read_exact(&mut body).is_err() {
+        if !deadline::read_exact(stream, &mut body, deadline::IO_TIMEOUT_US) {
             return false;
         }
 
@@ -248,17 +439,34 @@ impl HubState {
 
         write_frame(stream, &encode_response(&response))
     }
+
+}
+
+/// Accept-and-serve every connection already waiting in the backlog.
+/// Non-blocking (`TcpListener::try_accept`): BOTH threads call this on
+/// every tick — the raft thread and the agent loop — so requests are
+/// served by whichever tick lands first. Returns how many frames were
+/// served (0 = quiet litter, no cost).
+pub fn drain(listener: &TcpListener, state: &mut HubState) -> usize {
+    let mut served = 0usize;
+    while let Ok((mut stream, _peer)) = listener.try_accept() {
+        // Deadline-bounded serving: a client that never finishes its
+        // request must not hold the raft thread (and the state lock)
+        // forever. It costs the client a retry — one request per
+        // connection, so a retry is a fresh connection.
+        let _ = libakuma::set_nonblocking(stream.as_raw_fd(), true);
+        state.serve_one(&mut stream);
+        served += 1;
+    }
+    served
 }
 
 fn write_frame(stream: &mut TcpStream, payload: &str) -> bool {
-    let mut framed = Vec::with_capacity(4 + payload.len());
-    framed.extend_from_slice(&encode_len_header(payload.len() as u32));
-    framed.extend_from_slice(payload.as_bytes());
-    stream.write_all(&framed).is_ok()
+    deadline::write_all(stream, &deadline::frame(payload), deadline::IO_TIMEOUT_US)
 }
 
-/// One-line stand-in for a message in the snapshot: truncate to ~120 chars
-/// on a char boundary. A dumb summary, deliberately — the snapshot's job is
+/// One-line stand-in for a folded message: truncate to ~120 chars on a
+/// char boundary. A dumb summary, deliberately — the marker's job is
 /// keeping payloads and context windows small, not editorializing.
 fn summarize(body: &str) -> String {
     let single = body.replace('\n', " ");
@@ -274,95 +482,68 @@ fn summarize(body: &str) -> String {
     s
 }
 
-/// Accept-and-serve every connection already waiting on `listener`'s backlog,
-/// then return how many were served. Non-blocking by design
-/// (`TcpListener::try_accept`): the leader calls this between inbox polls and
-/// around turns, so hub duty costs nothing when the litter is quiet — and
-/// while an agent is mid-turn (an LLM call can take minutes), clients simply
-/// queue in the kernel's listen backlog and get served on the next drain.
-pub fn drain(listener: &TcpListener, state: &mut HubState) -> usize {
-    let mut served = 0usize;
-    while let Ok((mut stream, _peer)) = listener.try_accept() {
-        state.serve_one(&mut stream);
-        served += 1;
-    }
-    served
-}
-
 #[cfg(feature = "tests")]
 pub fn run_tests() -> i32 {
     let mut passed = 0usize;
     let mut total = 0usize;
     libakuma::print("--- litter serve tests ---\n");
 
-    // join → peers round-trip, and join is idempotent
+    // join → peers (with term/leader), idempotent join, join/leave events
     total += 1;
     {
         let mut hub = HubState::new();
-        let j1 = hub.handle(Request::Join { name: String::from("sherlock") });
-        let j2 = hub.handle(Request::Join { name: String::from("sherlock") });
-        let peers = hub.handle(Request::Peers);
-        let joined = matches!(j1, Response::Joined) && matches!(j2, Response::Joined);
-        let listed = matches!(&peers, Response::Peers { names } if names.len() == 1 && names[0] == "sherlock");
-        if joined && listed { passed += 1; }
-        else { libakuma::print(&format!("  [!] join/peers: joined={:?} listed={:?}\n", j1, peers)); }
+        hub.set_leader("sherlock", 1);
+        let j = hub.handle(Request::Join { name: String::from("sherlock") });
+        hub.handle(Request::Join { name: String::from("sherlock") });
+        let peers = hub.handle(Request::Peers { since: 0 });
+        let joined = matches!(j, Response::Joined);
+        let ok = matches!(&peers, Response::Peers { names, term, leader, events, .. }
+            if names.len() == 1 && *term == 1 && leader.as_deref() == Some("sherlock")
+               && events.iter().any(|e| e.contains("sherlock is leader"))
+               && events.iter().filter(|e| e.contains("joined")).count() == 1);
+        if joined && ok { passed += 1; }
+        else { libakuma::print(&format!("  [!] join/peers: joined={:?} peers={:?}\n", j, peers)); }
     }
 
-    // join rejects invalid names and rejects a roster overflowing the cap
+    // event cursor: since=last epoch returns nothing new
     total += 1;
     {
         let mut hub = HubState::new();
-        let bad = hub.handle(Request::Join { name: String::from("../etc") });
-        let mut full = HubState::new();
-        let mut overflow = false;
-        for i in 0..MAX_ROSTER_SIZE + 1 {
-            let r = full.handle(Request::Join { name: format!("agent-{}", i) });
-            if let Response::Error { .. } = r {
-                overflow = i == MAX_ROSTER_SIZE;
-                break;
-            }
-        }
-        let bad_rejected = matches!(bad, Response::Error { .. });
-        if bad_rejected && overflow { passed += 1; }
-        else { libakuma::print(&format!("  [!] cap/invalid: bad={:?} overflow={}\n", bad, overflow)); }
+        hub.handle(Request::Join { name: String::from("a") });
+        let after = hub.handle(Request::Peers { since: 0 });
+        let epoch = match &after {
+            Response::Peers { epoch, .. } => *epoch,
+            _ => 0,
+        };
+        let again = hub.handle(Request::Peers { since: epoch });
+        let fresh = matches!(&again, Response::Peers { events, .. } if events.is_empty());
+        if epoch > 0 && fresh { passed += 1; }
+        else { libakuma::print(&format!("  [!] cursor: epoch={} again={:?}\n", epoch, again)); }
     }
 
-    // send → inbox; empty inbox for an unknown name is not an error
+    // history paging: newest-first take, delivered ascending
     total += 1;
     {
         let mut hub = HubState::new();
         hub.handle(Request::Join { name: String::from("hercules") });
-        hub.handle(Request::Join { name: String::from("sherlock") });
-        let sent = hub.handle(Request::Send {
-            from: String::from("sherlock"),
-            to: String::from("hercules"),
-            body: String::from("the game is afoot"),
-            round: 1,
-        });
-        let inbox = hub.handle(Request::Inbox { name: String::from("hercules") });
-        let ghost = hub.handle(Request::Inbox { name: String::from("ressler") });
-        let ok_sent = matches!(sent, Response::Sent { bytes } if bytes == 17);
-        let ok_inbox = matches!(&inbox, Response::Inbox { messages }
-            if messages.len() == 1 && messages[0].from == "sherlock" && messages[0].round == 1);
-        let ok_ghost = matches!(&ghost, Response::Inbox { messages } if messages.is_empty());
-        if ok_sent && ok_inbox && ok_ghost { passed += 1; }
-        else { libakuma::print(&format!("  [!] send/inbox: sent={:?} inbox={:?} ghost={:?}\n", sent, inbox, ghost)); }
+        for i in 0..10u64 {
+            let r = hub.handle(Request::Send { from: String::from("hercules"), to: String::from("hercules"), body: format!("m{}", i), round: i as i64 });
+            let _ = r;
+        }
+        // Give the messages distinct ts values by construction: send twice
+        // (now_us granularity may collide), so instead read all and page by
+        // the second-newest ts.
+        let all = hub.handle(Request::Inbox { name: String::from("hercules") });
+        let msgs = match all { Response::Inbox { messages } => messages, _ => Vec::new() };
+        let before = msgs[8].ts; // everything from m8 back
+        let page = hub.handle(Request::History { name: String::from("hercules"), before, limit: 3 });
+        let paged = match page { Response::Inbox { messages } => messages, _ => Vec::new() };
+        let ok = paged.len() == 3 && paged.iter().enumerate().all(|(i, m)| m.body == format!("m{}", 5 + i as u64));
+        if ok { passed += 1; }
+        else { libakuma::print(&format!("  [!] history page: {:?}\n", paged.iter().map(|m| m.body.clone()).collect::<Vec<_>>())); }
     }
 
-    // send rejects invalid from/to and empty bodies
-    total += 1;
-    {
-        let mut hub = HubState::new();
-        let bad_from = hub.handle(Request::Send { from: String::from("a b"), to: String::from("x"), body: String::from("hi"), round: 0 });
-        let bad_to = hub.handle(Request::Send { from: String::from("x"), to: String::new(), body: String::from("hi"), round: 0 });
-        let empty = hub.handle(Request::Send { from: String::from("x"), to: String::from("y"), body: String::new(), round: 0 });
-        let all_err = [bad_from, bad_to, empty].iter().all(|r| matches!(r, Response::Error { .. }));
-        if all_err { passed += 1; }
-        else { libakuma::print("  [!] send validation: some invalid send was accepted\n"); }
-    }
-
-    // group broadcast: Send to the reserved `litter` name fans out to every
-    // roster member, and the sender gets their own copy back too
+    // group fan-out reaches every member
     total += 1;
     {
         let mut hub = HubState::new();
@@ -372,14 +553,14 @@ pub fn run_tests() -> i32 {
         hub.handle(Request::Send { from: String::from("sherlock"), to: String::from(GROUP_NAME), body: String::from("attention all"), round: 2 });
         let every_member_has_it = ["sherlock", "hercules", "zenigata"].iter().all(|n| {
             matches!(hub.handle(Request::Inbox { name: String::from(*n) }),
-                Response::Inbox { messages } if messages.len() == 1 && messages[0].body == "attention all")
+                Response::Inbox { messages } if messages.iter().any(|m| m.body == "attention all"))
         });
         if every_member_has_it { passed += 1; }
         else { libakuma::print("  [!] group broadcast: some member did not receive the fan-out\n"); }
     }
 
-    // compaction: history beyond the tail folds into the snapshot and a
-    // joining member receives the snapshot as its first inbox message
+    // compaction: fold past the tail into a marker; marker sits at inbox
+    // head and carries the summary; History walks stop at it naturally
     total += 1;
     {
         let mut hub = HubState::new();
@@ -388,30 +569,106 @@ pub fn run_tests() -> i32 {
             hub.handle(Request::Send { from: String::from("sherlock"), to: String::from("sherlock"), body: format!("msg {}", i), round: i as i64 });
         }
         let folded = hub.compact();
-        let kept = matches!(hub.handle(Request::Inbox { name: String::from("sherlock") }),
-            Response::Inbox { messages } if messages.len() == KEEP_RECENT);
-        let empty = hub.compact() == 0; // idempotent when nothing to fold
-        if folded == 1 && kept && empty && hub.snapshot.contains("[r0] sherlock: msg 0") && !hub.snapshot.contains("msg 18") {
+        let inbox = hub.handle(Request::Inbox { name: String::from("sherlock") });
+        let msgs = match inbox { Response::Inbox { messages } => messages, _ => Vec::new() };
+        let marker_first = msgs[0].body.starts_with("[compacted:") && msgs[0].body.contains("msg 0");
+        let kept = msgs.len() == KEEP_RECENT + 1; // tail + marker
+        let idempotent = hub.compact() == 0;
+        if folded == 5 && marker_first && kept && idempotent {
             passed += 1;
         } else {
-            libakuma::print(&format!("  [!] compact: folded={} kept={} empty2={} snap={}\n", folded, kept, empty, hub.snapshot));
+            libakuma::print(&format!("  [!] compact: folded={} first={:?} kept={} idem={}\n", folded, msgs.first().map(|m| m.body.clone()), kept, idempotent));
         }
     }
 
-    // a joining agent's first inbox message is the snapshot, nothing older
+    // task hooks: [task] seeds the table, coordinator tick assigns and
+    // delivers, [done: tN] closes and logs an event
     total += 1;
     {
         let mut hub = HubState::new();
-        hub.set_snapshot(String::from("we decided: use dual-bank boot\n"));
-        hub.handle(Request::Send { from: String::from("sherlock"), to: String::from(GROUP_NAME), body: String::from("old debate"), round: 1 });
-        hub.handle(Request::Join { name: String::from("ressler") });
-        let inbox = hub.handle(Request::Inbox { name: String::from("ressler") });
-        let ok = matches!(&inbox, Response::Inbox { messages }
-            if messages.len() == 1 && messages[0].body.contains("dual-bank boot") && !messages[0].body.contains("old debate"));
-        if ok { passed += 1; }
-        else { libakuma::print(&format!("  [!] join snapshot: {:?}\n", inbox)); }
+        hub.handle(Request::Join { name: String::from("sherlock") });
+        hub.handle(Request::Send { from: String::from("root"), to: String::from(GROUP_NAME), body: String::from("[task] audit main.rs"), round: 0 });
+        hub.task_tick();
+        let inbox = hub.handle(Request::Inbox { name: String::from("sherlock") });
+        let msgs = match inbox { Response::Inbox { messages } => messages, _ => Vec::new() };
+        let got_assignment = msgs.iter().any(|m| m.body.starts_with("[assigned: t1]") && m.body.contains("audit main.rs"));
+        let done = hub.handle(Request::Send { from: String::from("sherlock"), to: String::from(GROUP_NAME), body: String::from("[done: t1] all clear"), round: 0 });
+        let peers = hub.handle(Request::Peers { since: 0 });
+        let done_ok = matches!(done, Response::Sent { .. })
+            && matches!(&peers, Response::Peers { events, .. } if events.iter().any(|e| e.contains("t1 done by sherlock")))
+            && hub.tasks.is_empty();
+        if got_assignment && done_ok { passed += 1; }
+        else { libakuma::print(&format!("  [!] task hooks: got_assignment={} done_ok={}\n", got_assignment, done_ok)); }
     }
 
     libakuma::print(&format!("  result: {}/{}\n", passed, total));
     if passed == total { 0 } else { 1 }
+}
+
+/// Deadline-bounded I/O over a NONBLOCKING stream. The whole point: a
+/// hub client that goes silent (hung leader, half-open connection) must
+/// cost the reader a bounded wait, never an unbounded one — otherwise a
+/// dead hub freezes the very loop that is supposed to detect it and
+/// re-elect (see docs/LITTER_STATE_MACHINE.md, WAYWARD).
+pub mod deadline {
+    use alloc::vec::Vec;
+    use libakuma::net::TcpStream;
+
+    /// One bounded I/O wait in µs — comfortably above a healthy hub's
+    /// serve latency, far below WAYWARD_TIMEOUT.
+    pub const IO_TIMEOUT_US: u64 = 5 * 1_000_000;
+    const POLL_SLEEP_MS: u64 = 2;
+
+    fn now_us() -> u64 {
+        crate::util::now_us()
+    }
+
+    /// Read exactly `buf.len()` bytes or give up at the deadline.
+    pub fn read_exact(stream: &TcpStream, buf: &mut [u8], timeout_us: u64) -> bool {
+        let deadline = now_us().saturating_add(timeout_us);
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let n = unsafe {
+                libakuma::read_fd(stream.as_raw_fd(), &mut buf[filled..])
+            };
+            if n > 0 {
+                filled += n as usize;
+            } else if n == 0 {
+                return false; // EOF
+            } else if now_us() >= deadline {
+                return false; // timeout (or hard error — same treatment)
+            } else {
+                libakuma::sleep_ms(POLL_SLEEP_MS);
+            }
+        }
+        true
+    }
+
+    /// Write the whole framed payload or give up at the deadline.
+    pub fn write_all(stream: &TcpStream, payload: &[u8], timeout_us: u64) -> bool {
+        let deadline = now_us().saturating_add(timeout_us);
+        let mut sent = 0usize;
+        while sent < payload.len() {
+            let n = unsafe {
+                libakuma::write_fd(stream.as_raw_fd(), &payload[sent..])
+            };
+            if n > 0 {
+                sent += n as usize;
+            } else if now_us() >= deadline {
+                return false;
+            } else {
+                libakuma::sleep_ms(POLL_SLEEP_MS);
+            }
+        }
+        true
+    }
+
+    /// Frame a payload (4-byte big-endian length + bytes).
+    pub fn frame(payload: &str) -> Vec<u8> {
+        use litter_wire::{encode_len_header, MAX_FRAME_LEN};
+        let mut framed = Vec::with_capacity(4 + payload.len());
+        framed.extend_from_slice(&encode_len_header(payload.len() as u32));
+        framed.extend_from_slice(payload.as_bytes());
+        framed
+    }
 }
