@@ -85,23 +85,17 @@ fn require_agent_name() -> Result<String, ToolResult> {
     })
 }
 
-/// Route the Litter* tools: fail fast in the WAYWARD state, otherwise talk
-/// to the configured hub like any other client.
+/// Route the Litter* tools to the configured hub. No staleness gate here,
+/// deliberately: a long LLM turn is NOT hub silence, and gating on
+/// time-since-last-call latched the whole turn shut the first time a model
+/// thought for 15 seconds (observed live). Every client call is
+/// deadline-bounded (5s) in `hub::call_addr`, so a genuinely dead hub
+/// costs each tool call 5s and a clean error — and the tick loop's pulse
+/// is what drives the WAYWARD transition, not the tools.
 fn hub_gate() -> Result<String, ToolResult> {
-    match hub::hub_addr() {
-        Some(addr) => {
-            if hub::unresponsive() {
-                return Err(ToolResult::err(alloc::format!(
-                    "hub unresponsive (no answer for {}s) — the litter is wayward; retry later",
-                    hub::silent_for_secs()
-                )));
-            }
-            Ok(addr)
-        }
-        None => Err(ToolResult::err(
-            "Litter hub not configured: set litter_hub_addr in the config",
-        )),
-    }
+    hub::hub_addr().ok_or_else(|| {
+        ToolResult::err("Litter hub not configured: set litter_hub_addr in the config")
+    })
 }
 
 pub fn tool_send_message(to: &str, body: &str, round: i64) -> ToolResult {

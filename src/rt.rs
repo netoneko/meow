@@ -67,31 +67,76 @@ static NEXT_STACK: AtomicU64 = AtomicU64::new(0);
 //
 // The parent's thread pointer is read with `mrs` and handed to clone as
 // the TLS argument; the kernel installs it as the child's `tpidr_el0`.
+// The spawn trampoline, per architecture. Same shape both ways:
+// parent-side assembly around the `clone` syscall (the child cannot return
+// into Rust — its sp points at a stack with no frame), entry fn planted on
+// the child stack, child exits with `exit`-not-`exit_group`.
+//
+// Per-arch syscall ABI facts that bite if missed:
+// - aarch64: nr in x8, args x0-x5, `svc #0`; clone = 220.
+// - x86_64: nr in rax, args rdi,rsi,rdx,r10,r8,r9, `syscall` clobbers
+//   rcx/r11; clone = 56, and the fourth argument (child_tid) goes in r10,
+//   NOT rcx — the classic port bug libakuma's own syscall wrapper
+//   documents.
+// - TLS: neither arch sets it. meow's raw `_start` never initializes the
+//   parent's TLS either (aarch64: tpidr_el0 = 0; x86_64: fs base unset),
+//   and CLONE_SETTLS with that gets refused / is pointless — so litter
+//   threads run TLS-free. no_std meow + libakuma raw syscalls never touch
+//   TLS; musl `errno` does, so no libc calls from a litter thread.
+#[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
     r#"
     .section .text.litter_spawn_thread
     .global litter_spawn_thread
 litter_spawn_thread:
     /* x0 = flags, x1 = child stack top, x2 = entry fn */
-    mov x6, x0                  /* flags */
-    mrs x4, tpidr_el0           /* child shares the parent's TLS image */
     sub x1, x1, 16
     str x2, [x1]                /* plant the entry fn on the child stack */
     mov x2, xzr                 /* parent_tid = NULL */
     mov x3, xzr                 /* child_tid = NULL (detached) */
+    mov x4, xzr                 /* tls = NULL (TLS-free by design) */
     mov x8, 220                 /* SYS_clone */
     svc #0
     cbnz x0, 2f                 /* parent: x0 = child tid, done */
     /* child */
     ldr x19, [sp], 16           /* entry fn */
     blr x19
-    /* the entry fn is done: end this thread and only this thread */
     mov x0, 93                  /* SYS_exit — NOT exit_group */
     svc #0
 1:  b 1b
 2:  ret
 "#
 );
+
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    r#"
+    .section .text.litter_spawn_thread
+    .global litter_spawn_thread
+litter_spawn_thread:
+    /* rdi = flags, rsi = child stack top, rdx = entry fn */
+    sub rsi, 8
+    mov [rsi], rdx              /* plant the entry fn on the child stack */
+    xor edx, edx                /* parent_tid = NULL */
+    xor r10d, r10d              /* child_tid = NULL (detached) */
+    xor r8d, r8d                /* tls = NULL (TLS-free by design) */
+    mov rax, 56                 /* SYS_clone */
+    syscall
+    test rax, rax
+    jnz 2f                      /* parent: rax = child tid, done */
+    /* child */
+    pop rax
+    call rax
+    mov eax, 60                 /* SYS_exit — NOT exit_group */
+    xor edi, edi                /* status 0 */
+    syscall
+1:  jmp 1b
+2:  ret
+"#
+);
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+core::compile_error!("litter threads: no clone trampoline for this architecture yet");
 
 unsafe extern "C" {
     /// Returns the child's tid in the parent; never returns in the child.
@@ -155,7 +200,10 @@ impl<T> PMutex<T> {
 const FUTEX_WAIT_PRIVATE: i32 = 128;
 const FUTEX_WAKE_PRIVATE: i32 = 129;
 
-const SYS_FUTEX: u64 = 98; // aarch64
+#[cfg(target_arch = "aarch64")]
+const SYS_FUTEX: u64 = 98;
+#[cfg(target_arch = "x86_64")]
+const SYS_FUTEX: u64 = 202;
 
 fn futex_wait(word: &AtomicI32, expected: i32) {
     // Ignore the return: a spurious wake or EAGAIN just re-runs the swap loop.
