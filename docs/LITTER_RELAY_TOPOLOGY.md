@@ -134,6 +134,52 @@ place:
   vanishing from `ps` with logs ending mid-line is this, not a litter
   bug. Stop the yard, rebuild, start it.
 
+## Second attempt: trashcan ↔ ryzen (2026-09-20, later) — discovery, still no crossing
+
+Two litters this time, not three: `trashcan` (bare metal) and `ryzen`
+(Firecracker guest). The yard was retired from the picture.
+
+**Reached, for the first time:** the trashcan *discovers* its peer —
+`[event] static peer ryzen discovered at 192.168.1.126:7701` — and keeps
+rediscovering it, because the peer flaps. **Not reached:** any crossing;
+`Inbox for 'panther' is empty` after two sends.
+
+Three things about the relay itself came out of it, and they matter for the
+design in "Direction" below:
+
+- **A probe is paid for out of the hub's ability to serve.** `probe_peers_io`
+  runs inline in the raft thread — the same thread as `serve::drain` — and used
+  the same 5 s budget as a real request. Two litters listing each other starve
+  each other's serve loops *symmetrically and permanently*: neither answers, so
+  both probes time out, forever, and it survives restarts because it is
+  symmetric. Probes now get `PROBE_TIMEOUT_US` (500 ms) plus doubling backoff on
+  a silent peer. **The connect is still unbounded** — an unanswered SYN sits for
+  Akuma's 10 s `CONNECT_TIMEOUT_US`, longer than the pulse interval, so this is
+  mitigated rather than fixed.
+- **A static-peer address is a liability.** Every address in this session was
+  wrong at least once: the yard pointed at the host instead of the guest, the
+  guest kept the pre-move address, and the two boxes turned out unable to reach
+  each other at all. See "Open questions" — peer discovery is the real answer.
+- **The two boxes could not reach each other directly**, while every non-Akuma
+  host reached both. Hub traffic is currently relayed through forwarders on the
+  Ryzen host (`:7701` → the guest, `:7702` → the trashcan), which is what made
+  discovery work at all. `docs/archive/AMD64_PROXY_ARP_UNREACHABLE.md` in the
+  main repo.
+
+**Why no crossing:** the guest's hub accepts a TCP connection in 0.01 s and
+answers nobody, because meow's raft thread there starts and never runs its first
+loop iteration. That thread is what serves the hub and what drains the relay
+log, so nothing can cross. Full write-up:
+`docs/archive/AMD64_SPAWNED_THREAD_NEVER_RUNS.md`, and the session narrative is
+`docs/archive/LITTER_TRASHCAN_RYZEN_JOIN.md`.
+
+**One trap worth adding to the list below:** `litter_hub_addr=0.0.0.0:7700`
+looks like the way to expose a hub and is not. Akuma's listener binds by **port
+only**, so a hub on `127.0.0.1:7700` already answers on the box's LAN address —
+verified from another host. Setting `0.0.0.0` changes nothing about who can
+reach it and breaks every local client, because Akuma cannot `connect()` to
+`0.0.0.0`.
+
 ### Still to do
 
 - Complete one verified crossing in each direction.
