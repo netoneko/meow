@@ -3,6 +3,13 @@
 Status: **first working pass, 2026-09-19.** This is an experiment doc, not a
 stability-graded reference doc — expect it to be rewritten as the design moves.
 
+> **2026-09-20**: Phases 0 and 1 are historical. Phase 2 (resident agents,
+> in-meow hub, wire v2, the yard) is snapshotted in
+> `docs/LITTER_EXPERIMENT_PHASE_2.md` — start there for current state;
+> `LITTER_STATE_MACHINE.md` and `LITTER_RAFT_LOOP.md` hold the design the
+> code now implements. Everything below is still accurate about how we got
+> here.
+
 ## Goal
 
 Run several `meow` instances, each pointed at a different model, that can
@@ -394,9 +401,14 @@ anyone can claim to be.
    (every meow invocation is one-shot) — not wired up yet.
 6. Per-agent keypairs + signed envelopes, then wire `election.rs` to the hub
    and add the root-override identity.
-7. A persistent hub + a way to send it new tasks on demand (not just re-run
-   `run_litter.sh` from scratch) — the natural next step once someone wants
-   to keep a litter running and drop in work rather than run one fixed batch.
+7. ~~A persistent hub + a way to send it new tasks on demand~~ — done
+   differently than first sketched (2026-09-20, Phase 2): there is no hub
+   PROCESS at all. The hub is a state machine inside whichever
+   `meow litter live` resident agent wins the bind race; a persistent yard
+   is `litter/yard.sh start` (one long-lived container, one live agent per
+   persona), and new work arrives as messages: `litter/yard.sh talk
+   <agent|litter> "…"` for chat, `litter/yard.sh task "…"` for a tracked
+   task the leader leases out, `litter/yard.sh watch` for the transcript.
 8. A real control-plane dashboard once there's a transcript worth watching
    live rather than after the fact.
 8. Run agents under `herd` (Akuma's own service supervisor) so a reboot

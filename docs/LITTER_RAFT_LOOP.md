@@ -1,6 +1,6 @@
 # Litter raft loop: messages and tool calls that drive the swarm
 
-Status: design snapshot (2026-09-20). Companion to
+Status: built and live-verified (2026-09-20); companion to
 `docs/LITTER_STATE_MACHINE.md` (agent-side states). This doc is the
 *message-level* view: which wire messages and LLM tool calls flow, in what
 order, and which process drives each. Read that one first for the states;
@@ -8,10 +8,19 @@ this one for the traffic.
 
 ## Process view: two threads, one process
 
-The agent is a **single process** (`meow litter live`) with two pthread
-threads (raw musl pthreads — meow is `no_std`, so `src/rt/threads.rs`
-declares `pthread_create`/`pthread_mutex_*` externs and wraps them in a
-tiny safe `spawn_thread` + `PMutex<T>`):
+The agent is a **single process** (`meow litter live`) with two threads.
+Built and live-verified (2026-09-20) — and the threads are NOT musl
+pthreads: meow's raw `_start` never initializes musl's thread runtime, so
+`pthread_create` fails. `src/rt.rs` does what
+`userspace/amd64/threadprobe` does: raw `clone(CLONE_VM|…|CLONE_THREAD)`
+with a per-arch assembly trampoline (aarch64 + x86_64, cfg-gated; child
+never returns into Rust; `exit`-not-`exit_group`), threads are TLS-free
+(no `CLONE_SETTLS`: the parent's thread pointer is never initialized), and
+the shared state sits behind one futex-word mutex (`rt::PMutex`,
+Drop-guard unlock). Live-found bugs this encoding absorbed: loopback
+self-deadlock, blocking `try_accept`, the self-silencing staleness gate,
+CLONE_SETTLS EINVAL, unconditional aarch64 asm — see
+`docs/LITTER_EXPERIMENT_PHASE_2.md`.
 
 ```
 ┌─────────────────────────── meow litter live (one process) ─────────────────────────────┐

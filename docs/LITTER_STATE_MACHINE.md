@@ -1,6 +1,7 @@
 # Litter agent state machine
 
-Status: design snapshot (2026-09-20). Companion docs:
+Status: implementation-accurate as of 2026-09-20 (live-found bugs absorbed;
+see `docs/LITTER_EXPERIMENT_PHASE_2.md`). Companion docs:
 `LITTER_RAFT_LOOP.md` (message-level view: wire frames + tool calls, thread
 wiring). This doc is the agent's control flow; the code, tests and scripts
 all use these words.
@@ -19,12 +20,14 @@ the last compaction marker.
 
 ## The states
 
-One process (`meow litter live`), **two pthread threads** (raw musl
-pthreads; wiring in `LITTER_RAFT_LOOP.md`): the main thread is the agent
-loop (poll → wake → LLM turn, may stall minutes); a second thread runs the
-raft/serve duties (drain, heartbeats, task leases, compaction, votes) and
-is never blocked by inference. Agent-loop decisions happen between ticks;
-the raft thread ticks straight through any turn.
+One process (`meow litter live`), **two threads** (raw-clone trampoline,
+NOT pthreads — meow's raw `_start` never initializes musl's thread
+runtime, so `pthread_create` fails; see `src/rt.rs` and the wiring notes
+in `LITTER_RAFT_LOOP.md`): the main thread is the agent loop (poll → wake
+→ LLM turn, may stall minutes); a second thread runs the raft/serve duties
+(drain, heartbeats, task leases, compaction, votes) and is never blocked by
+inference. Agent-loop decisions happen between ticks; the raft thread ticks
+straight through any turn.
 
 ```
                              STARTUP
