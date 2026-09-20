@@ -1298,6 +1298,54 @@ pub mod sim {
             else { libakuma::print(&format!("  [!] permissive: accepted={} bad_refused={}\n", accepted, bad_refused)); }
         }
 
+        // 10. direct-message wake: a message addressed to ONE agent (not the
+        //     group) is exactly what `live::run()`'s agent loop polls for via
+        //     `local_inbox_count` — reproduces the trashcan->ryzen shape
+        //     (kirill's chat relayed to a resident live process) and checks
+        //     the piece observe can't see: whether the receiving side's own
+        //     wake predicate actually flips. Three roles, each exercised
+        //     through its real, unmodified function rather than a
+        //     reimplementation: the sending litter's raft thread
+        //     (`relay_jobs`/`relay_send`, mocked here as `relay_tick`, same
+        //     as every other cross-litter test above), the receiving
+        //     litter's raft thread accepting the `Request::Send` into
+        //     `HubState::handle`, and the receiving agent loop's own wake
+        //     check (`super::local_inbox_count` + `super::wakeable`, copied
+        //     from nowhere — it's the literal fn `run()`'s Leader/Follower
+        //     arms call). A regression here reads exactly like the live bug
+        //     that motivated it: "a direct message arrived and nobody
+        //     answered."
+        total += 1;
+        {
+            let mut sw = vec![
+                ("yard", Litter::seed("yard", "10.0.0.1:7700", &["al"], "island@10.0.0.2:7700")),
+                ("island", Litter::seed("island", "10.0.0.2:7700", &["bob"], "yard@10.0.0.1:7700")),
+            ];
+            let i_yard = sw.iter().position(|(n, _)| *n == "yard").unwrap();
+            // Baseline the receiving agent's own loop would have captured at
+            // its own startup, before anything arrived (`live::run`'s `seen`).
+            let seen = super::local_inbox_count(&mut sw[i_yard].1.hub, "al");
+
+            say(&mut sw, "island", "bob", "al", "direct hello", 3);
+            let crossed = relay_tick(&mut sw, "island");
+
+            let count = super::local_inbox_count(&mut sw[i_yard].1.hub, "al");
+            let woke = count > seen;
+            let landed_wakeably = matches!(
+                sw[i_yard].1.hub.handle(Request::Inbox { name: String::from("al") }),
+                Response::Inbox { messages }
+                    if messages.iter().any(|m| m.from == "bob" && m.body == "direct hello" && super::wakeable(m))
+            );
+            let ok = crossed == 1 && seen == 0 && woke && landed_wakeably;
+            if ok { passed += 1; }
+            else {
+                libakuma::print(&format!(
+                    "  [!] direct wake: crossed={} seen={} count={} woke={} landed_wakeably={}\n",
+                    crossed, seen, count, woke, landed_wakeably
+                ));
+            }
+        }
+
         libakuma::print(&format!("  result: {}/{}\n", passed, total));
         if passed == total { 0 } else { 1 }
     }
