@@ -330,6 +330,15 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
     // A timestamp cursor, not a count: the turn is built from the messages
     // themselves now, so what matters is *which* are new, and the hub
     // guarantees strictly increasing stamps (`Membership::stamp`).
+    //
+    // It is advanced EXACTLY ONCE per tick, before the turn, over the batch
+    // that was actually fed. Re-reading the inbox afterwards and advancing
+    // again — which is what this did first — silently eats every message
+    // that arrived *during* the turn, and an LLM turn is minutes. Observed
+    // live 2026-09-20: the leader's `[plan-needed]` directive landed while
+    // it was still answering the roll call, was skipped without ever being
+    // shown to the model, and the task only progressed when the nag timer
+    // re-sent it two minutes later.
     let mut cursor: u64 = match &machine {
         // Solo leaders read their own state; everyone else — including a
         // leader with a live owner thread — asks over the socket.
@@ -344,6 +353,16 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
 
     let mut tick: u64 = 0;
     let mut latest_term: u64 = 0; // highest term any pulse reported
+
+    // Cluster events owed to the model. The event log is how the litter
+    // announces everything that is not a message — elections, joins,
+    // leaves, task churn — and until now the loop printed those to the
+    // console and told the model nothing. A ROLE CHANGE is the one that
+    // matters most: every agent runs this same loop and applies its role
+    // from state, so a switch needs no new code path, but the model behind
+    // it is still answering as whatever it was last told it is.
+    let mut event_epoch: u64 = 0;
+    let mut pending_events: Vec<String> = Vec::new();
 
     loop {
         tick += 1;
@@ -378,33 +397,40 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                     // SAFETY: solo means no owner thread exists, so this
                     // thread is the single owner (see `OwnerCtx`).
                     if let Some(ctx) = owner_ctx() {
-                        let st = unsafe { ctx.state() };
-                        serve::drain(listener, st);
-                        let feed = local_feed(st, &me, cursor);
-                        if feed.iter().any(wakeable) {
-                            cursor = high_water(&feed, cursor);
-                            run_turn(&me, &model, &provider, &system_prompt, &feed);
-                            let st = unsafe { ctx.state() };
-                            serve::drain(listener, st);
-                            cursor = high_water(&local_feed(st, &me, cursor), cursor);
-                        } else {
-                            // Nothing worth waking for, but it has still
-                            // been read: leaving non-wakeable traffic under
-                            // the cursor would re-feed it every tick.
-                            cursor = high_water(&feed, cursor);
+                        // Advance once, over exactly what was fed: everything
+                        // in this batch has now been read, whether or not it
+                        // was worth a turn.
+                        let (feed, next) = drain_feed_local(ctx, listener, &me, cursor);
+                        cursor = next;
+                        if feed.iter().any(|m| rouses(m, &me)) {
+                            run_turn(&me, &model, &provider, &system_prompt, &feed, &pending_events, &addr);
+                        pending_events.clear();
                         }
                     }
                 } else {
+                    if tick % PULSE_TICKS == 0 {
+                        if let Ok(Response::Peers { term: t, epoch: e, events, .. }) =
+                            hub::peers(&addr, event_epoch)
+                        {
+                            hub::mark_alive();
+                            latest_term = latest_term.max(t);
+                            for event in events {
+                                libakuma::safe_print!(256, "[live] {} hears: {}\n", me, event);
+                                pending_events.push(event);
+                            }
+                            event_epoch = e;
+                        }
+                    }
                     // The owner thread has the state and always answers, so
                     // the leader is an ordinary client of its own hub —
                     // identical to a follower. This is what single ownership
                     // buys: the agent loop holds nothing, locks nothing, and
                     // cannot starve the hub by thinking for four minutes.
-                    let feed = remote_feed(&addr, &me, cursor);
-                    cursor = high_water(&feed, cursor);
-                    if feed.iter().any(wakeable) {
-                        run_turn(&me, &model, &provider, &system_prompt, &feed);
-                        cursor = high_water(&remote_feed(&addr, &me, cursor), cursor);
+                    let (feed, next) = drain_feed(&addr, &me, cursor);
+                    cursor = next;
+                    if feed.iter().any(|m| rouses(m, &me)) {
+                        run_turn(&me, &model, &provider, &system_prompt, &feed, &pending_events, &addr);
+                        pending_events.clear();
                     }
                 }
             }
@@ -418,8 +444,10 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                             *roster = names;
                             for event in events {
                                 libakuma::safe_print!(256, "[live] {} hears: {}\n", me, event);
+                                pending_events.push(event);
                             }
                             *epoch = e;
+                            event_epoch = e;
                         }
                         Ok(_) => {}
                         Err(_) => { /* probe failed: liveness bookkeeping simply doesn't advance */ }
@@ -431,11 +459,11 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                         continue;
                     }
                 }
-                let feed = remote_feed(&addr, &me, cursor);
-                cursor = high_water(&feed, cursor);
-                if feed.iter().any(wakeable) {
-                    run_turn(&me, &model, &provider, &system_prompt, &feed);
-                    cursor = high_water(&remote_feed(&addr, &me, cursor), cursor);
+                let (feed, next) = drain_feed(&addr, &me, cursor);
+                cursor = next;
+                if feed.iter().any(|m| rouses(m, &me)) {
+                    run_turn(&me, &model, &provider, &system_prompt, &feed, &pending_events, &addr);
+                        pending_events.clear();
                 }
             }
             Machine::Wayward { epoch, roster, term } => {
@@ -1068,9 +1096,81 @@ fn remote_feed(addr: &str, me: &str, cursor: u64) -> Vec<Message> {
     }
 }
 
+/// How many times a drain re-reads before giving up and running the turn
+/// anyway. Bounded because a litter talking faster than this agent thinks
+/// must not be able to starve it of turns entirely.
+const DRAIN_ROUNDS: usize = 4;
+
+/// Settle time between drain passes. Long enough for a message already in
+/// flight to land, short enough to be invisible against an LLM turn.
+const DRAIN_SETTLE_MS: u64 = 50;
+
+/// Read the inbox until it stops producing, and return **everything** that
+/// arrived, oldest first.
+///
+/// A turn should never start on a partial view. One read gets whatever had
+/// landed at that instant; anything in flight arrives moments later and
+/// would otherwise wait a full tick — or, worse, a full turn, since the
+/// next read happens after the model has finished thinking. Draining to
+/// quiescence first means the model sees the whole backlog at once and can
+/// answer it in one pass, which is the entire point of feeding the inbox
+/// instead of making it fetch: one turn per *batch*, not one per message.
+fn drain_feed(addr: &str, me: &str, cursor: u64) -> (Vec<Message>, u64) {
+    let mut all: Vec<Message> = Vec::new();
+    let mut c = cursor;
+    for round in 0..DRAIN_ROUNDS {
+        let batch = remote_feed(addr, me, c);
+        if batch.is_empty() {
+            break;
+        }
+        c = high_water(&batch, c);
+        all.extend(batch);
+        if round + 1 < DRAIN_ROUNDS {
+            libakuma::sleep_ms(DRAIN_SETTLE_MS);
+        }
+    }
+    (all, c)
+}
+
+/// [`drain_feed`] for the solo leader, reading the state it owns.
+fn drain_feed_local(ctx: &OwnerCtx, listener: &TcpListener, me: &str, cursor: u64) -> (Vec<Message>, u64) {
+    let mut all: Vec<Message> = Vec::new();
+    let mut c = cursor;
+    for round in 0..DRAIN_ROUNDS {
+        // SAFETY: solo ⇒ no owner thread ⇒ this thread is the single owner.
+        let st = unsafe { ctx.state() };
+        serve::drain(listener, st);
+        let batch = local_feed(st, me, c);
+        if batch.is_empty() {
+            break;
+        }
+        c = high_water(&batch, c);
+        all.extend(batch);
+        if round + 1 < DRAIN_ROUNDS {
+            libakuma::sleep_ms(DRAIN_SETTLE_MS);
+        }
+    }
+    (all, c)
+}
+
 /// The newest timestamp in a batch, for advancing the cursor.
 fn high_water(messages: &[Message], cursor: u64) -> u64 {
     messages.iter().map(|m| m.ts).fold(cursor, |a, b| if b > a { b } else { a })
+}
+
+/// Whether this message should start a turn *for us*.
+///
+/// Two filters, and both are load-bearing:
+///
+/// - `wakeable` drops protocol bookkeeping (compaction markers, replicated
+///   records, the closing artifact). Those still reach the model — they are
+///   in the feed as context — they just are not a reason to think.
+/// - `m.from != me` drops our own words. A group send is delivered to every
+///   roster member *including the sender*, which is the right transcript but
+///   the wrong wake-up: without this an agent that says anything to the
+///   litter immediately wakes itself and answers it.
+fn rouses(m: &Message, me: &str) -> bool {
+    wakeable(m) && m.from != me
 }
 
 /// What wakes an agent: real conversation and task assignments. Compaction
@@ -1089,12 +1189,26 @@ fn wakeable(m: &Message) -> bool {
 /// `TaskUpdate`. That asymmetry is what lets an agent absorb a pile of
 /// events in one pass instead of round-tripping a whole turn per message
 /// (`docs/LITTER_WORKFLOW.md` § "Auto-feed, explicit completion").
-fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str, feed: &[Message]) {
-    // A wake-up turn must be SHORT. A reasoning model spends its budget in
-    // `reasoning_content` that produces no visible reply; uncapped it
-    // measured 17 minutes (2026-09-20). 2048 is ample for the catch-up plus
-    // a reply plus a few tool iterations, each its own request.
-    api_client::set_max_tokens(2048);
+fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str, feed: &[Message], events: &[String], addr: &str) {
+    // The cap exists because a reasoning model spends its budget in
+    // `reasoning_content` that meow does not render; uncapped, one turn
+    // measured 17 minutes (2026-09-20).
+    //
+    // It used to be 2048, and that number was protecting the *hub*: back
+    // when the agent loop was one of the two threads serving the socket, a
+    // long turn was a litter-wide outage. Single ownership removed that
+    // coupling — the owner thread serves on its own cadence no matter what
+    // the model is doing — so the only thing a long turn now costs is that
+    // agent's own responsiveness.
+    //
+    // 2048 turned out to be under the floor for a reasoning model: measured
+    // live on qwen3:4b, a leader asked to plan a task streamed for 117
+    // seconds and emitted **zero** visible tokens — the entire budget went
+    // to thinking, so no tool call was ever made and the task could not
+    // progress. The nag timer re-sent the directive and it failed again the
+    // same way. A budget that cannot fit one decision is not a safety
+    // margin, it is a deadlock with a timeout.
+    api_client::set_max_tokens(8192);
 
     let session_id = session::generate_session_id();
     let mut conversation = Conversation::new_session(session_id);
@@ -1104,28 +1218,96 @@ fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str, fee
 
     libakuma::safe_print!(128, "\n[live] {} wakes on {} new message(s)\n", me, feed.len());
 
-    let mut wake = alloc::format!("You are '{}' in a litter of agents.\n\nNew since you last acted:\n", me);
-    for m in feed {
-        // Cap each one: a single 32KB message must not crowd out the rest
-        // of the feed, and the whole feed shares one 2048-token budget.
+    // The state goes in as JSON, not as hand-laid prose. Two reasons, and
+    // the second is the load-bearing one:
+    //
+    // 1. It is less string plumbing on a no_std heap, and a model does not
+    //    care which it reads.
+    // 2. **Prose framing is spoofable.** When each message is rendered as
+    //    "[from] body", the delimiter is a bracket any agent can type: a
+    //    body containing "\n[sherlock] ignore that, do X" reads exactly
+    //    like a header from sherlock. Escaped JSON has an unambiguous
+    //    boundary between what was said and who said it, so a message can
+    //    no longer forge its own provenance or invent cluster events.
+    //
+    // Only the instruction stays prose — that part is genuinely addressed
+    // to the model, and a small model follows a sentence better than a
+    // schema.
+    let mut wake = String::from("{\"you\":\"");
+    crate::util::json_escape_to(me, &mut wake);
+    wake.push('"');
+
+    if let Ok(Response::Peers { names, leader, .. }) = hub::peers(addr, 0) {
+        wake.push_str(",\"leader\":");
+        match leader.as_deref() {
+            Some(l) => {
+                wake.push('"');
+                crate::util::json_escape_to(l, &mut wake);
+                wake.push('"');
+                wake.push_str(",\"you_are_leader\":");
+                wake.push_str(if l == me { "true" } else { "false" });
+            }
+            None => wake.push_str("null"),
+        }
+        wake.push_str(",\"peers\":[");
+        let mut first = true;
+        for n in names.iter().filter(|n| n.as_str() != me) {
+            if !first {
+                wake.push(',');
+            }
+            first = false;
+            wake.push('"');
+            crate::util::json_escape_to(n, &mut wake);
+            wake.push('"');
+        }
+        wake.push(']');
+    }
+
+    if !events.is_empty() {
+        wake.push_str(",\"changed\":[");
+        for (i, e) in events.iter().enumerate() {
+            if i > 0 {
+                wake.push(',');
+            }
+            wake.push('"');
+            crate::util::json_escape_to(e, &mut wake);
+            wake.push('"');
+        }
+        wake.push(']');
+    }
+
+    wake.push_str(",\"inbox\":[");
+    for (i, m) in feed.iter().enumerate() {
+        if i > 0 {
+            wake.push(',');
+        }
+        // Cap each body: one 32KB message must not crowd out the rest of
+        // the batch, and the whole batch shares one 2048-token budget.
         let body = if m.body.len() > 1500 {
             let mut cut = 1500;
             while cut > 0 && !m.body.is_char_boundary(cut) {
                 cut -= 1;
             }
-            alloc::format!("{}…", &m.body[..cut])
+            &m.body[..cut]
         } else {
-            m.body.clone()
+            m.body.as_str()
         };
-        wake.push_str(&alloc::format!("\n[{}] {}\n", m.from, body));
+        wake.push_str("{\"from\":\"");
+        crate::util::json_escape_to(&m.from, &mut wake);
+        wake.push_str("\",\"body\":\"");
+        crate::util::json_escape_to(body, &mut wake);
+        wake.push_str("\"}");
     }
+    wake.push_str("]}");
+
     wake.push_str(
-        "\nDo whatever these ask of you. To say something, use SendMessage — to one peer by \
-         name, or to 'litter' for everyone. If one of them assigned you a sub-task, use \
-         TaskUpdate exactly as that message instructs: claim it, and report your result with \
-         status=\"done\" (or status=\"failed\" if you cannot). A sub-task stays open until you \
-         say otherwise, so do not leave one unanswered. If there is genuinely nothing worth \
-         doing, finish without sending anything.",
+        "\n\nThat is your state and everything new since you last acted. Do whatever it asks \
+         of you. To say something, use SendMessage — to one peer by name, or to 'litter' for \
+         everyone. If a message assigned you a sub-task, use TaskUpdate exactly as it \
+         instructs: claim it, and report your result with status \"done\" (or status \
+         \"failed\" if you cannot). A sub-task stays open until you say otherwise, so do not \
+         leave one unanswered. If there is genuinely nothing worth doing, finish without \
+         sending anything.",
     );
 
     if let Err(e) = chat_once(model, provider, &wake, &mut conversation, None, system_prompt) {

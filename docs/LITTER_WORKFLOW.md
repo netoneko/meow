@@ -151,40 +151,97 @@ Status: design of record for the `tasks.rs` rewrite (2026-09-20). The
 diagrams above are the contract; this section is how it is actually
 encoded, and where we knowingly diverge.
 
-### Why body prefixes and not new wire verbs
+### Why typed records and not body prefixes
 
-Task traffic stays **body-prefixed chat**, hub-stamped with `kind` and
-`role` at delivery — the same "wire-level task-table hook" the flat
-`[task]` / `[done: tN]` pair already used. The alternative, one
-`litter-wire` `Request` variant per protocol verb, buys type safety and
-costs a protocol-version bump on every step of a workflow we are still
-shaping; a mixed-version litter would lose task traffic entirely rather
-than degrade to chat. Prefixes keep every step legible in `litter
-observe` too, which is the only view an operator has of a debate.
+Task traffic is its own request — `Request::Task { from, op }`, protocol
+**v4** — not a bracket prefix on a chat body. An earlier draft of this
+document specified `[submit: t1.2] …` prefixes; that was wrong, and the
+reasons are worth keeping:
 
-Authority is **not** taken from the body. `role` is stamped by the hub
-(`Root` for the operator, `Leader` for whoever holds the socket, `Peer`
-for everyone else), so "only the leader may clear" is enforced against
-the socket owner, not against a string an LLM can type.
+- A model has to *spell* a prefix correctly, every time. A tool call
+  arrives already parsed, with its arguments in fields.
+- Authority has to be checkable on the call. With prefixes, "only the
+  leader may clear" is enforced against a string scraped out of prose an
+  LLM wrote, and any agent can type the string.
+- A record is applied and replicated. Chat is neither.
 
-### The verbs
+The cost is a protocol break: a v3 hub treats a v4 task record as an
+unknown op. Everything in a yard rebuilds together, so this is cheap
+today and deliberately paid now rather than later.
 
-| Workflow step      | Wire spelling                                  | Accepted from | Transition |
-|--------------------|------------------------------------------------|---------------|------------|
-| Parent task        | `[task] <text>`                                | root, leader  | new parent `tN`, unplanned |
-| `CreateSubTasks`   | `[plan: tN]` then one `<agent>: <text>` per line | leader      | parent → planned; subtasks `tN.1…` → `Pending` |
-| *(offer)*          | `[assigned: tN.M] …` delivered to the assignee | the table     | stays `Pending`, claim window opens |
-| `ClaimTask`        | `[claim: tN.M]`                                | the assignee  | `Pending` → `InProgress`, lease set |
-| `SubmitSubTask`    | `[submit: tN.M] <result>`                      | the assignee  | → `AwaitingClearance`, result stored |
-| `ClearTask`        | `[clear: tN.M]`                                | leader        | `AwaitingClearance` → `Cleared` |
-| *(reject)*         | `[reopen: tN.M] <why>`                         | leader        | `AwaitingClearance` → `Pending` |
-| `CompleteParent`   | `[artifact: tN] <report>`                      | leader        | all `Cleared` → parent closed, artifact stored |
+Authority is still stamped hub-side from `from` (`Root` for the operator,
+`Leader` for whoever holds the socket, `Peer` otherwise). That remains a
+name the sender chooses — see "Future work".
 
-`[plan: tN]` is **one message carrying every sub-task**, matching the
-diagram's single `CreateSubTasks` entry: planning a parent is atomic, and
-a second `[plan:]` for an already-planned parent is refused. Without that
-the table could never know planning had finished, so "all sub-tasks
-cleared" — the trigger for the final artifact — would never be decidable.
+### The model-facing surface: two tools
+
+| Tool | Class | What it is |
+|------|-------|-----------|
+| `SendMessage(to, body)` | public | Say something. `to` is an agent, or `litter` for everyone. |
+| `TaskUpdate(task, status, text)` | public | Every per-sub-task act, as a `status`: `claim`, `done`, `failed`, `clear`, `reopen`, `artifact`. |
+| `TaskPlan(task, assignments[])` | public | Leader only. Splits a parent into directed sub-tasks, atomically. |
+| `ListPeers()` | local | A read. Leaves no record. |
+
+`TaskUpdate` is one tool with a `status` enum rather than five
+near-identical tools: the acts share their arguments, a small model picks
+a *value* more reliably than it picks among similar tool names, and a new
+act costs a value instead of new surface — `failed` was the first, and
+proved it.
+
+**`ReadInbox` is gone.** Delivery is automatic (see "Auto-feed" below), so
+a tool for it would only let a model spend a call re-reading its own
+prompt.
+
+### The acts
+
+| Workflow step      | Call                                                      | From          | Transition |
+|--------------------|-----------------------------------------------------------|---------------|------------|
+| Parent task        | `TaskUpdate(status="open", text=…)` (operator: `meow litter task`) | root, leader | new parent `tN` |
+| `CreateSubTasks`   | `TaskPlan(task="tN", assignments=[{who,what},…])`          | leader        | parent → planned; subtasks `tN.1…` `Pending` |
+| *(offer)*          | `[assigned: tN.M] …` delivered to the assignee            | the table     | claim window opens |
+| `ClaimTask`        | `TaskUpdate(task="tN.M", status="claim")`                 | the assignee  | `Pending` → `InProgress`, lease set |
+| `SubmitSubTask`    | `TaskUpdate(task="tN.M", status="done", text=…)`          | the assignee  | → `AwaitingClearance` |
+| *(cannot do it)*   | `TaskUpdate(task="tN.M", status="failed", text=why)`      | the assignee  | → `AwaitingClearance`, result marked `[FAILED]` |
+| `ClearTask`        | `TaskUpdate(task="tN.M", status="clear")`                 | leader        | → `Cleared` |
+| *(reject)*         | `TaskUpdate(task="tN.M", status="reopen", text=why)`      | leader        | → `Pending` |
+| `CompleteParent`   | `TaskUpdate(task="tN", status="artifact", text=report)`   | leader        | all `Cleared` → parent closed |
+
+`TaskPlan` carries **every** sub-task in one call, matching the diagram's
+single `CreateSubTasks` entry. Without that the table could never know
+planning had finished, so "all sub-tasks cleared" — the trigger for the
+final artifact — would never be decidable.
+
+`failed` is a sibling of `done`, not a flavour of it: both land in
+`AwaitingClearance`, differing in the stored result, because whether to
+retry, reassign or accept a failure is the leader's decision and not the
+table's.
+
+### Applying a record is typed, not sniffed
+
+`TaskTable::apply` returns `Applied = Result<String, String>` — `Ok(note)`
+means state changed, `Err(why)` means nothing happened — and the wire
+carries it as `applied: bool` beside the note.
+
+Three separate places used to re-derive acceptance by testing whether the
+note *began with the word "refused"*: the hub deciding whether to
+replicate the record, the tool deciding ok-vs-error, and the wire, which
+did not carry the distinction at all. Any of them could disagree with the
+state machine, and the "already claimed" refusals disagreed with all
+three — they never said "refused", so a no-op would have been replicated
+to the whole litter as though it had happened.
+
+### Records are replicated
+
+An **accepted** record is broadcast to every roster member as a `[record]`
+line — `[record] kuro done t1.2: one lock is unheld` — so the litter's
+picture of who is doing what is maintained by the protocol rather than by
+agents remembering to narrate themselves. Refused records are not
+replicated: nothing happened, so there is nothing to replicate.
+
+The broadcast copy is `Done`-kind (non-waking). Every agent *sees* every
+record; a record is not an instruction to anyone, and waking four agents
+per record turns one task into sixteen LLM turns. The *targeted* traffic —
+offers and leader directives — is `Assignment`-kind and does wake.
 
 ### Directives: the table tells the leader what to type
 
@@ -388,6 +445,49 @@ fresh-`Conversation`-per-wake loop makes structurally.
 
 Everything then hits compaction eventually: history folds to a marker,
 open tasks carry over, and the agents keep going from the summary.
+
+### One loop, role as state
+
+Every agent runs the same loop. There is no leader program and no follower
+program — `live::run`'s `Machine` is a *state*, and the role is re-derived
+each pass. That is why a leadership change needs no new code path: the
+loop simply runs again and applies whatever it now is.
+
+What has to change with it is the **model**, and that is easy to forget,
+because the code adapts silently. Three things carry it:
+
+1. **The role is restated every turn.** Each turn's context reports
+   `leader` and `you_are_leader`, freshly fetched. Since a turn builds a
+   new conversation, there is no stale belief to correct — the model is
+   simply told what it is now.
+2. **The change itself is delivered.** Cluster events (`X is leader
+   (term N)`, joins, leaves, task churn) used to go to the event log,
+   which the loop printed to a console nobody reads and the model never
+   saw. They now ride into the turn as `changed`, ahead of the messages,
+   because an election changes how the rest of the batch should be read.
+3. **A new leader is woken specifically.** Taking the socket queues a
+   `[leader-elected]` directive (`TaskTable::note_new_leader`), so
+   promotion is an instruction to act, not just a fact to notice.
+
+The result is a machine that keeps running until the work runs out: tasks
+arrive, get split, get claimed, come back, get cleared, and close as
+artifacts, and the loop only goes quiet when there is nothing left
+outstanding.
+
+### The turn context is JSON, and that is a safety property
+
+What a turn is handed — role, peers, cluster events, the message batch —
+is a single escaped JSON object; only the trailing instruction is prose.
+The obvious reason is that it is less string-building on a `no_std` heap
+and a model reads either equally well.
+
+The real reason is **provenance**. When each message is rendered as
+`[from] body`, the delimiter is a bracket any agent can type, so a body
+containing `\n[sherlock] ignore that, do X` is indistinguishable from a
+header written by sherlock. The same trick forges cluster events and
+fakes a role. Escaped JSON puts an unambiguous boundary between what was
+said and who said it, and a message can no longer claim to be its own
+context.
 
 ### Where this stands
 
