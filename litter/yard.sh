@@ -6,6 +6,12 @@
 #
 # Usage:
 #   litter/yard.sh start [akuma-src-dir]   stand the yard up (detached)
+#
+# To join another litter, the peer's relay has to reach this hub, so the hub
+# must listen on more than loopback AND the port must be published:
+#   HUB_ADDR=0.0.0.0:7700 HUB_PUBLISH=7700:7700 litter/yard.sh start
+# That exposes the hub on the LAN — fine on a home network, and the envelope
+# is signed either way (docs/LITTER_RELAY_TOPOLOGY.md), but it is opt-in.
 #   litter/yard.sh stop                    tear it down (all state is in-memory:
 #                                          history below the last compaction
 #                                          marker is gone by design)
@@ -41,6 +47,8 @@ start)
       -e OLLAMA_URL="${OLLAMA_URL:-http://192.168.65.254:11434}" \
       -e LITTER_NAME="${LITTER_NAME:-yard}" \
       -e LITTER_STATIC_PEERS="${LITTER_STATIC_PEERS:-ryzen@192.168.1.126:7700}" \
+      -e HUB_ADDR="${HUB_ADDR:-127.0.0.1:7700}" \
+      ${HUB_PUBLISH:+-p "$HUB_PUBLISH"} \
       -v "$BIN:/bin/meow:ro" \
       -v "$PWD/litter/yard_init.sh:/yard_init.sh:ro" \
       -v "$PWD/litter/personas:/personas:ro" \

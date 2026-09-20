@@ -231,10 +231,25 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                 // The agent loop drains too: two serve points on one
                 // listener, so requests never wait a full raft tick.
                 serve::drain(&listener, &mut state.lock());
-                let count = inbox_count(&addr, &me);
+                // Read our OWN inbox straight out of the state we are
+                // holding, never over a socket to ourselves.
+                //
+                // `inbox_count`'s client call is a TCP round trip to
+                // `addr`, and when we are the leader that is our own
+                // listener. The only code that can accept and answer it is
+                // `serve::drain` — which runs on this thread. With a raft
+                // thread alive the other thread answers and nobody notices;
+                // with no raft thread (measured: Akuma/amd64, where
+                // `spawn_detached` fails) this thread blocks waiting for a
+                // reply only it could send, times out every tick, and reads
+                // its own inbox as permanently empty. The leader then never
+                // wakes, never runs a turn, and never serves anyone —
+                // a litter with a leader that does nothing at all.
+                let count = local_inbox_count(&mut state.lock(), &me);
                 if count > seen {
                     run_turn(&me, &model, &provider, &system_prompt);
-                    seen = inbox_count(&addr, &me);
+                    serve::drain(&listener, &mut state.lock());
+                    seen = local_inbox_count(&mut state.lock(), &me);
                 }
             }
             Machine::Follower { epoch, roster, term } => {
@@ -355,20 +370,49 @@ fn start_raft_thread(listener: &Arc<TcpListener>, state: &Arc<PMutex<HubState>>,
         peers: PMutex::new(static_peers),
     }));
     RAFT_CTX.store(ctx as *const RaftCtx as u64, core::sync::atomic::Ordering::Release);
-    unsafe { crate::rt::spawn_detached(raft_entry) }
+    let spawned = unsafe { crate::rt::spawn_detached(raft_entry) };
+    if !spawned {
+        // Loud, because everything downstream assumes this thread exists:
+        // the hub is served from here, not from the agent loop, and an
+        // agent whose raft thread never started is a leader that stops
+        // answering the moment it starts thinking.
+        libakuma::print("[live] WARNING: raft thread failed to spawn - this agent cannot serve the hub\n");
+        raft_log("raft thread spawn FAILED");
+    }
+    spawned
 }
 
 fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, static_peers: &PMutex<Vec<StaticPeer>>) {
     let mut tick: u64 = 0;
     loop {
         tick += 1;
+        // Probe I/O first, holding NOTHING. `probe_static_peers` used to run
+        // inside the state lock below, which put a cross-host TCP round trip
+        // — one per peer, at that peer's timeout — in the middle of the
+        // hub's critical section. Two litters pointed at each other then
+        // deadlock each other in slow motion: our probe waits on their hub,
+        // which is locked waiting on its probe of ours. It looks exactly
+        // like "the leader goes deaf during an LLM turn" and has nothing to
+        // do with the LLM; it appears the moment a peer is configured.
+        let pulse = tick % PULSE_TICKS == 0;
+        let probe_results = if pulse {
+            let targets: Vec<(String, String)> = static_peers
+                .lock()
+                .iter()
+                .map(|p| (p.name.clone(), p.addr.clone()))
+                .collect();
+            probe_peers_io(&targets)
+        } else {
+            Vec::new()
+        };
+
         let batch = {
             let mut st = state.lock();
             serve::drain(&listener, &mut st);
-            if tick % PULSE_TICKS == 0 {
+            if pulse {
                 st.task_tick();
                 let mut peers = static_peers.lock();
-                probe_static_peers(&mut st, &mut peers);
+                apply_probe_results(&mut st, &mut peers, &probe_results);
                 relay_jobs(&mut st, &mut peers)
             } else {
                 Vec::new()
@@ -498,25 +542,39 @@ fn relay_send(jobs: &[RelayJob], static_peers: &PMutex<Vec<StaticPeer>>) {
 /// event, so every agent hears about it); silence after being online
 /// raises a "lost" event. The peer's own litter is unaffected: we only
 /// read its public pulse.
-fn probe_static_peers(st: &mut HubState, peers: &mut [StaticPeer]) {
-    // To actually reach a static peer we need a client call; `hub::peers`
-    // targets `hub_addr()`, so for remote peers issue the request directly
-    // through a one-shot connect on the peer's address.
-    for peer in peers {
-        let view = super::hub::call_addr(&peer.addr, &Request::Peers { since: 0 });
-        match view {
-            Ok(Response::Peers { .. }) => {
-                if !peer.online {
-                    peer.online = true;
-                    st.event(format!("[event] static peer {} discovered at {}", peer.name, peer.addr));
-                }
-            }
-            _ => {
-                if peer.online {
-                    peer.online = false;
-                    st.event(format!("[event] static peer {} lost ({})", peer.name, peer.addr));
-                }
-            }
+/// The probe's **network half**: ask each peer "who's there?" holding no
+/// lock at all. Returns one `(name, addr, reachable)` per target, in the
+/// order given. This is a cross-host round trip per peer and it is allowed
+/// to be slow — that is precisely why nothing may be held while it runs.
+fn probe_peers_io(targets: &[(String, String)]) -> Vec<(String, String, bool)> {
+    let mut out = Vec::new();
+    for (name, addr) in targets {
+        // `hub::peers` targets `hub_addr()`, so for a remote peer issue the
+        // request directly through a one-shot connect on its address.
+        let reachable = matches!(
+            super::hub::call_addr(addr, &Request::Peers { since: 0 }),
+            Ok(Response::Peers { .. })
+        );
+        out.push((name.clone(), addr.clone(), reachable));
+    }
+    out
+}
+
+/// The probe's **state half**: fold the results in and emit the
+/// discovered/lost transitions. Pure bookkeeping, no I/O — safe to run
+/// under the locks.
+///
+/// Results are matched back by address rather than by index: the peer list
+/// is re-locked between the two halves, so position is not a stable key.
+fn apply_probe_results(st: &mut HubState, peers: &mut [StaticPeer], results: &[(String, String, bool)]) {
+    for (_, addr, reachable) in results {
+        let Some(peer) = peers.iter_mut().find(|p| &p.addr == addr) else { continue };
+        if *reachable && !peer.online {
+            peer.online = true;
+            st.event(format!("[event] static peer {} discovered at {}", peer.name, peer.addr));
+        } else if !*reachable && peer.online {
+            peer.online = false;
+            st.event(format!("[event] static peer {} lost ({})", peer.name, peer.addr));
         }
     }
 }
@@ -552,6 +610,19 @@ fn load_history(addr: &str, me: &str, system_prompt: &str) {
     let _ = system_prompt;
 }
 
+/// Count wakeable messages in our own inbox from the hub state we already
+/// hold. The leader's version of `inbox_count`, with no socket in it — see
+/// the note in the `Machine::Leader` arm for why that distinction is
+/// load-bearing rather than an optimization.
+fn local_inbox_count(st: &mut HubState, me: &str) -> usize {
+    match st.handle(Request::Inbox { name: alloc::string::String::from(me) }) {
+        Response::Inbox { messages } => messages.iter().filter(|m| wakeable(m)).count(),
+        _ => 0,
+    }
+}
+
+/// Count wakeable messages by asking the hub over the network. For
+/// FOLLOWERs and WAYWARD agents, where the hub really is another process.
 fn inbox_count(addr: &str, me: &str) -> usize {
     match hub::inbox_messages(addr, me) {
         Ok(messages) => messages.iter().filter(|m| wakeable(m)).count(),

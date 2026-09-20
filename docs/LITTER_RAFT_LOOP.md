@@ -14,13 +14,24 @@ pthreads: meow's raw `_start` never initializes musl's thread runtime, so
 `pthread_create` fails. `src/rt.rs` does what
 `userspace/amd64/threadprobe` does: raw `clone(CLONE_VM|…|CLONE_THREAD)`
 with a per-arch assembly trampoline (aarch64 + x86_64, cfg-gated; child
-never returns into Rust; `exit`-not-`exit_group`), threads are TLS-free
-(no `CLONE_SETTLS`: the parent's thread pointer is never initialized), and
-the shared state sits behind one futex-word mutex (`rt::PMutex`,
-Drop-guard unlock). Live-found bugs this encoding absorbed: loopback
-self-deadlock, blocking `try_accept`, the self-silencing staleness gate,
-CLONE_SETTLS EINVAL, unconditional aarch64 asm — see
-`docs/LITTER_EXPERIMENT_PHASE_2.md`.
+never returns into Rust; `exit`-not-`exit_group`), and the shared state
+sits behind one futex-word mutex (`rt::PMutex`, Drop-guard unlock).
+Live-found bugs this encoding absorbed: loopback self-deadlock, blocking
+`try_accept`, the self-silencing staleness gate, CLONE_SETTLS EINVAL,
+unconditional aarch64 asm — see `docs/LITTER_EXPERIMENT_PHASE_2.md`.
+
+**`CLONE_SETTLS` is per-target, because the two targets refuse the
+opposite thing** (2026-09-20). Linux refuses the flag with a NULL tls
+(`EINVAL`) — that is the "CLONE_SETTLS EINVAL" above, and why the flag was
+dropped. Akuma/amd64 refuses its *absence* (`amd64/src/thread.rs`), so the
+same flag word that works on Linux cannot create a thread there at all:
+`spawn_detached` returned false on the Firecracker guest and every leader
+ran with **no raft thread**, which is not a degraded mode but a broken one
+(see "When thread 1 does not exist" below). So x86_64 now passes
+`CLONE_SETTLS` plus a real TCB — the shape musl's `pthread_create` already
+uses — while aarch64 keeps the flag off. The child is still TLS-free by
+construction either way: nothing in raft-thread code reads the thread
+pointer, the block merely has to exist.
 
 ```
 ┌─────────────────────────── meow litter live (one process) ─────────────────────────────┐
@@ -82,6 +93,44 @@ Key consequences of the split:
 - **One lock, coarse on purpose.** `Mutex<HubState>` is held for
   microseconds per frame; a litter is a handful of agents, contention is
   nil. No channels, no lock-free anything.
+- **Nothing does network I/O while holding that lock.** "Microseconds per
+  frame" is the whole basis of the coarse lock, and a single remote round
+  trip inside the critical section invalidates it. `relay_send` was
+  written this way from the start; `probe_static_peers` was not, and did a
+  cross-host TCP round trip **per peer** under the lock. Two litters
+  pointed at each other then deadlock in slow motion — our probe waits on
+  their hub, which is locked waiting on its probe of ours — and the
+  symptom looks exactly like a leader gone deaf in an LLM turn while
+  having nothing to do with the LLM. It only appears once a static peer is
+  configured. Split into `probe_peers_io` (no locks) and
+  `apply_probe_results` (locks, no I/O), 2026-09-20. **Before adding
+  anything to the raft tick, check which side of that line it falls on.**
+- **The leader reads its own inbox through the lock, never through a
+  socket.** The diagram has always said "direct lock if leader"; the code
+  did not, and always went through `hub::inbox_messages`. With thread 1
+  alive nobody notices, because thread 1 answers. Without it the leader
+  blocks waiting for a reply only it could have sent, times out every
+  tick, and reads its own inbox as permanently empty — so it never wakes,
+  never runs a turn, and never serves anyone. Now `local_inbox_count`
+  (2026-09-20), which is what the diagram always described.
+
+### When thread 1 does not exist
+
+If `spawn_detached` fails, this design does not degrade — it stops. The
+hub is served *only* from thread 1, so a leader without it accepts
+nothing: the listen backlog fills and the hub goes from slow to actively
+refusing connections, while the leader itself sits in a turn. Followers
+then go WAYWARD, re-race the bind, and fail because the leader still holds
+the socket.
+
+There is no fallback, deliberately. A "pump" that drains the listener from
+inside the model's streaming loop was tried on 2026-09-20 and removed the
+same day: it works (the hub went from refusing connections to 44/45
+reachable), but it puts hub-serving inside the model call, which is
+precisely the coupling this whole split exists to prevent. The supported
+answer is that the thread must spawn. `live::start_raft_thread` therefore
+logs a loud warning and a `raft thread spawn FAILED` line to the agent's
+`raft.log` rather than quietly carrying on.
 
 The old standalone `litter-hub` binary stays only as a debugging tool;
 the swarm no longer needs any separately-launched process.
@@ -279,9 +328,44 @@ Notes:
                         └──────────── one litter over IP (published hub port) ───────────┘
 ```
 
+As actually stood up on 2026-09-20 — **two litters**, not one, joined by
+the cross-litter relay (`docs/LITTER_RELAY_TOPOLOGY.md`) rather than being
+a single roster over one hub:
+
+```
+  ┌── Mac (Docker) ────────────────┐        ┌── Ryzen laptop (Pop!_OS) ───────────────┐
+  │ container `litter-yard`        │        │  Ollama :11434                          │
+  │  litter_name = yard            │        │  Firecracker guest = Akuma/amd64        │
+  │  sherlock hercules             │        │   ┌───────────────────────────────────┐ │
+  │  zenigata ressler              │        │   │ litter_name = ryzen               │ │
+  │  hub 0.0.0.0:7700              │        │   │ panther tiger jaguar (herd)       │ │
+  │  published -p 7700:7700        │        │   │ hub <guest-ip>:7700               │ │
+  │  192.168.1.203                 │        │   └───────────────────────────────────┘ │
+  └────────────────────────────────┘        │   tap0 ── proxy_arp ── wlp2s0 .126       │
+            │                               └─────────────────────────────────────────┘
+            │            192.168.1.0/24 (WiFi)                    │
+            └───────────────────────────────────────────────────────┘
+                    each side: litter_static_peers = the other
+                    relay = one hop, hub → hub, signed per agent
+```
+
+Two things that cost a day and are properties of the *hosts*, not the
+protocol:
+
+- **Firecracker gives you a tap and nothing else** — no NAT, no port
+  forwarding, no DHCP. It is not QEMU's `-netdev user`/`hostfwd`. Every
+  bit of routing is the host's job; `amd64/net-setup.sh` supplies the
+  outbound half (MASQUERADE) and nothing supplied the inbound half until
+  a peer needed to reach in.
+- **Ryzen is WiFi-only, so the guest cannot be bridged onto the LAN.**
+  802.11 will not forward frames for other MACs. The working equivalent
+  is proxy-ARP routing: a real `192.168.1.x` on the guest, `proxy_arp=1`
+  on both `wlp2s0` and `tap0`, and a `/32` route to `tap0`. The tap's own
+  address must be added `noprefixroute`, or its `/24` competes with the
+  real LAN route and takes the host off the network.
+
 Because the protocol is network-only, "same container" was never a
 requirement — the hub socket just needs to be reachable (published port or
 tunnel between hosts). Stable-model agents on the laptop serve as the
 continuity-carrying members; trashcan agents churn freely since knowledge
 lives in the protocol history, not in any one process.
-```

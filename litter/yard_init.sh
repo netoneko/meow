@@ -18,7 +18,12 @@
 #   AGENTS env var   -- "name:model ..." whitespace-separated
 
 AGENTS="${AGENTS:-sherlock:qwen3:4b hercules:gemma4-yolo-4b:latest zenigata:gemma4:e4b ressler:qwen3.5:0.8b}"
-HUB_ADDR="127.0.0.1:7700"
+# One address serves both jobs: agents CONNECT to it, and the bind-race winner
+# LISTENS on it. 127.0.0.1 keeps the litter inside this container, which is the
+# right default. Set HUB_ADDR=0.0.0.0:7700 (with yard.sh publishing the port) to
+# let a peer litter's relay reach in — on Linux, connect() to 0.0.0.0 lands on
+# loopback, so the agents' own calls keep working unchanged.
+HUB_ADDR="${HUB_ADDR:-127.0.0.1:7700}"
 OLLAMA_URL="${OLLAMA_URL:-http://192.168.65.254:11434}"
 # Relay plane (docs/LITTER_RELAY_TOPOLOGY.md): our litter's identity plus
 # peer litters (`name@host:port,...`) — local hub always, peers via raft.

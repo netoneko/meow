@@ -21,6 +21,15 @@ Config keys (`/etc/meow/config`):
 | `litter_peer_keys` | `name:<64-hex-pubkey>,…` — a **guest list**, not a name binding: any listed key may sign for any name. **Unset ⇒ everyone is accepted** (the default; this is a LAN, not a hostile network). With the list unset, only the signature's *shape* is checked — Ed25519 needs the signer's public key and the envelope carries none, so a stranger's signature is unverifiable by construction, not merely untrusted. Pinning a key later verifies that traffic retroactively. |
 | `litter_static_peers` | `name@host:port,…` — who to relay to, and the discovery probe list. |
 
+Standing up the Mac side so a peer can reach in (`litter/yard.sh`): the
+hub must listen on more than loopback **and** the port must be published,
+both opt-in because the default keeps a litter inside its container.
+
+```bash
+HUB_ADDR=0.0.0.0:7700 HUB_PUBLISH=7700:7700 \
+  LITTER_STATIC_PEERS=ryzen@<peer-ip>:7700 litter/yard.sh start
+```
+
 Mechanics:
 
 - **Sign, at the source.** The sending agent signs in its own process,
@@ -78,6 +87,62 @@ inherits every problem of the thing it proxies:
 - **No end-to-end picture.** Each hub relays what it has; neither side
   knows what the other side has already seen, so dedup is cursor-shaped
   guesswork (`last_relay_ts`), and "relevant" is undefined.
+
+## First live join: yard ↔ ryzen (2026-09-20) — where it got to
+
+Both litters were stood up and **discovered each other**
+(`[event] static peer ryzen discovered at …`), each agent generated and
+persisted its own `litter_key`, and the relay fired for real: sherlock's
+`raft.log` carries
+`relay fail to=192.168.1.126:7700 from=root ot=…` — the operator's
+roll-call message attempting to cross while the far side was restarting.
+
+**No message has yet completed a crossing.** The relay path is exercised
+up to and including the send; the far hub has not yet accepted one.
+
+What the attempt cost, and what it bought — each of these is written up
+where it belongs, listed here so the next session starts from the right
+place:
+
+| Finding | Where |
+|---|---|
+| Probe I/O under the hub lock — two litters deadlock each other | `LITTER_RAFT_LOOP.md` § "Key consequences" |
+| Leader could not serve itself (TCP round trip to its own hub) | same |
+| `CLONE_SETTLS` is per-target; amd64 had **no raft thread at all** | same, § threading |
+| Firecracker has no NAT/forwarding; WiFi cannot bridge | same, § "Deployment topology" |
+| Guest overwrites its own `authorized_keys` when it generates a host key | below, "Known traps" |
+
+### Known traps (bit us; not yet fixed)
+
+- **The guest clobbers `authorized_keys`.** On a boot where no host key
+  exists on disk, the Akuma guest generates one and writes over
+  `etc/sshd/authorized_keys`, locking out the key `amd64/mkdisk.sh`
+  staged into the image. Recover by writing the `.pub` back in with
+  `debugfs -w -R "write <key>.pub etc/sshd/authorized_keys"` **with the VM
+  stopped**. It does not recur once a host key is on disk (the boot log
+  then says `Loaded host key from filesystem` rather than
+  `Generating new host key`).
+- **Never `debugfs -w` a disk a running VM has mounted rw**, and never
+  `pkill` Firecracker with the rootfs mounted rw. Doing both on
+  2026-09-20 left the image unable to `spawn '/bin/sh'` for ssh sessions;
+  recovery is a rebuild via `amd64/mkdisk.sh`. The boot log on the host
+  stays readable either way.
+- **Do not rebuild a binary a live agent is running.** `litter/yard.sh`
+  bind-mounts the host's `meow` into the container, so `cargo build`
+  rewrites the text of every running agent and they die of SIGBUS — no
+  `PANIC!` line, because it is a signal, not a Rust panic. Agents
+  vanishing from `ps` with logs ending mid-line is this, not a litter
+  bug. Stop the yard, rebuild, start it.
+
+### Still to do
+
+- Complete one verified crossing in each direction.
+- Remove the leftover `DNAT` (`PREROUTING --dport 7700`) and the
+  `MASQUERADE` for `10.0.2.0/24` on ryzen: the guest now has a real LAN
+  address and needs neither.
+- Both sides' configs still name pre-move addresses; the guest's
+  `litter_hub_addr` and the yard's `litter_static_peers` need the guest's
+  current LAN address.
 
 ## Direction (to review): raft-collected, peer-transmitted, storm-proof
 

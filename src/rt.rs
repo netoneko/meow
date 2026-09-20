@@ -37,17 +37,52 @@ const CLONE_FILES: u64 = 0x0000_0400;
 const CLONE_SIGHAND: u64 = 0x0000_0800;
 const CLONE_THREAD: u64 = 0x0001_0000;
 const CLONE_SYSVSEM: u64 = 0x0400_0000;
+/// Set the child's thread pointer from clone's `tls` argument. Required by
+/// Akuma/amd64, refused with a NULL tls by Linux — see `THREAD_FLAGS`.
+#[cfg(target_arch = "x86_64")]
+const CLONE_SETTLS: u64 = 0x0008_0000;
 
-/// No CLONE_SETTLS, deliberately: meow's raw `_start` never initializes
-/// the parent's `tpidr_el0`, and handing a NULL TLS to clone is refused.
-/// The child therefore runs with a zero thread pointer — which means NO
-/// TLS use is allowed in litter thread code: no musl `errno`, no libc
-/// TLS-dependent calls. libakuma does raw syscalls and meow is no_std, so
-/// everything the raft thread runs is TLS-free by construction. Verified
-/// empirically (bisected at runtime once — the SETTLS variant is the one
-/// that returned -EINVAL in the Alpine container).
+/// Whether `CLONE_SETTLS` is passed is **per-target, because the two
+/// targets refuse the opposite thing**, and a single flag word cannot
+/// satisfy both:
+///
+/// - **Linux (aarch64, the Alpine container)**: passing `CLONE_SETTLS`
+///   with a NULL tls is refused with `EINVAL`. Bisected at runtime; that
+///   is why the flag was dropped originally.
+/// - **Akuma/amd64**: `sys_clone_thread` refuses the *absence* of
+///   `CLONE_SETTLS` with `EINVAL` (`amd64/src/thread.rs`), so the very
+///   same flag word that works on Linux cannot create a thread here at
+///   all. This is what made `spawn_detached` return false on the
+///   Firecracker guest, leaving a litter leader with no raft thread.
+///
+/// So x86_64 passes `CLONE_SETTLS` **and a real tls pointer** — which is
+/// also exactly what musl's `pthread_create` does, i.e. the normal Linux
+/// shape rather than a special case. Either way the child still runs
+/// TLS-free by construction: libakuma issues raw syscalls and meow is
+/// `no_std`, so nothing in raft-thread code reads the thread pointer. The
+/// block merely has to exist and be valid, not be used.
+#[cfg(target_arch = "aarch64")]
 const THREAD_FLAGS: u64 =
     CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+#[cfg(target_arch = "x86_64")]
+const THREAD_FLAGS: u64 =
+    CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SETTLS;
+
+/// One thread-control block per thread slot. x86_64 wants `%fs` to point at
+/// a TCB whose first word is a pointer to itself — the self-pointer every
+/// `fs:0` access reads. Nothing in meow reads it, but a valid block costs
+/// two pointers and removes a whole class of "works until something
+/// touches TLS" surprise.
+#[repr(C, align(16))]
+struct Tcb {
+    self_ptr: *mut Tcb,
+    _reserved: [u64; 7],
+}
+
+static mut TCBS: [Tcb; 2] = [
+    Tcb { self_ptr: core::ptr::null_mut(), _reserved: [0; 7] },
+    Tcb { self_ptr: core::ptr::null_mut(), _reserved: [0; 7] },
+];
 
 /// The child's stack: 64 KiB in `.bss`, `align(16)` because AAPCS64
 /// requires it and a misaligned stack is the kind of thing that works
@@ -114,12 +149,13 @@ core::arch::global_asm!(
     .section .text.litter_spawn_thread
     .global litter_spawn_thread
 litter_spawn_thread:
-    /* rdi = flags, rsi = child stack top, rdx = entry fn */
+    /* rdi = flags, rsi = child stack top, rdx = entry fn, rcx = tls */
     sub rsi, 8
     mov [rsi], rdx              /* plant the entry fn on the child stack */
     xor edx, edx                /* parent_tid = NULL */
     xor r10d, r10d              /* child_tid = NULL (detached) */
-    xor r8d, r8d                /* tls = NULL (TLS-free by design) */
+    mov r8, rcx                 /* tls — MUST be set before the syscall:
+                                   `syscall` clobbers rcx with the return rip */
     mov rax, 56                 /* SYS_clone */
     syscall
     test rax, rax
@@ -140,7 +176,7 @@ core::compile_error!("litter threads: no clone trampoline for this architecture 
 
 unsafe extern "C" {
     /// Returns the child's tid in the parent; never returns in the child.
-    fn litter_spawn_thread(flags: u64, stack_top: *mut c_void, entry: fn()) -> i64;
+    fn litter_spawn_thread(flags: u64, stack_top: *mut c_void, entry: fn(), tls: *mut c_void) -> i64;
 }
 
 /// Spawn `f` on a dedicated raw-clone thread. Returns false when no stack
@@ -164,7 +200,14 @@ pub unsafe fn spawn_detached(f: fn()) -> bool {
         STACKS[slot].as_mut().unwrap_unchecked()
     };
     let stack_top = stack.0.as_mut_ptr().wrapping_add(64 * 1024) as *mut c_void;
-    let tid = unsafe { litter_spawn_thread(THREAD_FLAGS, stack_top, f) };
+    // SAFETY: one TCB per slot, and `slot` was just claimed exclusively by
+    // the fetch_add above, so no other thread can be initializing this one.
+    let tls = unsafe {
+        let tcb = core::ptr::addr_of_mut!(TCBS[slot]);
+        (*tcb).self_ptr = tcb;
+        tcb as *mut c_void
+    };
+    let tid = unsafe { litter_spawn_thread(THREAD_FLAGS, stack_top, f, tls) };
     tid > 0
 }
 
