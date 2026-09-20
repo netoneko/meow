@@ -47,6 +47,9 @@ const COMPACT_TICKS: u64 = 30;
 const KEEP_RECENT: usize = serve::KEEP_RECENT;
 /// History page size when a cold-starting agent walks back to the marker.
 const HISTORY_PAGE: u32 = 32;
+/// How old an outbound chat may be and still cross a litter boundary —
+/// past this it's history, not news; the peer gets it via history, not replay.
+const RELAY_MAX_AGE_US: u64 = 60 * 1_000_000;
 
 /// One `name@host:port` entry from `litter_static_peers` in the config —
 /// a peer we want to know about even before (or without) it ever joining
@@ -58,6 +61,10 @@ pub struct StaticPeer {
     pub addr: String,
     /// Last probe reached it — drives discovered/lost event transitions.
     pub online: bool,
+    /// Relay cursor: every outbound chat with `ts` above this has been
+    /// delivered to this peer's hub. Cursor only advances on confirmed
+    /// `Sent`, so an unreachable peer re-drives its batch next tick.
+    pub last_relay_ts: u64,
 }
 
 pub fn parse_static_peers(spec: Option<&str>) -> Vec<StaticPeer> {
@@ -70,7 +77,7 @@ pub fn parse_static_peers(spec: Option<&str>) -> Vec<StaticPeer> {
             }
             if let Some((name, addr)) = entry.split_once('@') {
                 if litter_wire::is_valid_name(name.trim()) && addr.contains(':') {
-                    out.push(StaticPeer { name: String::from(name.trim()), addr: String::from(addr.trim()), online: false });
+                    out.push(StaticPeer { name: String::from(name.trim()), addr: String::from(addr.trim()), online: false, last_relay_ts: 0 });
                 }
             }
         }
@@ -293,19 +300,86 @@ fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, stat
     let mut tick: u64 = 0;
     loop {
         tick += 1;
-        {
+        let relay_jobs = {
             let mut st = state.lock();
             serve::drain(&listener, &mut st);
             if tick % PULSE_TICKS == 0 {
                 st.task_tick();
                 let mut peers = static_peers.lock();
                 probe_static_peers(&mut st, &mut peers);
+                relay_jobs(&mut st, &mut peers)
+            } else {
+                Vec::new()
             }
-            if tick % COMPACT_TICKS == 0 {
-                st.compact();
-            }
+        };
+        if tick % COMPACT_TICKS == 0 {
+            state.lock().compact();
+        }
+        // Relay I/O runs OUTSIDE the state lock: a slow peer costs its own
+        // send deadlines, never the hub (same rule as deadline-bounded
+        // serve_one — see docs/LITTER_RELAY_TOPOLOGY.md for where this goes
+        // long-term).
+        if !relay_jobs.is_empty() {
+            relay_send(&relay_jobs, static_peers);
         }
         libakuma::sleep(TICK_SECS);
+    }
+}
+
+/// Snapshot the outbound relay batch for every online peer, oldest first.
+/// Pure state read — the I/O happens in `relay_send`, outside the locks.
+/// Loop guard: a message whose sender already carries any known litter
+/// prefix (a peer's, or our own) was relayed IN — it never relays onward.
+/// Age guard: chat older than RELAY_MAX_AGE_US is never relayed — a peer
+/// that comes back after a long partition resyncs through history, it does
+/// not get a replay of the debate it missed (see docs/LITTER_RELAY_TOPOLOGY.md).
+fn relay_jobs(st: &mut HubState, peers: &mut [StaticPeer]) -> Vec<(String, String, String, String, i64, u64)> {
+    let our = match super::litter_name() {
+        Some(n) => n,
+        None => return Vec::new(), // relay off: no litter identity configured
+    };
+    let now = crate::util::now_us();
+    let fresh_enough = |ts: u64| now.saturating_sub(ts) <= RELAY_MAX_AGE_US;
+    let mut jobs = Vec::new();
+    for peer in peers.iter().filter(|p| p.online) {
+        let peer_prefix = format!("{}-", peer.name);
+        let our_prefix = format!("{}-", our);
+        for entry in &st.relay_log {
+            if entry.msg.ts <= peer.last_relay_ts || entry.msg.kind != MessageKind::Chat || !fresh_enough(entry.msg.ts) {
+                continue;
+            }
+            if entry.msg.from.starts_with(&peer_prefix) || entry.msg.from.starts_with(&our_prefix) {
+                continue;
+            }
+            // Routing: group broadcast stays group; direct traffic to
+            // `<peer>-<agent>` is rewritten to the bare agent name on the
+            // far side; everything else is litter-local and not relayed.
+            let to = if entry.to == serve::GROUP_NAME {
+                String::from(serve::GROUP_NAME)
+            } else {
+                match entry.to.strip_prefix(&peer_prefix) {
+                    Some(bare) if litter_wire::is_valid_name(bare) => String::from(bare),
+                    _ => continue,
+                }
+            };
+            jobs.push((peer.addr.clone(), format!("{}-{}", our, entry.msg.from), to, entry.msg.body.clone(), entry.msg.round, entry.msg.ts));
+        }
+    }
+    jobs
+}
+
+/// Drive one relay batch: cursor only advances on a confirmed `Sent`, so an
+/// unreachable peer simply re-drives its batch on a later tick (bounded by
+/// the relay log's cap, never queued unboundedly).
+fn relay_send(jobs: &[(String, String, String, String, i64, u64)], static_peers: &PMutex<Vec<StaticPeer>>) {
+    for (addr, from, to, body, round, ts) in jobs {
+        let req = Request::Send { from: from.clone(), to: to.clone(), body: body.clone(), round: *round };
+        if matches!(hub::call_addr(addr, &req), Ok(Response::Sent { .. })) {
+            let mut peers = static_peers.lock();
+            if let Some(p) = peers.iter_mut().find(|p| &p.addr == addr) {
+                p.last_relay_ts = p.last_relay_ts.max(*ts);
+            }
+        }
     }
 }
 
@@ -405,5 +479,217 @@ fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str) {
     );
     if let Err(e) = chat_once(model, provider, &wake, &mut conversation, None, system_prompt) {
         libakuma::print(&format!("[live] {}'s turn failed: {}\n", me, e));
+    }
+}
+
+// ============================================================================
+// Swarm simulation (`meow test`) — docs/LITTER_RELAY_TOPOLOGY.md's "part of
+// the raft traffic simulation" requirement, stopgap-relay edition. Two and
+// three litter topologies over a MOCKED transport: the real `HubState` state
+// machine and the real `relay_jobs` snapshot run, but `relay_send`'s socket
+// hop is replaced by applying the job's `Request::Send` to the peer hub
+// directly (the litter-raft sim's trick). What this buys: storm-bound,
+// dedup, age-discard and cursor guarantees are asserted against the real
+// code paths, not a reimplementation of them.
+// ============================================================================
+#[cfg(feature = "tests")]
+pub mod sim {
+    use alloc::format;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use alloc::vec;
+
+    use litter_wire::{Request, Response, SenderRole};
+
+    use super::{parse_static_peers, relay_jobs, StaticPeer};
+    use crate::tools::litter::serve::{HubState, RelayEntry, GROUP_NAME};
+    use crate::util::now_us;
+
+    struct Litter {
+        name: &'static str,
+        /// This litter's own hub address (what peers aim at).
+        addr: &'static str,
+        hub: HubState,
+        peers: Vec<StaticPeer>,
+    }
+
+    impl Litter {
+        /// A litter with `agents` joined and one leader, peering at `peers`
+        /// (all links simulated up — tests toggle them explicitly).
+        fn seed(name: &'static str, addr: &'static str, agents: &[&str], peers_spec: &str) -> Self {
+            let mut hub = HubState::new();
+            hub.set_leader(agents[0], 1);
+            for a in agents {
+                hub.handle(Request::Join { name: String::from(*a) });
+            }
+            let mut peers = parse_static_peers(Some(peers_spec));
+            for p in peers.iter_mut() {
+                p.online = true;
+            }
+            Litter { name, addr, hub, peers }
+        }
+
+        fn inbox_has(&mut self, agent: &str, body: &str) -> bool {
+            matches!(
+                self.hub.handle(Request::Inbox { name: String::from(agent) }),
+                Response::Inbox { messages } if messages.iter().any(|m| m.body == body)
+            )
+        }
+    }
+
+    /// The mocked transport: one relay tick, exactly what `relay_send` does
+    /// on `Ok(Sent)` — apply the job to the destination hub, advance the
+    /// cursor. Returns how many frames crossed a link.
+    fn relay_tick(litters: &mut [( &'static str, Litter )], from: &str) -> usize {
+        let i = litters.iter().position(|(n, _)| *n == from).expect("litter");
+        crate::tools::litter::set_litter_name(Some(String::from(litters[i].0)));
+        let jobs = {
+            let (_, litter) = &mut litters[i];
+            relay_jobs(&mut litter.hub, &mut litter.peers)
+        };
+        let mut crossed = 0usize;
+        for (addr, from, to, body, round, ts) in jobs {
+            // resolve destination: the litter whose HUB listens on this addr
+            let dest = litters.iter().position(|(_, l)| l.addr == addr).expect("peer litter");
+            let req = Request::Send { from, to, body, round };
+            if matches!(litters[dest].1.hub.handle(req), Response::Sent { .. }) {
+                let peer = litters[i].1.peers.iter_mut().find(|p| p.addr == addr).unwrap();
+                peer.last_relay_ts = peer.last_relay_ts.max(ts);
+                crossed += 1;
+            }
+        }
+        crossed
+    }
+
+    pub fn run_tests() -> i32 {
+        let mut passed = 0usize;
+        let mut total = 0usize;
+        libakuma::print("--- litter swarm sim tests ---\n");
+
+        // 1. relay joins two litters: yard's broadcast lands in every
+        //    island inbox, prefixed with the origin litter's name
+        total += 1;
+        {
+            let mut sw = vec![
+                ("yard", Litter::seed("yard", "10.0.0.1:7700", &["al", "amber"], "island@10.0.0.2:7700")),
+                ("island", Litter::seed("island", "10.0.0.2:7700", &["bob", "bella"], "yard@10.0.0.1:7700")),
+            ];
+            sw[0].1.hub.handle(Request::Send { from: String::from("al"), to: String::from(GROUP_NAME), body: String::from("hello island"), round: 1 });
+            let crossed = relay_tick(&mut sw, "yard");
+            let ok = crossed == 1
+                && sw[1].1.inbox_has("bob", "hello island")
+                && sw[1].1.inbox_has("bella", "hello island");
+            if ok { passed += 1; } else {
+            let dump = |l: &mut Litter, a: &str| match l.hub.handle(Request::Inbox { name: String::from(a) }) {
+                Response::Inbox { messages } => messages.iter().map(|m| (m.from.clone(), m.body.clone())).collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            libakuma::print(&format!("  [!] join: crossed={} bob={:?} bella={:?}\n", crossed, dump(&mut sw[1].1, "bob"), dump(&mut sw[1].1, "bella")));
+        }
+        }
+
+        // 2. storm bound: the relayed-in copy never relays onward — one
+        //    message crosses one link exactly once, no matter how many ticks
+        total += 1;
+        {
+            let mut sw = vec![
+                ("yard", Litter::seed("yard", "10.0.0.1:7700", &["al"], "island@10.0.0.2:7700")),
+                ("island", Litter::seed("island", "10.0.0.2:7700", &["bob"], "yard@10.0.0.1:7700")),
+            ];
+            sw[0].1.hub.handle(Request::Send { from: String::from("al"), to: String::from(GROUP_NAME), body: String::from("once only"), round: 1 });
+            let first = relay_tick(&mut sw, "yard");
+            let again = relay_tick(&mut sw, "yard") + relay_tick(&mut sw, "island") + relay_tick(&mut sw, "island");
+            if first == 1 && again == 0 { passed += 1; }
+            else { libakuma::print(&format!("  [!] storm bound: first={} again={}\n", first, again)); }
+        }
+
+        // 3. direct cross-litter reply: island's bob → yard's al arrives
+        //    only in al's inbox, still prefixed with the origin litter
+        total += 1;
+        {
+            let mut sw = vec![
+                ("yard", Litter::seed("yard", "10.0.0.1:7700", &["al", "amber"], "island@10.0.0.2:7700")),
+                ("island", Litter::seed("island", "10.0.0.2:7700", &["bob"], "yard@10.0.0.1:7700")),
+            ];
+            sw[1].1.hub.handle(Request::Send { from: String::from("bob"), to: String::from("yard-al"), body: String::from("reply to yard"), round: 2 });
+            let crossed = relay_tick(&mut sw, "island");
+            let ok = crossed == 1
+                && sw[0].1.inbox_has("al", "reply to yard")
+                && !sw[0].1.inbox_has("amber", "reply to yard");
+            if ok { passed += 1; } else { libakuma::print(&format!("  [!] direct: crossed={}\n", crossed)); }
+        }
+
+        // 4. age discard: an old unseen message is never relayed — a peer
+        //    back after a long partition resyncs via history, not replay
+        total += 1;
+        {
+            let mut sw = vec![
+                ("yard", Litter::seed("yard", "10.0.0.1:7700", &["al"], "island@10.0.0.2:7700")),
+                ("island", Litter::seed("island", "10.0.0.2:7700", &["bob"], "yard@10.0.0.1:7700")),
+            ];
+            let old = now_us().saturating_sub(super::RELAY_MAX_AGE_US + 1_000_000);
+            sw[0].1.hub.relay_log.push(RelayEntry {
+                to: String::from(GROUP_NAME),
+                msg: litter_wire::Message {
+                    from: String::from("al"),
+                    round: 1,
+                    body: String::from("stale news"),
+                    ts: old,
+                    kind: litter_wire::MessageKind::Chat,
+                    role: SenderRole::Peer,
+                },
+            });
+            let crossed = relay_tick(&mut sw, "yard");
+            if crossed == 0 && !sw[1].1.inbox_has("bob", "stale news") { passed += 1; }
+            else { libakuma::print(&format!("  [!] age discard: crossed={}\n", crossed)); }
+        }
+
+        // 5. flake + cursor: an offline peer drops nothing permanently but
+        //    delivers nothing twice — offline ticks skip, one online tick
+        //    delivers, the cursor keeps every later tick silent
+        total += 1;
+        {
+            let mut sw = vec![
+                ("yard", Litter::seed("yard", "10.0.0.1:7700", &["al"], "island@10.0.0.2:7700")),
+                ("island", Litter::seed("island", "10.0.0.2:7700", &["bob"], "yard@10.0.0.1:7700")),
+            ];
+            sw[0].1.hub.handle(Request::Send { from: String::from("al"), to: String::from(GROUP_NAME), body: String::from("across the flake"), round: 1 });
+            sw[0].1.peers[0].online = false;
+            let while_down = relay_tick(&mut sw, "yard");
+            sw[0].1.peers[0].online = true;
+            let recovered = relay_tick(&mut sw, "yard");
+            let after = relay_tick(&mut sw, "yard");
+            let ok = while_down == 0 && recovered == 1 && after == 0
+                && sw[1].1.inbox_has("bob", "across the flake");
+            if ok { passed += 1; }
+            else { libakuma::print(&format!("  [!] flake: down={} recovered={} after={}\n", while_down, recovered, after)); }
+        }
+
+        // 6. three-litter mesh: A's message reaches B and C exactly once
+        //    each (B does NOT transit A's traffic to C — relay is one hop,
+        //    the anti-storm property the target topology must preserve)
+        total += 1;
+        {
+            let mut sw = vec![
+                ("a", Litter::seed("a", "10.0.0.1:7700", &["x"], "b@10.0.0.2:7700,c@10.0.0.3:7700")),
+                ("b", Litter::seed("b", "10.0.0.2:7700", &["y"], "a@10.0.0.1:7700,c@10.0.0.3:7700")),
+                ("c", Litter::seed("c", "10.0.0.3:7700", &["z"], "a@10.0.0.1:7700,b@10.0.0.2:7700")),
+            ];
+            sw[0].1.hub.handle(Request::Send { from: String::from("x"), to: String::from(GROUP_NAME), body: String::from("mesh news"), round: 1 });
+            let mut crossings = 0;
+            for _ in 0..3 {
+                crossings += relay_tick(&mut sw, "a");
+                crossings += relay_tick(&mut sw, "b");
+                crossings += relay_tick(&mut sw, "c");
+            }
+            let ok = crossings == 2
+                && sw[1].1.inbox_has("y", "mesh news")
+                && sw[2].1.inbox_has("z", "mesh news");
+            if ok { passed += 1; }
+            else { libakuma::print(&format!("  [!] mesh: crossings={} (want 2)\n", crossings)); }
+        }
+
+        libakuma::print(&format!("  result: {}/{}\n", passed, total));
+        if passed == total { 0 } else { 1 }
     }
 }

@@ -476,6 +476,8 @@ mod tests {
             round: 3,
             body: String::from("line1\nline2 \"quoted\""),
             ts: 1234567890,
+            kind: MessageKind::Chat,
+            role: SenderRole::Peer,
         };
         let json = encode_message(&m);
         let back = decode_message(&json).expect("decode");
@@ -591,8 +593,8 @@ mod tests {
     fn inbox_response_round_trips_several_messages_in_order() {
         let r = Response::Inbox {
             messages: alloc::vec![
-                Message { from: String::from("a"), round: 0, body: String::from("first"), ts: 1 },
-                Message { from: String::from("b"), round: 1, body: String::from("second, with a \"quote\""), ts: 2 },
+                Message { from: String::from("a"), round: 0, body: String::from("first"), ts: 1, kind: MessageKind::Chat, role: SenderRole::Peer },
+                Message { from: String::from("b"), round: 1, body: String::from("second, with a \"quote\""), ts: 2, kind: MessageKind::Chat, role: SenderRole::Peer },
             ],
         };
         let json = encode_response(&r);

@@ -20,6 +20,10 @@
 AGENTS="${AGENTS:-sherlock:qwen3:4b hercules:gemma4-yolo-4b:latest zenigata:gemma4:e4b ressler:qwen3.5:0.8b}"
 HUB_ADDR="127.0.0.1:7700"
 OLLAMA_URL="${OLLAMA_URL:-http://192.168.65.254:11434}"
+# Relay plane (docs/LITTER_RELAY_TOPOLOGY.md): our litter's identity plus
+# peer litters (`name@host:port,...`) — local hub always, peers via raft.
+LITTER_NAME="${LITTER_NAME:-yard}"
+LITTER_STATIC_PEERS="${LITTER_STATIC_PEERS:-}"
 
 # The operator's identity: yard.sh talk/task run `meow litter send` as `root`
 # through this scope, without being an agent themselves. root outranks
@@ -28,6 +32,8 @@ mkdir -p /operator/etc/meow
 cat > /operator/etc/meow/config <<EOF
 litter_agent_name=operator
 litter_hub_addr=${HUB_ADDR}
+litter_name=${LITTER_NAME}
+litter_static_peers=${LITTER_STATIC_PEERS}
 
 [provider:ollama]
 base_url=${OLLAMA_URL}
@@ -46,6 +52,8 @@ for pair in $AGENTS; do
     cat > "${home}/etc/meow/config" <<EOF
 litter_agent_name=${name}
 litter_hub_addr=${HUB_ADDR}
+litter_name=${LITTER_NAME}
+litter_static_peers=${LITTER_STATIC_PEERS}
 current_provider=ollama
 current_model=${model}
 

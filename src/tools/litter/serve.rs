@@ -56,7 +56,17 @@ pub const KEEP_RECENT: usize = 16;
 /// as fresh news.
 const EVENT_LOG_CAP: usize = 512;
 
-/// Cap on how many folded-message summaries one compaction marker
+/// Cap on the relay log: oldest entries drop when a peer stays unreachable
+/// past this many outbound messages (relay is best-effort, never unbounded).
+const RELAY_LOG_CAP: usize = 256;
+
+/// One outbound message recorded for the relay plane: `to` as the sender
+/// addressed it (GROUP_NAME for broadcasts) plus the stamped message. The
+/// raft thread drains this log to peer litters (see `live::relay_tick`).
+pub struct RelayEntry {
+    pub to: String,
+    pub msg: Message,
+}
 /// carries. The marker is a summary, not an archive.
 const MARKER_SUMMARY_LINES: usize = 20;
 
@@ -74,6 +84,10 @@ pub struct HubState {
     /// Cluster event log: (epoch, text), epoch strictly increasing.
     events: Vec<(u64, String)>,
     pub tasks: TaskTable,
+    /// Outbound chat traffic, oldest first, for the cross-litter relay.
+    /// Captured in `handle` (pure state), drained by the raft thread's
+    /// relay tick — never by `handle` itself, which does no I/O.
+    pub relay_log: Vec<RelayEntry>,
 }
 
 impl HubState {
@@ -88,6 +102,7 @@ impl HubState {
             leader: None,
             events: Vec::new(),
             tasks: TaskTable::new(),
+            relay_log: Vec::new(),
         }
     }
 
@@ -188,6 +203,20 @@ impl HubState {
                     litter_wire::SenderRole::Peer
                 };
                 let msg = Message { role, ..Message::chat(from, round, body, self.stamp()) };
+
+                // Relay-plane capture: every outbound chat is recorded (with
+                // its original `to`) for the raft thread to forward to peer
+                // litters. Relayed-IN traffic (from `<litter>-<agent>`) is
+                // never captured — the hyphen marks it: capture would make
+                // every hub a transit node and the mesh a broadcast storm
+                // (caught live by the swarm sim). Task/system traffic
+                // (assignments, markers, done lines) stays litter-local.
+                if msg.kind == litter_wire::MessageKind::Chat && !msg.from.contains('-') {
+                    self.relay_log.push(RelayEntry { to: to.clone(), msg: msg.clone() });
+                    if self.relay_log.len() > RELAY_LOG_CAP {
+                        self.relay_log.remove(0);
+                    }
+                }
 
                 // Task-table hooks: [task] opens, [done: tN] closes. The
                 // table's outputs are events (and, at tick time,
@@ -579,6 +608,22 @@ pub fn run_tests() -> i32 {
         } else {
             libakuma::print(&format!("  [!] compact: folded={} first={:?} kept={} idem={}\n", folded, msgs.first().map(|m| m.body.clone()), kept, idempotent));
         }
+    }
+
+    // relay log: outbound chat is captured with its original `to`, ts
+    // strictly increasing (the per-peer relay cursor's ordering key)
+    total += 1;
+    {
+        let mut hub = HubState::new();
+        hub.handle(Request::Send { from: String::from("sherlock"), to: String::from(GROUP_NAME), body: String::from("broadcast"), round: 1 });
+        hub.handle(Request::Send { from: String::from("sherlock"), to: String::from("rylen-tiger"), body: String::from("direct"), round: 1 });
+        let ok = hub.relay_log.len() == 2
+            && hub.relay_log[0].to == GROUP_NAME
+            && hub.relay_log[1].to == "rylen-tiger"
+            && hub.relay_log[0].msg.ts < hub.relay_log[1].msg.ts
+            && hub.relay_log.iter().all(|e| e.msg.kind == litter_wire::MessageKind::Chat);
+        if ok { passed += 1; }
+        else { libakuma::print(&format!("  [!] relay log: {:?}\n", hub.relay_log.iter().map(|e| (e.to.clone(), e.msg.ts)).collect::<Vec<_>>())); }
     }
 
     // task hooks: [task] seeds the table, coordinator tick assigns and

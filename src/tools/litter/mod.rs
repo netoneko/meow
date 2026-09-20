@@ -53,6 +53,26 @@ pub fn static_peers_spec() -> Option<String> {
     }
 }
 
+/// `litter_name` from the config — this litter's own identity on the relay
+/// plane. Messages this hub forwards to a remote litter travel as
+/// `<litter_name>-<agent>`; relay is off while this is unset.
+static mut LITTER_NAME: Option<String> = None;
+static LITTER_NAME_INIT: AtomicBool = AtomicBool::new(false);
+
+/// Called once at startup from `Config::litter_name`.
+pub fn set_litter_name(name: Option<String>) {
+    unsafe { *core::ptr::addr_of_mut!(LITTER_NAME) = name; }
+    LITTER_NAME_INIT.store(true, Ordering::Release);
+}
+
+pub fn litter_name() -> Option<String> {
+    if LITTER_NAME_INIT.load(Ordering::Acquire) {
+        unsafe { (*core::ptr::addr_of!(LITTER_NAME)).clone() }
+    } else {
+        None
+    }
+}
+
 /// Called once at startup from `Config::litter_agent_name`.
 pub fn set_agent_name(name: String) {
     unsafe { *core::ptr::addr_of_mut!(AGENT_NAME) = Some(name); }
@@ -201,5 +221,5 @@ pub fn run_tests() -> i32 {
 
     libakuma::print(&alloc::format!("  result: {}/{}\n", passed, total));
     let mailbox_failures = if passed == total { 0 } else { 1 };
-    mailbox_failures + hub::run_tests() + observe::run_tests() + serve::run_tests() + tasks::run_tests()
+    mailbox_failures + hub::run_tests() + observe::run_tests() + serve::run_tests() + tasks::run_tests() + live::sim::run_tests()
 }

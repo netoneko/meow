@@ -39,6 +39,8 @@ start)
     docker run -d --platform linux/arm64 --name "$NAME" \
       -e AGENTS="${LITTER_AGENTS:-sherlock:qwen3:4b hercules:gemma4-yolo-4b:latest zenigata:gemma4:e4b ressler:qwen3.5:0.8b}" \
       -e OLLAMA_URL="${OLLAMA_URL:-http://192.168.65.254:11434}" \
+      -e LITTER_NAME="${LITTER_NAME:-yard}" \
+      -e LITTER_STATIC_PEERS="${LITTER_STATIC_PEERS:-ryzen@192.168.1.126:7700}" \
       -v "$BIN:/bin/meow:ro" \
       -v "$PWD/litter/yard_init.sh:/yard_init.sh:ro" \
       -v "$PWD/litter/personas:/personas:ro" \

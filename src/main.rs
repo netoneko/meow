@@ -49,6 +49,8 @@ pub extern "C" fn main() {
     tools::litter::hub::set_hub_addr(app_config.litter_hub_addr.clone());
     #[cfg(feature = "litter")]
     tools::litter::set_static_peers_spec(app_config.litter_static_peers.clone());
+    #[cfg(feature = "litter")]
+    tools::litter::set_litter_name(app_config.litter_name.clone());
     // Bootstrap: a hub-backed litter member joins the hub's roster as part of
     // its own startup, every invocation — see `tools::litter::hub::bootstrap`.
     // Filesystem-mode litter (no `litter_hub_addr`) needs no equivalent step:

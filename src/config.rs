@@ -197,6 +197,10 @@ pub struct Config {
     /// instead — the hub is opt-in, not a replacement, so an install with no
     /// hub configured keeps working exactly as before.
     pub litter_hub_addr: Option<String>,
+    /// This litter's own identity for cross-litter relay: relayed messages
+    /// travel as `<litter_name>-<agent>` on the remote side (see
+    /// `live::relay_tick`). Absent = relay disabled.
+    pub litter_name: Option<String>,
     /// Static peers the raft thread probes on its tick — `name@host:port`
     /// entries (comma-separated) for agents on other hosts (the
     /// trashcan/laptop split). First answer registers the peer with a
@@ -215,6 +219,7 @@ impl Default for Config {
             render_markdown: false,
             litter_agent_name: None,
             litter_hub_addr: None,
+            litter_name: None,
             litter_static_peers: None,
         }
     }
@@ -323,6 +328,7 @@ impl Config {
             render_markdown: true,
             litter_agent_name: None,
             litter_hub_addr: None,
+            litter_name: None,
             litter_static_peers: None,
         };
 
@@ -391,6 +397,11 @@ impl Config {
                         "litter_hub_addr" => {
                             if !value.is_empty() {
                                 config.litter_hub_addr = Some(String::from(value));
+                            }
+                        }
+                        "litter_name" => {
+                            if !value.is_empty() {
+                                config.litter_name = Some(String::from(value));
                             }
                         }
                         _ => {}
@@ -473,6 +484,11 @@ impl Config {
         if let Some(ref addr) = self.litter_hub_addr {
             content.push_str("litter_hub_addr=");
             content.push_str(addr);
+            content.push('\n');
+        }
+        if let Some(ref name) = self.litter_name {
+            content.push_str("litter_name=");
+            content.push_str(name);
             content.push('\n');
         }
 
@@ -603,6 +619,25 @@ impl Config {
                 libakuma::print(&format!(
                     "  [!] litter_hub_addr: empty={:?} set={:?} blank={:?}\n",
                     empty.litter_hub_addr, set.litter_hub_addr, blank.litter_hub_addr
+                ));
+            }
+        }
+
+        // litter_name: same absent/round-trip contract as litter_agent_name.
+        total += 1;
+        {
+            let empty = Config::parse("current_model=testmodel\n");
+            let set = Config::parse("litter_name=yard\n");
+            let blank = Config::parse("litter_name=\n");
+            if empty.litter_name.is_none()
+                && set.litter_name.as_deref() == Some("yard")
+                && blank.litter_name.is_none()
+                && set.serialize().contains("litter_name=yard")
+            { passed += 1; }
+            else {
+                libakuma::print(&format!(
+                    "  [!] litter_name: empty={:?} set={:?} blank={:?}\n",
+                    empty.litter_name, set.litter_name, blank.litter_name
                 ));
             }
         }
