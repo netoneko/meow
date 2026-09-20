@@ -57,6 +57,9 @@ const PROBE_TIMEOUT_US: u64 = 500_000;
 /// pulses 1, 2, 4, 8, 16 … so a dead or starved peer costs a bounded fraction of
 /// this hub's serving time instead of all of it.
 const PROBE_BACKOFF_MAX: u32 = 5;
+
+/// How often the raft thread says it is alive, in ticks.
+const HEARTBEAT_TICKS: u64 = 10;
 /// History compaction cadence, in ticks (~30s).
 const COMPACT_TICKS: u64 = 30;
 /// How many newest messages per inbox the compaction marker spares.
@@ -161,8 +164,27 @@ enum Machine {
 // what keeps several agents in one box from sharing this file.
 // ============================================================================
 
-static mut RAFT_LOG_PATH: Option<String> = None;
+/// The log path as **bytes in a fixed buffer**, not a `String`.
+///
+/// `raft_log` is called from the raft thread, and the point of this file's
+/// logging is to work when the process is in trouble — so the path it writes to
+/// must not be cloned (an allocation) on every line. 256 bytes covers
+/// `MEOW_HOME`-scoped session roots with room to spare; a longer one simply
+/// does not log, which is the right failure for a diagnostic.
+static mut RAFT_LOG_PATH: [u8; 256] = [0u8; 256];
+static mut RAFT_LOG_PATH_LEN: usize = 0;
 static RAFT_LOG_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The log's fd, opened **once** and held for the life of the process.
+///
+/// It used to be opened and closed per line, which was wrong twice over: it is
+/// three syscalls where one write would do, and it made the log itself the
+/// thing under suspicion — on the Firecracker guest exactly one append per tick
+/// landed and the rest vanished, which is the shape of descriptors not coming
+/// back (see `docs/archive/AMD64_SPAWNED_THREAD_NEVER_RUNS.md`). A diagnostic that
+/// consumes a scarce resource per line cannot be trusted to describe a process
+/// running low on it.
+static RAFT_LOG_FD: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
 
 /// Point the raft log at this agent's session root — `MEOW_HOME`-scoped, so
 /// one file per agent, sitting beside that agent's session directories.
@@ -172,24 +194,59 @@ fn set_raft_log() -> String {
     let dir = session::sessions_root();
     libakuma::mkdir_p(&dir);
     let path = format!("{}/raft.log", dir);
-    unsafe { *core::ptr::addr_of_mut!(RAFT_LOG_PATH) = Some(path.clone()) };
-    RAFT_LOG_INIT.store(true, core::sync::atomic::Ordering::Release);
+    let bytes = path.as_bytes();
+    if bytes.len() < 256 {
+        // SAFETY: single-threaded here — `set_raft_log` runs before the raft
+        // thread is spawned, and `RAFT_LOG_INIT` is the release that publishes
+        // it. Nothing writes these after that store.
+        unsafe {
+            let dst = core::ptr::addr_of_mut!(RAFT_LOG_PATH).cast::<u8>();
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+            *core::ptr::addr_of_mut!(RAFT_LOG_PATH_LEN) = bytes.len();
+        }
+        let fd = libakuma::open(
+            &path,
+            libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_APPEND,
+        );
+        if fd >= 0 {
+            RAFT_LOG_FD.store(fd, core::sync::atomic::Ordering::Release);
+            RAFT_LOG_INIT.store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
     path
 }
 
-fn raft_log(line: &str) {
+/// The held log fd, or `None` before it is opened.
+fn raft_log_fd() -> Option<i32> {
     if !RAFT_LOG_INIT.load(core::sync::atomic::Ordering::Acquire) {
-        return;
+        return None;
     }
-    let path = unsafe { (*core::ptr::addr_of!(RAFT_LOG_PATH)).clone() };
-    let Some(path) = path else { return };
-    let stamp = crate::util::now_us() / 1_000_000;
-    let full = format!("[{}] {}\n", stamp, line);
-    let fd = libakuma::open(&path, libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_APPEND);
-    if fd >= 0 {
-        libakuma::write_fd(fd, full.as_bytes());
-        libakuma::close(fd);
-    }
+    let fd = RAFT_LOG_FD.load(core::sync::atomic::Ordering::Acquire);
+    if fd >= 0 { Some(fd) } else { None }
+}
+
+/// Append one formatted line to the raft log, allocating nothing.
+///
+/// **The raft thread logs here and nowhere else.** It used to `libakuma::print`
+/// to the shared stdout that herd captures, and on the Firecracker guest that
+/// output was provably unreliable: the loop printed `tick 1/2/3 start` and none
+/// of the lines that sit between them in program order, which cannot happen in
+/// one thread unless the writes themselves are being lost. Two threads
+/// formatting into one captured fd is not a diagnostic you can trust when the
+/// thing you are diagnosing is those two threads.
+macro_rules! raft_logf {
+    ($n:expr, $($arg:tt)*) => {{
+        if let Some(fd) = raft_log_fd() {
+            let stamp = crate::util::now_us() / 1_000_000;
+            libakuma::safe_write!(fd, 32, "[{}] ", stamp);
+            libakuma::safe_write!(fd, $n, $($arg)*);
+            libakuma::write_fd(fd, b"\n");
+        }
+    }};
+}
+
+fn raft_log(line: &str) {
+    raft_logf!(256, "{}", line);
 }
 
 pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
@@ -206,7 +263,7 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
     // restarts (see the note above `set_raft_log`).
     let raft_log_path = set_raft_log();
     raft_log(&format!("start agent={} hub={} model={}", me, addr, model));
-    libakuma::print(&format!("[live] raft log: {}\n", raft_log_path));
+    libakuma::safe_print!(320, "[live] raft log: {}\n", raft_log_path);
 
     // ---- Bootstrap (self-serve): join, then walk history back to the
     // marker. Both are plain client calls; if the hub isn't up, they fail
@@ -241,17 +298,18 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
             // exactly like a healthy one and the log was actively misleading
             // while the hub answered nobody.
             let raft_up = start_raft_thread(&listener, &state, static_peers);
-            libakuma::print(&format!(
+            libakuma::safe_print!(
+                192,
                 "[live] {} holds the hub at {} (won the bind race) — raft thread {}\n",
                 me,
                 addr,
                 if raft_up { "up" } else { "DOWN (serving from the agent loop only)" }
-            ));
+            );
             raft_log(&format!("state=leader term=1 hub={} raft={}", addr, if raft_up { "up" } else { "down" }));
             Machine::Leader { listener, state }
         }
         Err(_) => {
-            libakuma::print(&format!("[live] {} joined the litter at {} (hub already up)\n", me, addr));
+            libakuma::safe_print!(160, "[live] {} joined the litter at {} (hub already up)\n", me, addr);
             raft_log(&format!("state=follower hub={}", addr));
             Machine::Follower { epoch: 0, roster: Vec::new(), term: 0 }
         }
@@ -259,12 +317,26 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
 
     // Baseline: history predates us — wake only on what arrives from now.
     let mut seen = inbox_count(&addr, &me);
-    libakuma::print(&format!("[live] {} awake; {} message(s) already in history\n", me, seen));
+    libakuma::safe_print!(128, "[live] {} awake; {} message(s) already in history\n", me, seen);
 
     let mut tick: u64 = 0;
     let mut latest_term: u64 = 0; // highest term any pulse reported
+
     loop {
         tick += 1;
+        // What has the raft thread managed? Reported from HERE, by the main
+        // thread, because the child's own logging is one of the things under
+        // suspicion — a counter it stores costs it one atomic and needs no
+        // syscall, so a child that is alive but cannot do I/O still shows up.
+        if tick % 10 == 0 {
+            raft_logf!(
+                96,
+                "agent tick {} sees RAFT_TICKS={} alive={}",
+                tick,
+                RAFT_TICKS.load(core::sync::atomic::Ordering::Acquire),
+                RAFT_ALIVE.load(core::sync::atomic::Ordering::Acquire)
+            );
+        }
 
         match &mut machine {
             Machine::Leader { listener, state } => {
@@ -301,7 +373,7 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                             *term = t;
                             *roster = names;
                             for event in events {
-                                libakuma::print(&format!("[live] {} hears: {}\n", me, event));
+                                libakuma::safe_print!(256, "[live] {} hears: {}\n", me, event);
                             }
                             *epoch = e;
                         }
@@ -309,7 +381,7 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                         Err(_) => { /* probe failed: liveness bookkeeping simply doesn't advance */ }
                     }
                     if hub::unresponsive() {
-                        libakuma::print(&format!("[live] {} is WAYWARD: hub silent for {}s\n", me, hub::silent_for_secs()));
+                        libakuma::safe_print!(128, "[live] {} is WAYWARD: hub silent for {}s\n", me, hub::silent_for_secs());
                         raft_log(&format!("state=wayward silent_for_s={}", hub::silent_for_secs()));
                         machine = Machine::Wayward { epoch: *epoch, roster: core::mem::take(roster), term: *term };
                         continue;
@@ -338,7 +410,7 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                         }
                         let static_peers = parse_static_peers(super::static_peers_spec().as_deref());
                         start_raft_thread(&listener, &state, static_peers);
-                        libakuma::print(&format!("[live] {} re-raced the bind and WON — leader again (term {})\n", me, latest_term.max(*term) + 1));
+                        libakuma::safe_print!(160, "[live] {} re-raced the bind and WON — leader again (term {})\n", me, latest_term.max(*term) + 1);
                         machine = Machine::Leader { listener, state };
                         // State we served before is gone (in-memory by
                         // design); survivors re-register through their own
@@ -354,7 +426,7 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                         if tick % PULSE_TICKS == 0 {
                             if let Ok(Response::Peers { names, term: t, epoch: e, .. }) = hub::peers(&addr, *epoch) {
                                 hub::mark_alive();
-                                libakuma::print(&format!("[live] {} is FOLLOWER again (hub answered after {}s)\n", me, hub::silent_for_secs()));
+                                libakuma::safe_print!(160, "[live] {} is FOLLOWER again (hub answered after {}s)\n", me, hub::silent_for_secs());
                                 raft_log(&format!("state=follower recovered silent_for_s={}", hub::silent_for_secs()));
                                 machine = Machine::Follower { epoch: e, roster: core::mem::take(roster), term: t.max(*term) };
                                 let _ = names;
@@ -401,6 +473,12 @@ static RAFT_CTX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 /// `spawn_detached` test.
 static RAFT_ALIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Bumped by the raft thread at the top of every tick, read by the **main**
+/// thread. A counter, not a log line, because the question being asked is
+/// whether the child can do anything at all — and the child's own logging is
+/// one of the things under suspicion.
+static RAFT_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// How long the parent waits for the child to announce itself. Generous: this
 /// runs once, at startup, and a false "it did not start" would be worse than
 /// the wait.
@@ -408,8 +486,10 @@ const RAFT_START_TIMEOUT_MS: u64 = 2000;
 
 fn raft_entry() {
     RAFT_ALIVE.store(true, core::sync::atomic::Ordering::Release);
+    raft_logf!(64, "raft_entry running");
     let ptr = RAFT_CTX.load(core::sync::atomic::Ordering::Acquire) as *const RaftCtx;
     if ptr.is_null() {
+        raft_logf!(64, "raft_entry: RAFT_CTX is NULL, thread exits");
         return;
     }
     // SAFETY: the ctx was leaked by start_raft_thread before the child was
@@ -462,9 +542,21 @@ fn start_raft_thread(listener: &Arc<TcpListener>, state: &Arc<PMutex<HubState>>,
 }
 
 fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, static_peers: &PMutex<Vec<StaticPeer>>) {
+    raft_logf!(64, "raft loop entered");
     let mut tick: u64 = 0;
+    // Heartbeat counters. A hub that answers nobody is indistinguishable from
+    // outside from one whose thread never runs, whose probe never returns, and
+    // whose drain never accepts — three different faults that all present as
+    // "went silent before answering". These tell them apart from the log alone.
+    let mut served_total: usize = 0;
+    let mut probes_ok: u64 = 0;
+    let mut probes_fail: u64 = 0;
     loop {
         tick += 1;
+        RAFT_TICKS.store(tick, core::sync::atomic::Ordering::Release);
+        if tick <= 8 {
+            raft_logf!(64, "raft tick {} top", tick);
+        }
         // Probe I/O first, holding NOTHING. `probe_static_peers` used to run
         // inside the state lock below, which put a cross-host TCP round trip
         // — one per peer, at that peer's timeout — in the middle of the
@@ -494,9 +586,15 @@ fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, stat
             Vec::new()
         };
 
+        if tick <= 8 {
+            raft_logf!(64, "tick {} probed ({} results)", tick, probe_results.len());
+        }
+        for (_, _, reachable) in &probe_results {
+            if *reachable { probes_ok += 1 } else { probes_fail += 1 }
+        }
         let batch = {
             let mut st = state.lock();
-            serve::drain(&listener, &mut st);
+            served_total += serve::drain(&listener, &mut st);
             if pulse {
                 st.task_tick();
                 let mut peers = static_peers.lock();
@@ -506,6 +604,20 @@ fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, stat
                 Vec::new()
             }
         };
+        if tick <= 8 {
+            raft_logf!(64, "tick {} drained (served={})", tick, served_total);
+        }
+        // The heartbeat: enough to tell a loop that is not running from one
+        // whose probe never returns from one whose drain never accepts. All
+        // three present identically from outside as "went silent before
+        // answering".
+        if tick % HEARTBEAT_TICKS == 0 {
+            raft_logf!(
+                128,
+                "tick={} served={} probes ok={} fail={}",
+                tick, served_total, probes_ok, probes_fail
+            );
+        }
         if tick % COMPACT_TICKS == 0 {
             state.lock().compact();
         }
@@ -748,7 +860,7 @@ fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str) {
     conversation.append(&ChatMessage::new("user", "[System Context] Current working directory: /\nNo sandbox restrictions."));
     conversation.append(&ChatMessage::new("assistant", "Understood."));
 
-    libakuma::print(&format!("\n[live] {} wakes on new inbox activity\n", me));
+    libakuma::safe_print!(128, "\n[live] {} wakes on new inbox activity\n", me);
     let wake = format!(
         "You are '{}' in a litter of agents. Your inbox has message(s) you haven't seen. \
          Use ListPeers to see who's here (the response also carries recent cluster events), \
@@ -760,7 +872,7 @@ fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str) {
         me
     );
     if let Err(e) = chat_once(model, provider, &wake, &mut conversation, None, system_prompt) {
-        libakuma::print(&format!("[live] {}'s turn failed: {}\n", me, e));
+        libakuma::safe_print!(256, "[live] {}'s turn failed: {}\n", me, e);
     }
 }
 
