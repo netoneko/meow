@@ -16,8 +16,11 @@
 
 pub mod hub;
 pub mod live;
+pub mod membership;
 pub mod observe;
 pub mod raft;
+pub mod record;
+pub mod relay;
 pub mod serve;
 pub mod sig;
 pub mod tasks;

@@ -1,7 +1,7 @@
 # Litter agent state machine
 
 Status: implementation-accurate as of 2026-09-20 (live-found bugs absorbed;
-see `docs/LITTER_EXPERIMENT_PHASE_2.md`). Companion docs:
+see `docs/LITTER_EXPERIMENT_PHASE_2.md` and `_PHASE_3.md`). Companion docs:
 `LITTER_RAFT_LOOP.md` (message-level view: wire frames + tool calls, thread
 wiring). This doc is the agent's control flow; the code, tests and scripts
 all use these words.
@@ -74,10 +74,14 @@ Raft-thread tick (~1s):
 - heartbeat tick: term bookkeeping, heartbeat observation for peers,
   `RequestVote` answered in-place by the state machine (`litter-raft`) —
   never by an LLM.
-- task tick (~5s): task-table duties — assign pending tasks to roster
-  members round-robin (lease stamped `holder`/`until`), requeue leases
-  past expiry (crashed worker), fold `[done]` replies into the compaction
-  marker.
+- task tick (~5s): task-table duties — offer `Pending` sub-tasks to their
+  **named** assignee, promote claims to `InProgress` with a lease, requeue
+  offers nobody claimed and leases past expiry (crashed worker), and
+  deliver the leader its outstanding directives (`[plan-needed:]`,
+  `[clearance-needed:]`, `[artifact-needed:]`). The full parent → directed
+  sub-task → claim → submit → clear → artifact lifecycle, its wire
+  spelling and its timers are `LITTER_WORKFLOW.md`
+  § "Implementation"; this doc only places it in the tick.
 - compact tick (~30s): prune each inbox past `KEEP_RECENT` recent messages
   and keep exactly one `"[compacted: …]"` marker message summarizing what
   was folded.
@@ -133,10 +137,37 @@ cannot deadlock — kernel arbitration.
   majority threshold, `is_authorized(sender, root)`) is built and tested;
   the raft thread consumes it for term/vote bookkeeping. The root
   identity (operator messages) always outranks whoever is leader.
-- Task leases (`holder`/`until`, in-memory) are the only timers: worker
-  liveness, not leadership liveness. An expired lease requeues a task,
-  nothing more. The task table is leader memory; if the leader dies
-  mid-queue, unfinished tasks are re-posted by whoever remembers them.
+- Task leases (in-memory) are the only timers: worker liveness, not
+  leadership liveness. An expired lease requeues a sub-task, nothing more.
+  The task table is leader memory; if the leader dies mid-queue, unfinished
+  work is re-posted by whoever remembers it, and compaction folds the open
+  sub-task list into the marker so the *knowledge* of what was outstanding
+  survives even though the table does not.
+
+## Lock discipline
+
+One `PMutex<HubState>` per leader, shared by the agent loop and the raft
+thread. It is a plain futex word and **not reentrant**, which makes two
+rules load-bearing rather than stylistic:
+
+1. **Never hold it across I/O.** Read the request frame with no lock, take
+   it only for `handle()` — a pure transition, microseconds — drop it, then
+   write the response with no lock. The peer probe already obeys this (a
+   cross-host round trip inside the critical section deadlocks two litters
+   that list each other); serving must too.
+2. **Callbacks that can run inside a critical section use `try_lock` and
+   skip.** Failing to take the lock proves someone else is already serving,
+   so skipping loses nothing.
+
+Both come from one incident (2026-09-20): `serve::drain` held the lock
+across each connection's deadline-bounded read, the deadline poll hook
+called `local_drain`, and `local_drain` re-locked. Evidence was
+unambiguous — both leader threads in `FUTEX_WAIT` on the *same* address at
+the *same* PC, differing only in stack pointer. A non-reentrant mutex left
+at 1 with every thread that could clear it asleep can only mean the holder
+is among the waiters, so it was permanent, not slow. From outside it
+looked exactly like three unrelated faults: "went silent before
+answering".
 
 ## The states as a table
 

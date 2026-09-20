@@ -12,7 +12,8 @@
 //!   heartbeat observation and the event feed), polls its inbox, and wakes
 //!   into a `chat_once` turn on new activity.
 //!
-//! Both threads share `PMutex<HubState>` + the listener behind `Arc`s;
+//! The owner thread holds `HubState` outright (no lock anywhere); the
+//! agent loop reaches the hub over the socket like any other client;
 //! critical sections are Vec operations. State is in-memory only — the
 //! filesystem is not a transport, not a store (network-bound by design).
 //!
@@ -33,7 +34,6 @@ use crate::api::client as api_client;
 use crate::app::session;
 use crate::app::{chat_once, Conversation, Message as ChatMessage};
 use crate::config::Provider;
-use crate::rt::{spawn_detached, PMutex};
 
 use super::hub;
 use super::serve::{self, HubState};
@@ -63,6 +63,11 @@ const PROBE_BACKOFF_MAX: u32 = 5;
 const HEARTBEAT_TICKS: u64 = 10;
 /// History compaction cadence, in ticks (~30s).
 const COMPACT_TICKS: u64 = 30;
+
+/// How long the owner sleeps between serving passes inside one tick. The
+/// hub's answer latency, now that every agent — the leader's own loop
+/// included — reaches it over the socket.
+const OWNER_SLICE_MS: u64 = 20;
 /// How many newest messages per inbox the compaction marker spares.
 const KEEP_RECENT: usize = serve::KEEP_RECENT;
 /// History page size when a cold-starting agent walks back to the marker.
@@ -129,7 +134,12 @@ pub fn parse_static_peers(spec: Option<&str>) -> Vec<StaticPeer> {
 enum Machine {
     Leader {
         listener: Arc<TcpListener>,
-        state: Arc<PMutex<HubState>>,
+        /// No owner thread started, so this loop IS the owner: it serves
+        /// the hub inline between polls, and the hub is unavailable while
+        /// an LLM turn runs. Degraded, and loudly so — see
+        /// `start_owner_thread`. With an owner thread (the normal case)
+        /// this is false and the agent loop touches no hub state at all.
+        solo: bool,
     },
     /// Hub is up (someone else's process) and answering.
     Follower {
@@ -282,32 +292,28 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
             // lock and the hub freezes for the whole litter.
             let _ = listener.set_nonblocking(true);
             let listener = Arc::new(listener);
-            let state = Arc::new(PMutex::new(HubState::new()));
-            {
-                let mut st = state.lock();
-                st.handle(Request::Join { name: me.clone() });
-                // Fresh litter = term 1. (A takeover re-race bumps to
-                // last_seen_term + 1 — see WAYWARD handling below.)
-                st.set_leader(&me, 1);
-            }
             // Static peers from the config: discovered (or declared lost)
-            // by the raft thread; this is how the trashcan/laptop split
+            // by the owner thread; this is how the trashcan/laptop split
             // shows up as status changes instead of absence.
             let static_peers = parse_static_peers(super::static_peers_spec().as_deref());
+            // Fresh litter = term 1. (A takeover re-race bumps to
+            // last_seen_term + 1 — see WAYWARD handling below.)
+            //
             // **Not discarded.** This line used to print "raft thread up"
-            // unconditionally, so a leader with no raft thread announced itself
-            // exactly like a healthy one and the log was actively misleading
-            // while the hub answered nobody.
-            let raft_up = start_raft_thread(&listener, &state, static_peers);
+            // unconditionally, so a leader with no owner thread announced
+            // itself exactly like a healthy one, and the log was actively
+            // misleading while the hub answered nobody.
+            let owner_up = start_owner_thread(&listener, HubState::new_seeded(&me, 1), static_peers);
+            enter_solo_if_needed(owner_up);
             libakuma::safe_print!(
                 192,
-                "[live] {} holds the hub at {} (won the bind race) — raft thread {}\n",
+                "[live] {} holds the hub at {} (won the bind race) — owner thread {}\n",
                 me,
                 addr,
-                if raft_up { "up" } else { "DOWN (serving from the agent loop only)" }
+                if owner_up { "up" } else { "DOWN (serving from the agent loop only)" }
             );
-            raft_log(&format!("state=leader term=1 hub={} raft={}", addr, if raft_up { "up" } else { "down" }));
-            Machine::Leader { listener, state }
+            raft_log(&format!("state=leader term=1 hub={} owner={}", addr, if owner_up { "up" } else { "down" }));
+            Machine::Leader { listener, solo: !owner_up }
         }
         Err(_) => {
             libakuma::safe_print!(160, "[live] {} joined the litter at {} (hub already up)\n", me, addr);
@@ -322,7 +328,13 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
     // a live raft thread or our own loop can answer. Reading locally costs
     // nothing and cannot stall (see the loop's `local_inbox_count` note).
     let mut seen = match &machine {
-        Machine::Leader { state, .. } => local_inbox_count(&mut state.lock(), &me),
+        // Solo leaders read their own state; everyone else — including a
+        // leader with a live owner thread — asks over the socket.
+        Machine::Leader { solo: true, .. } => match owner_ctx() {
+            // SAFETY: solo ⇒ no owner thread ⇒ we are the single owner.
+            Some(ctx) => local_inbox_count(unsafe { ctx.state() }, &me),
+            None => 0,
+        },
         _ => inbox_count(&addr, &me),
     };
     libakuma::safe_print!(128, "[live] {} awake; {} message(s) already in history\n", me, seen);
@@ -348,29 +360,42 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
         }
 
         match &mut machine {
-            Machine::Leader { listener, state } => {
-                // The agent loop drains too: two serve points on one
-                // listener, so requests never wait a full raft tick.
-                serve::drain(&listener, &mut state.lock());
-                // Read our OWN inbox straight out of the state we are
-                // holding, never over a socket to ourselves.
-                //
-                // `inbox_count`'s client call is a TCP round trip to
-                // `addr`, and when we are the leader that is our own
-                // listener. The only code that can accept and answer it is
-                // `serve::drain` — which runs on this thread. With a raft
-                // thread alive the other thread answers and nobody notices;
-                // with no raft thread (measured: Akuma/amd64, where
-                // `spawn_detached` fails) this thread blocks waiting for a
-                // reply only it could send, times out every tick, and reads
-                // its own inbox as permanently empty. The leader then never
-                // wakes, never runs a turn, and never serves anyone —
-                // a litter with a leader that does nothing at all.
-                let count = local_inbox_count(&mut state.lock(), &me);
-                if count > seen {
-                    run_turn(&me, &model, &provider, &system_prompt);
-                    serve::drain(&listener, &mut state.lock());
-                    seen = local_inbox_count(&mut state.lock(), &me);
+            Machine::Leader { listener, solo } => {
+                if *solo {
+                    // No owner thread: this loop IS the owner, so it serves
+                    // inline and reads its own inbox directly. It must not
+                    // call `inbox_count` here — that is a TCP round trip to
+                    // our own listener, and the only code that could answer
+                    // it is the drain on this very thread. Measured on
+                    // Akuma/amd64, where `spawn_detached` fails: the leader
+                    // times out every tick, reads its inbox as permanently
+                    // empty, never wakes and never serves. A litter with a
+                    // leader that does nothing at all.
+                    //
+                    // SAFETY: solo means no owner thread exists, so this
+                    // thread is the single owner (see `OwnerCtx`).
+                    if let Some(ctx) = owner_ctx() {
+                        let st = unsafe { ctx.state() };
+                        serve::drain(listener, st);
+                        let count = local_inbox_count(st, &me);
+                        if count > seen {
+                            run_turn(&me, &model, &provider, &system_prompt);
+                            let st = unsafe { ctx.state() };
+                            serve::drain(listener, st);
+                            seen = local_inbox_count(st, &me);
+                        }
+                    }
+                } else {
+                    // The owner thread has the state and always answers, so
+                    // the leader is an ordinary client of its own hub —
+                    // identical to a follower. This is what single ownership
+                    // buys: the agent loop holds nothing, locks nothing, and
+                    // cannot starve the hub by thinking for four minutes.
+                    let count = inbox_count(&addr, &me);
+                    if count > seen {
+                        run_turn(&me, &model, &provider, &system_prompt);
+                        seen = inbox_count(&addr, &me);
+                    }
                 }
             }
             Machine::Follower { epoch, roster, term } => {
@@ -410,17 +435,12 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                     Ok(listener) => {
                         let _ = listener.set_nonblocking(true);
                         let listener = Arc::new(listener);
-                        let state = Arc::new(PMutex::new(HubState::new()));
-                        {
-                            let mut st = state.lock();
-                            st.handle(Request::Join { name: me.clone() });
-                            let new_term = latest_term.max(*term) + 1;
-                            st.set_leader(&me, new_term);
-                        }
+                        let new_term = latest_term.max(*term) + 1;
                         let static_peers = parse_static_peers(super::static_peers_spec().as_deref());
-                        start_raft_thread(&listener, &state, static_peers);
-                        libakuma::safe_print!(160, "[live] {} re-raced the bind and WON — leader again (term {})\n", me, latest_term.max(*term) + 1);
-                        machine = Machine::Leader { listener, state };
+                        let owner_up = start_owner_thread(&listener, HubState::new_seeded(&me, new_term), static_peers);
+                        enter_solo_if_needed(owner_up);
+                        libakuma::safe_print!(160, "[live] {} re-raced the bind and WON — leader again (term {})\n", me, new_term);
+                        machine = Machine::Leader { listener, solo: !owner_up };
                         // State we served before is gone (in-memory by
                         // design); survivors re-register through their own
                         // pulses, and history below the last marker is
@@ -459,16 +479,40 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
 /// The raft thread's context, leaked once at spawn: a `fn()`-pointer
 /// spawn can't capture, and the thread lives exactly as long as the
 /// process, so a one-time leak IS the sane ownership story here.
-struct RaftCtx {
+struct OwnerCtx {
     listener: Arc<TcpListener>,
-    state: Arc<PMutex<HubState>>,
-    /// Behind the same coarse PMutex type as the state: the probe mutates
-    /// `online` transitions, and a fn()-pointer spawn can't hand a `&mut`
-    /// across the clone.
-    peers: PMutex<Vec<StaticPeer>>,
+    /// **Single owner.** Exactly one thread ever dereferences these: the
+    /// owner thread once it is running, or — if it never started — the
+    /// agent loop in solo mode. Never both: `start_owner_thread` only
+    /// reports success after the child says it is alive, and the agent
+    /// loop only touches state when that report was `false`.
+    ///
+    /// `UnsafeCell` rather than a mutex because the exclusivity is
+    /// structural, not something a lock is discovering at runtime. The
+    /// previous shape put an `Arc<PMutex<HubState>>` here and let both
+    /// threads drive it; that lock is what deadlocked the litter
+    /// (`LITTER_EXPERIMENT_PHASE_3.md` § 2), and removing the sharing
+    /// removes the lock rather than debugging it.
+    state: core::cell::UnsafeCell<HubState>,
+    /// Same contract: probe results mutate `online` transitions, owner only.
+    peers: core::cell::UnsafeCell<Vec<StaticPeer>>,
 }
 
-static RAFT_CTX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+impl OwnerCtx {
+    /// SAFETY: caller must be the single owner — see the field docs. Both
+    /// call sites are in this module and are the two arms of that rule.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn state(&self) -> &mut HubState {
+        &mut *self.state.get()
+    }
+    /// SAFETY: as `state`.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn peers(&self) -> &mut Vec<StaticPeer> {
+        &mut *self.peers.get()
+    }
+}
+
+static OWNER_CTX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Flipped by the raft thread itself, as its first act.
 ///
@@ -491,7 +535,7 @@ static RAFT_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// How far the child got before stopping. Written by the child after each
 /// step, read by the main thread's tick log. Stages:
 /// 1 = entered `raft_entry`, 2 = survived the first log write,
-/// 3 = `RAFT_CTX` loaded and non-null, 4 = entered `raft_tick_loop`.
+/// 3 = `OWNER_CTX` loaded and non-null, 4 = entered `raft_tick_loop`.
 /// A stage that stops advancing localizes the death to one step — the whole
 /// point of the §6 plan in docs/archive/AMD64_SPAWNED_THREAD_NEVER_RUNS.md.
 static RAFT_STAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -501,34 +545,70 @@ fn stage(n: u64) {
 }
 
 /// The hub module's `ConnectionRefused` self-rescue (see `DRAIN_HOOK` there):
-/// drain our own listener once. Reads the same leaked [`RAFT_CTX`] the raft
+/// drain our own listener once. Reads the same leaked [`OWNER_CTX`] the raft
 /// thread uses; safe as long as this process holds the bind — which is the
-/// only situation in which `start_raft_thread` runs and registers the hook.
+/// only situation in which `start_owner_thread` runs and registers the hook.
 ///
-/// **`try_lock`, never `lock`.** This function is a *callback from inside an
-/// I/O wait* (`serve::deadline`'s poll hook and `hub`'s drain hook), and both
-/// of those waits happen on paths that may already hold the state lock — the
-/// leader's own `serve::drain` is exactly one. `PMutex` is not reentrant, so
-/// `lock()` here is a self-deadlock the process cannot recover from: measured
-/// 2026-09-20, both leader threads parked in `FUTEX_WAIT` on the same word at
-/// the same PC, the lock word left at 1 with every thread that could clear it
-/// asleep. The hub answered nobody — not even `Join` — while looking alive
-/// from outside, which is the same "went silent before answering" signature as
-/// three unrelated faults.
+/// Register the self-rescue hooks, but **only** when no owner thread
+/// started. With an owner thread the agent loop is an ordinary client and
+/// the owner always answers, so a hook that reached into hub state would
+/// be a second driver — exactly the thing single ownership removes.
+fn enter_solo_if_needed(owner_up: bool) {
+    if owner_up {
+        return;
+    }
+    // Solo: every hub client call this process makes must serve as it
+    // waits, because nothing else can. Tools inside an LLM turn would
+    // otherwise wait for a reply only this thread could send.
+    serve::deadline::set_io_poll_hook(local_drain);
+    hub::set_drain_hook(local_drain);
+}
+
+/// **Solo mode only.** Serve our own listener once, from inside an I/O
+/// wait — the self-rescue for the case where this process holds the hub
+/// socket and has no owner thread, so a hub client call made by this very
+/// thread (a tool call inside an LLM turn) would otherwise wait for a
+/// reply only it could send.
 ///
-/// Giving up on a contended lock loses nothing: the hook exists to serve *when
-/// nobody else is*, and a lock we cannot take means someone already is.
+/// With an owner thread this is never registered: the owner always serves,
+/// so the agent loop is an ordinary client and needs no rescue. That is
+/// the single-owner rule doing its job — the hook exists exactly where the
+/// rule cannot.
+///
+/// The flag bounds recursion: `serve::drain` waits on I/O, which fires this
+/// hook again, which would nest without limit on a 64 KB thread stack. Its
+/// predecessor had the sharper version of the same bug — it took the state
+/// lock while `serve::drain` already held it, and `PMutex` is not
+/// reentrant. Measured 2026-09-20, both leader threads parked in
+/// `FUTEX_WAIT` on the same word at the same PC, the lock word left at 1
+/// with every thread that could clear it asleep; the hub answered nobody,
+/// not even `Join`, while looking alive from outside.
+static IN_HOOK_DRAIN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The leaked owner context, if this process ever won a bind race.
+fn owner_ctx() -> Option<&'static OwnerCtx> {
+    let ptr = OWNER_CTX.load(core::sync::atomic::Ordering::Acquire) as *const OwnerCtx;
+    if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: leaked by start_owner_thread, process-outlived.
+        Some(unsafe { &*ptr })
+    }
+}
+
 fn local_drain() {
-    let ptr = RAFT_CTX.load(core::sync::atomic::Ordering::Acquire) as *const RaftCtx;
+    let ptr = OWNER_CTX.load(core::sync::atomic::Ordering::Acquire) as *const OwnerCtx;
     if ptr.is_null() {
         return;
     }
-    // SAFETY: leaked by start_raft_thread, process-outlived (same contract as
-    // raft_entry's use).
-    let ctx = unsafe { &*ptr };
-    if let Some(mut st) = ctx.state.try_lock() {
-        serve::drain(&ctx.listener, &mut st);
+    if IN_HOOK_DRAIN.swap(true, core::sync::atomic::Ordering::Acquire) {
+        return; // a hook-driven drain is already running; do not nest
     }
+    // SAFETY: registered only in solo mode, where no owner thread exists and
+    // this thread is the single owner (see OwnerCtx's field docs).
+    let ctx = unsafe { &*ptr };
+    serve::drain(&ctx.listener, unsafe { ctx.state() });
+    IN_HOOK_DRAIN.store(false, core::sync::atomic::Ordering::Release);
 }
 
 /// How long the parent waits for the child to announce itself. Generous: this
@@ -597,37 +677,41 @@ fn raft_entry() {
     }
     raft_logf!(64, "raft_entry running");
     stage(2);
-    let ptr = RAFT_CTX.load(core::sync::atomic::Ordering::Acquire) as *const RaftCtx;
+    let ptr = OWNER_CTX.load(core::sync::atomic::Ordering::Acquire) as *const OwnerCtx;
     if ptr.is_null() {
-        raft_logf!(64, "raft_entry: RAFT_CTX is NULL, thread exits");
+        raft_logf!(64, "raft_entry: OWNER_CTX is NULL, thread exits");
         return;
     }
     stage(3);
-    // SAFETY: the ctx was leaked by start_raft_thread before the child was
+    // SAFETY: the ctx was leaked by start_owner_thread before the child was
     // spawned; the child is its only reader and the process outlives it.
     let ctx = unsafe { &*ptr };
     stage(4);
-    raft_tick_loop(ctx.listener.clone(), ctx.state.clone(), &ctx.peers);
+    // SAFETY: we are the owner thread; the agent loop only touches state
+    // when this thread failed to start (see OwnerCtx).
+    owner_tick_loop(ctx);
 }
 
 /// Leak the context and spawn the raft thread. Returns false when the thread is
 /// not **running** — which is a stronger claim than "the clone succeeded", and
 /// deliberately so (see [`RAFT_ALIVE`]). The caller keeps running as leader
 /// with its own drain — degraded, not dead.
-fn start_raft_thread(listener: &Arc<TcpListener>, state: &Arc<PMutex<HubState>>, static_peers: Vec<StaticPeer>) -> bool {
-    let ctx: &'static RaftCtx = Box::leak(Box::new(RaftCtx {
+/// Hand the hub state to a freshly spawned owner thread and report whether
+/// that thread is **running** — a stronger claim than "the clone
+/// succeeded", and deliberately so (see [`RAFT_ALIVE`]).
+///
+/// On `false` the caller keeps the hub but runs it solo: it owns the state
+/// itself and serves inline between polls. That is the only case in which
+/// two pieces of code could both reach `OwnerCtx`, and it is resolved by
+/// this return value — the agent loop touches state only when this said
+/// the thread is not there.
+fn start_owner_thread(listener: &Arc<TcpListener>, state: HubState, static_peers: Vec<StaticPeer>) -> bool {
+    let ctx: &'static OwnerCtx = Box::leak(Box::new(OwnerCtx {
         listener: listener.clone(),
-        state: state.clone(),
-        peers: PMutex::new(static_peers),
+        state: core::cell::UnsafeCell::new(state),
+        peers: core::cell::UnsafeCell::new(static_peers),
     }));
-    RAFT_CTX.store(ctx as *const RaftCtx as u64, core::sync::atomic::Ordering::Release);
-    // From here on this process holds a listener it serves only from its own
-    // loop and (in principle) the raft thread. Every hub client call from
-    // this process now serves as it waits (tools inside an LLM turn would
-    // otherwise deadlock until their deadline), and refused connects drain
-    // and retry once.
-    serve::deadline::set_io_poll_hook(local_drain);
-    hub::set_drain_hook(local_drain);
+    OWNER_CTX.store(ctx as *const OwnerCtx as u64, core::sync::atomic::Ordering::Release);
     let spawned = unsafe { crate::rt::spawn_detached(raft_entry) };
     // Wait for the child to say it is running, rather than trusting the clone's
     // return value.
@@ -660,8 +744,8 @@ fn start_raft_thread(listener: &Arc<TcpListener>, state: &Arc<PMutex<HubState>>,
     alive
 }
 
-fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, static_peers: &PMutex<Vec<StaticPeer>>) {
-    raft_logf!(64, "raft loop entered");
+fn owner_tick_loop(ctx: &OwnerCtx) -> ! {
+    raft_logf!(64, "owner loop entered");
     let mut tick: u64 = 0;
     // Heartbeat counters. A hub that answers nobody is indistinguishable from
     // outside from one whose thread never runs, whose probe never returns, and
@@ -674,16 +758,18 @@ fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, stat
         tick += 1;
         RAFT_TICKS.store(tick, core::sync::atomic::Ordering::Release);
         if tick <= 8 {
-            raft_logf!(64, "raft tick {} top", tick);
+            raft_logf!(64, "owner tick {} top", tick);
         }
-        // Probe I/O first, holding NOTHING. `probe_static_peers` used to run
-        // inside the state lock below, which put a cross-host TCP round trip
-        // — one per peer, at that peer's timeout — in the middle of the
-        // hub's critical section. Two litters pointed at each other then
-        // deadlock each other in slow motion: our probe waits on their hub,
-        // which is locked waiting on its probe of ours. It looks exactly
-        // like "the leader goes deaf during an LLM turn" and has nothing to
-        // do with the LLM; it appears the moment a peer is configured.
+        // Probe I/O first, touching no state at all. This is a cross-host
+        // TCP round trip per peer and it is allowed to be slow; running it
+        // before the state work keeps it off the serving path. It used to
+        // run in the middle of the hub's critical section, which made two
+        // litters pointed at each other deadlock in slow motion — our probe
+        // waiting on their hub, locked waiting on its probe of ours.
+        //
+        // Still not fully bounded: `TcpStream::connect` has no timeout, so
+        // an unreachable peer parks this loop for the kernel's SYN backoff.
+        // See `LITTER_EXPERIMENT_PHASE_3.md` § 4.
         let pulse = tick % PULSE_TICKS == 0;
         let probe_results = if pulse {
             // Only the peers due this pulse. A peer that answered is due every
@@ -691,8 +777,8 @@ fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, stat
             // it is paid for out of this hub's own serving time (see
             // `StaticPeer::probe_failures`).
             let pulse_no = tick / PULSE_TICKS;
-            let targets: Vec<(String, String)> = static_peers
-                .lock()
+            // SAFETY: owner thread; sole accessor (see OwnerCtx).
+            let targets: Vec<(String, String)> = unsafe { ctx.peers() }
                 .iter()
                 .filter(|p| {
                     let every = 1u64 << p.probe_failures.min(PROBE_BACKOFF_MAX);
@@ -711,17 +797,19 @@ fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, stat
         for (_, _, reachable) in &probe_results {
             if *reachable { probes_ok += 1 } else { probes_fail += 1 }
         }
-        let batch = {
-            let mut st = state.lock();
-            served_total += serve::drain(&listener, &mut st);
-            if pulse {
-                st.task_tick();
-                let mut peers = static_peers.lock();
-                apply_probe_results(&mut st, &mut peers, &probe_results);
-                relay_jobs(&mut st, &mut peers)
-            } else {
-                Vec::new()
-            }
+
+        // SAFETY: owner thread; sole accessor of both (see OwnerCtx).
+        let st = unsafe { ctx.state() };
+        let peers = unsafe { ctx.peers() };
+
+        served_total += serve::drain(&ctx.listener, st);
+
+        let batch = if pulse {
+            st.task_tick();
+            apply_probe_results(st, peers, &probe_results);
+            relay_jobs(st, peers)
+        } else {
+            Vec::new()
         };
         if tick <= 8 {
             raft_logf!(64, "tick {} drained (served={})", tick, served_total);
@@ -738,16 +826,24 @@ fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, stat
             );
         }
         if tick % COMPACT_TICKS == 0 {
-            state.lock().compact();
+            st.compact();
         }
-        // Relay I/O runs OUTSIDE the state lock: a slow peer costs its own
-        // send deadlines, never the hub (same rule as deadline-bounded
-        // serve_one — see docs/LITTER_RELAY_TOPOLOGY.md for where this goes
-        // long-term).
+        // Relay I/O last, and it touches no state: a slow peer costs its own
+        // send deadlines, never the hub (see docs/LITTER_RELAY_TOPOLOGY.md).
         if !batch.is_empty() {
-            relay_send(&batch, static_peers);
+            relay_send(&batch, peers);
         }
-        libakuma::sleep(TICK_SECS);
+
+        // Sleep in slices, serving between them. The agent loop is now an
+        // ordinary socket client — including the leader's own process — so
+        // "how fast does the hub answer" is this slice, not TICK_SECS. A
+        // flat one-second sleep here would put up to a second of latency on
+        // every inbox poll in the litter.
+        let slices = (TICK_SECS * 1000) / OWNER_SLICE_MS;
+        for _ in 0..slices {
+            libakuma::sleep_ms(OWNER_SLICE_MS);
+            served_total += serve::drain(&ctx.listener, st);
+        }
     }
 }
 
@@ -786,7 +882,7 @@ fn relay_jobs(st: &mut HubState, peers: &mut [StaticPeer]) -> Vec<RelayJob> {
     let fresh_enough = |ts: u64| now.saturating_sub(ts) <= RELAY_MAX_AGE_US;
     let mut jobs = Vec::new();
     for peer in peers.iter().filter(|p| p.online) {
-        for entry in &st.relay_log {
+        for entry in &st.relay.log {
             if entry.msg.ts <= peer.last_relay_ts
                 || entry.msg.kind != MessageKind::Chat
                 || entry.msg.ol.is_some()
@@ -827,7 +923,7 @@ fn relay_jobs(st: &mut HubState, peers: &mut [StaticPeer]) -> Vec<RelayJob> {
 /// clock, so an unreachable peer simply re-drives its batch on a later
 /// tick (bounded by the relay log's cap and the age guard, never queued
 /// unboundedly).
-fn relay_send(jobs: &[RelayJob], static_peers: &PMutex<Vec<StaticPeer>>) {
+fn relay_send(jobs: &[RelayJob], peers: &mut Vec<StaticPeer>) {
     let Some(me) = super::agent_name() else { return };
     for job in jobs {
         let payload = super::sig::relay_payload(&job.ol, &job.from, &job.to, &job.body, job.ot);
@@ -846,7 +942,6 @@ fn relay_send(jobs: &[RelayJob], static_peers: &PMutex<Vec<StaticPeer>>) {
         match hub::call_addr(&job.addr, &req) {
             Ok(Response::Sent { .. }) => {
                 raft_log(&format!("relay out to={} from={} round={} ot={}", job.addr, job.from, job.round, job.ot));
-                let mut peers = static_peers.lock();
                 if let Some(p) = peers.iter_mut().find(|p| p.addr == job.addr) {
                     p.last_relay_ts = p.last_relay_ts.max(job.cursor_ts);
                 }
@@ -1232,7 +1327,7 @@ pub mod sim {
                 ("island", Litter::seed("island", "10.0.0.2:7700", &["bob"], "yard@10.0.0.1:7700")),
             ];
             let old = now_us().saturating_sub(super::RELAY_MAX_AGE_US + 1_000_000);
-            sw[0].1.hub.relay_log.push(RelayEntry {
+            sw[0].1.hub.relay.capture(RelayEntry {
                 to: String::from(GROUP_NAME),
                 msg: litter_wire::Message::chat(String::from("al"), 1, String::from("stale news"), old),
                 origin_litter: String::from("yard"),
@@ -1306,7 +1401,7 @@ pub mod sim {
             // Replay the exact envelope that just crossed, by hand and with
             // a FRESH relayer signature — the cursor cannot help here, so
             // this is the seen-set doing the work.
-            let entry = &sw[0].1.hub.relay_log[0];
+            let entry = &sw[0].1.hub.relay.log[0];
             let (ol, ot, sig) = (entry.origin_litter.clone(), entry.origin_ts, entry.origin_sig.clone());
             let body = entry.msg.body.clone();
             become_agent(&sw[0].1, "al", &guests);

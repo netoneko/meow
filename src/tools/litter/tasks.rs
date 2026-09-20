@@ -78,6 +78,23 @@ impl TaskTable {
         self.tasks.is_empty()
     }
 
+    /// One line per still-open task, for the compaction marker to carry
+    /// forward. The table is leader memory and dies with the leader, so
+    /// what has to survive a leadership change has to be in history.
+    pub fn open_work_lines(&self) -> Vec<String> {
+        self.tasks
+            .iter()
+            .map(|t| {
+                format!(
+                    "[open] t{} -> {}: {}",
+                    t.id,
+                    t.holder.as_deref().unwrap_or("unassigned"),
+                    t.body
+                )
+            })
+            .collect()
+    }
+
     /// Feed one inbound message through the table. `[task] …` opens a task;
     /// `[done: tN] …` from the task's holder closes it. Everything else is
     /// ignored. `now_us` stamps new tasks' unassigned state.
