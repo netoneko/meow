@@ -166,6 +166,19 @@ pub enum OutKind {
     Done,
 }
 
+/// What applying a record did. `Ok(note)` means the state machine changed
+/// state and the record is real; `Err(why)` means nothing happened.
+///
+/// A type rather than a note the caller sniffs for the word "refused".
+/// Three separate places used to re-derive acceptance from the note's
+/// prefix — the hub deciding whether to replicate the record, the tool
+/// deciding ok-vs-error, and the wire, which did not carry the
+/// distinction at all. Any of them could disagree with the state machine,
+/// and the "already claimed" refusals disagreed with all three: they never
+/// said "refused", so a no-op was replicated to the whole litter as though
+/// it had happened.
+pub type Applied = Result<String, String>;
+
 /// The reserved broadcast name, mirroring `serve::GROUP_NAME`. Repeated
 /// rather than imported so this module keeps depending on nothing.
 pub const GROUP: &str = "litter";
@@ -249,10 +262,11 @@ impl TaskTable {
     /// the events to log, and a one-line note for the caller to hand back
     /// to whoever submitted the record.
     ///
-    /// Every refusal returns a note rather than failing silently. A model
+    /// Every refusal returns a reason rather than failing silently. A model
     /// that claimed the wrong sub-task learns it did; a model whose record
     /// was dropped for lack of authority learns that too. Silence here
-    /// would be indistinguishable from "accepted and nothing happened".
+    /// would be indistinguishable from "accepted and nothing happened" —
+    /// which, for a refusal, is exactly what it is.
     pub fn apply(
         &mut self,
         from: &str,
@@ -260,10 +274,10 @@ impl TaskTable {
         op: &TaskOp,
         now_us: u64,
         roster: &[String],
-    ) -> (Vec<Outbound>, Vec<String>, String) {
+    ) -> (Vec<Outbound>, Vec<String>, Applied) {
         let mut out = Vec::new();
         let mut events = Vec::new();
-        let note = match op.act {
+        let outcome = match op.act {
             TaskAct::Open => self.op_open(from, authority, &op.text, &mut events),
             TaskAct::Plan => self.op_plan(authority, op, roster, &mut events),
             TaskAct::Claim => self.op_claim(from, &op.id, now_us, &mut events),
@@ -273,19 +287,19 @@ impl TaskTable {
             TaskAct::Reopen => self.op_reopen(from, authority, &op.id, &op.text, &mut events),
             TaskAct::Artifact => self.op_artifact(from, authority, op, &mut out, &mut events),
         };
-        (out, events, note)
+        (out, events, outcome)
     }
 
-    fn op_open(&mut self, from: &str, authority: Authority, text: &str, events: &mut Vec<String>) -> String {
+    fn op_open(&mut self, from: &str, authority: Authority, text: &str, events: &mut Vec<String>) -> Applied {
         if !authority.may_open_parent() {
             // Otherwise any agent can mint work for the whole litter —
             // observed live, an agent tasking the litter to police the
             // kernel.
-            return String::from("refused: only the operator or the leader may open a task");
+            return Err(String::from("only the operator or the leader may open a task"));
         }
         let text = text.trim();
         if text.is_empty() {
-            return String::from("refused: a task needs a brief");
+            return Err(String::from("a task needs a brief"));
         }
         let id = self.next_parent;
         self.next_parent += 1;
@@ -298,7 +312,7 @@ impl TaskTable {
             nagged: 0,
         });
         events.push(format!("[event] parent task t{} opened by {}", id, from));
-        format!("opened t{}", id)
+        Ok(format!("opened t{}", id))
     }
 
     /// **Atomic, and refused if the parent is already planned.** One record
@@ -312,17 +326,17 @@ impl TaskTable {
         op: &TaskOp,
         roster: &[String],
         events: &mut Vec<String>,
-    ) -> String {
+    ) -> Applied {
         if !authority.is_leader() {
-            return String::from("refused: only the leader may plan a task");
+            return Err(String::from("only the leader may plan a task"));
         }
         let Some(pid) = parse_parent(&op.id) else {
-            return String::from("refused: 'task' must be a parent id like t1");
+            return Err(String::from("'task' must be a parent id like t1"));
         };
         match self.parents.iter().find(|p| p.id == pid) {
-            None => return format!("refused: no task t{}", pid),
-            Some(p) if p.planned => return format!("refused: t{} is already planned", pid),
-            Some(p) if p.closed => return format!("refused: t{} is closed", pid),
+            None => return Err(format!("no task t{}", pid)),
+            Some(p) if p.planned => return Err(format!("t{} is already planned", pid)),
+            Some(p) if p.closed => return Err(format!("t{} is closed", pid)),
             Some(_) => {}
         }
 
@@ -355,59 +369,59 @@ impl TaskTable {
         }
 
         if n == 0 {
-            return format!("refused: plan for t{} had no assignable sub-tasks", pid);
+            return Err(format!("plan for t{} had no assignable sub-tasks", pid));
         }
         if let Some(p) = self.parent_mut(pid) {
             p.planned = true;
             p.nagged = 0;
         }
         if skipped.is_empty() {
-            format!("planned t{}: {} sub-task(s)", pid, n)
+            Ok(format!("planned t{}: {} sub-task(s)", pid, n))
         } else {
-            format!("planned t{}: {} sub-task(s); not in the roster: {}", pid, n, skipped.join(", "))
+            Ok(format!("planned t{}: {} sub-task(s); not in the roster: {}", pid, n, skipped.join(", ")))
         }
     }
 
-    fn op_claim(&mut self, from: &str, id: &str, now_us: u64, events: &mut Vec<String>) -> String {
+    fn op_claim(&mut self, from: &str, id: &str, now_us: u64, events: &mut Vec<String>) -> Applied {
         let Some(pos) = self.sub_by_id(id) else {
-            return format!("refused: no sub-task {}", id);
+            return Err(format!("no sub-task {}", id));
         };
         let s = &mut self.subs[pos];
         if s.assignee != from {
-            return format!("refused: {} is assigned to {}", s.label(), s.assignee);
+            return Err(format!("{} is assigned to {}", s.label(), s.assignee));
         }
         if !matches!(s.state, SubState::Pending) {
-            return format!("{} is already {}", s.label(), s.state.as_str());
+            return Err(format!("{} is already {}", s.label(), s.state.as_str()));
         }
         s.state = SubState::InProgress;
         s.until = now_us.saturating_add(LEASE_US);
         events.push(format!("[event] {} claimed by {}", s.label(), from));
-        format!("claimed {}", s.label())
+        Ok(format!("claimed {}", s.label()))
     }
 
     /// Accepted from `Pending` as well as `InProgress`: a model that skips
     /// the claim handshake and goes straight to the answer has still done
     /// the work, and losing the ceremony is cheaper than losing the result.
-    fn op_done(&mut self, from: &str, id: &str, text: &str, events: &mut Vec<String>) -> String {
+    fn op_done(&mut self, from: &str, id: &str, text: &str, events: &mut Vec<String>) -> Applied {
         let Some(pos) = self.sub_by_id(id) else {
-            return format!("refused: no sub-task {}", id);
+            return Err(format!("no sub-task {}", id));
         };
         let result = text.trim();
         if result.is_empty() {
-            return String::from("refused: a result needs text");
+            return Err(String::from("a result needs text"));
         }
         let s = &mut self.subs[pos];
         if s.assignee != from {
-            return format!("refused: {} is assigned to {}", s.label(), s.assignee);
+            return Err(format!("{} is assigned to {}", s.label(), s.assignee));
         }
         if !s.is_open() {
-            return format!("{} is already {}", s.label(), s.state.as_str());
+            return Err(format!("{} is already {}", s.label(), s.state.as_str()));
         }
         s.state = SubState::AwaitingClearance;
         s.until = 0;
         s.result = String::from(result);
         events.push(format!("[event] {} submitted by {}, awaiting clearance", s.label(), from));
-        format!("submitted {} — awaiting the leader's clearance", s.label())
+        Ok(format!("submitted {} — awaiting the leader's clearance", s.label()))
     }
 
     /// The rejected branch of the future. Without its own act, a sub-task
@@ -415,36 +429,36 @@ impl TaskTable {
     /// It goes to the leader as a clearance decision rather than silently
     /// requeueing: whether to retry, re-assign or drop it is the leader's
     /// call, not the table's.
-    fn op_failed(&mut self, from: &str, id: &str, text: &str, events: &mut Vec<String>) -> String {
+    fn op_failed(&mut self, from: &str, id: &str, text: &str, events: &mut Vec<String>) -> Applied {
         let Some(pos) = self.sub_by_id(id) else {
-            return format!("refused: no sub-task {}", id);
+            return Err(format!("no sub-task {}", id));
         };
         let s = &mut self.subs[pos];
         if s.assignee != from {
-            return format!("refused: {} is assigned to {}", s.label(), s.assignee);
+            return Err(format!("{} is assigned to {}", s.label(), s.assignee));
         }
         if !s.is_open() {
-            return format!("{} is already {}", s.label(), s.state.as_str());
+            return Err(format!("{} is already {}", s.label(), s.state.as_str()));
         }
         let why = text.trim();
         s.state = SubState::AwaitingClearance;
         s.until = 0;
         s.result = format!("[FAILED] {}", if why.is_empty() { "no reason given" } else { why });
         events.push(format!("[event] {} reported FAILED by {}", s.label(), from));
-        format!("marked {} failed — the leader will decide what happens to it", s.label())
+        Ok(format!("marked {} failed — the leader will decide what happens to it", s.label()))
     }
 
-    fn op_clear(&mut self, from: &str, authority: Authority, id: &str, events: &mut Vec<String>) -> String {
+    fn op_clear(&mut self, from: &str, authority: Authority, id: &str, events: &mut Vec<String>) -> Applied {
         if !authority.is_leader() {
-            return String::from("refused: only the leader may clear a sub-task");
+            return Err(String::from("only the leader may clear a sub-task"));
         }
         let Some(pos) = self.sub_by_id(id) else {
-            return format!("refused: no sub-task {}", id);
+            return Err(format!("no sub-task {}", id));
         };
         let pid = self.subs[pos].parent;
         let s = &mut self.subs[pos];
         if !matches!(s.state, SubState::AwaitingClearance) {
-            return format!("refused: {} is {}, not awaiting clearance", s.label(), s.state.as_str());
+            return Err(format!("{} is {}, not awaiting clearance", s.label(), s.state.as_str()));
         }
         s.state = SubState::Cleared;
         let label = s.label();
@@ -452,23 +466,23 @@ impl TaskTable {
         if let Some(p) = self.parent_mut(pid) {
             p.nagged = 0; // the artifact directive should follow promptly
         }
-        format!("cleared {}", label)
+        Ok(format!("cleared {}", label))
     }
 
     /// The leader rejecting a submission: back to `Pending` for a fresh
     /// offer, with the reason carried into the sub-task body so the worker
     /// is told what was wrong rather than being handed the same brief.
-    fn op_reopen(&mut self, from: &str, authority: Authority, id: &str, text: &str, events: &mut Vec<String>) -> String {
+    fn op_reopen(&mut self, from: &str, authority: Authority, id: &str, text: &str, events: &mut Vec<String>) -> Applied {
         if !authority.is_leader() {
-            return String::from("refused: only the leader may reopen a sub-task");
+            return Err(String::from("only the leader may reopen a sub-task"));
         }
         let Some(pos) = self.sub_by_id(id) else {
-            return format!("refused: no sub-task {}", id);
+            return Err(format!("no sub-task {}", id));
         };
         let why = text.trim();
         let s = &mut self.subs[pos];
         if !matches!(s.state, SubState::AwaitingClearance) {
-            return format!("refused: {} is {}, not awaiting clearance", s.label(), s.state.as_str());
+            return Err(format!("{} is {}, not awaiting clearance", s.label(), s.state.as_str()));
         }
         s.state = SubState::Pending;
         s.until = 0;
@@ -478,7 +492,7 @@ impl TaskTable {
         }
         let label = s.label();
         events.push(format!("[event] {} reopened by {}", label, from));
-        format!("reopened {}", label)
+        Ok(format!("reopened {}", label))
     }
 
     fn op_artifact(
@@ -488,16 +502,16 @@ impl TaskTable {
         op: &TaskOp,
         out: &mut Vec<Outbound>,
         events: &mut Vec<String>,
-    ) -> String {
+    ) -> Applied {
         if !authority.is_leader() {
-            return String::from("refused: only the leader may close a task");
+            return Err(String::from("only the leader may close a task"));
         }
         let Some(pid) = parse_parent(&op.id) else {
-            return String::from("refused: 'task' must be a parent id like t1");
+            return Err(String::from("'task' must be a parent id like t1"));
         };
         let text = op.text.trim();
         if text.is_empty() {
-            return String::from("refused: an artifact needs the report text");
+            return Err(String::from("an artifact needs the report text"));
         }
         // Refuse to close over unfinished work: the artifact is a synthesis
         // of cleared results, and a leader declaring one early would strand
@@ -508,13 +522,13 @@ impl TaskTable {
             .filter(|s| s.parent == pid && !matches!(s.state, SubState::Cleared))
             .count();
         if outstanding > 0 {
-            return format!("refused: t{} still has {} uncleared sub-task(s)", pid, outstanding);
+            return Err(format!("t{} still has {} uncleared sub-task(s)", pid, outstanding));
         }
         let Some(p) = self.parent_mut(pid) else {
-            return format!("refused: no task t{}", pid);
+            return Err(format!("no task t{}", pid));
         };
         if p.closed {
-            return format!("t{} is already closed", pid);
+            return Err(format!("t{} is already closed", pid));
         }
         p.closed = true;
         p.artifact = String::from(text);
@@ -530,7 +544,7 @@ impl TaskTable {
         // The finished sub-tasks have served their purpose; the artifact and
         // the history carry what they found.
         self.subs.retain(|s| s.parent != pid);
-        format!("closed {} with the final artifact", label)
+        Ok(format!("closed {} with the final artifact", label))
     }
 
     fn sub_by_id(&self, id: &str) -> Option<usize> {
@@ -846,6 +860,15 @@ pub fn run_tests() -> i32 {
             plan: pairs.iter().map(|(a, b)| (String::from(*a), String::from(*b))).collect(),
         }
     }
+    // Assert against the typed outcome. A test that matched on the note's
+    // wording would pass for a refusal that happened to contain the right
+    // word — which is the class of bug this type exists to remove.
+    fn okc(a: &Applied, needle: &str) -> bool {
+        matches!(a, Ok(n) if n.contains(needle))
+    }
+    fn errc(a: &Applied, needle: &str) -> bool {
+        matches!(a, Err(w) if w.contains(needle))
+    }
     let mut check = |name: &str, cond: bool, passed: &mut usize| {
         if cond {
             *passed += 1;
@@ -885,7 +908,7 @@ pub fn run_tests() -> i32 {
 
         // artifact must be refused while kuro's half is outstanding
         let (_, _, early) = t.apply("mimi", Authority::Leader, &op(TaskAct::Artifact, "t1", "report"), 600, &r);
-        let refused_early = early.contains("uncleared") && !t.parents()[0].closed;
+        let refused_early = errc(&early, "uncleared") && !t.parents()[0].closed;
 
         t.apply("kuro", Authority::Peer, &op(TaskAct::Done, "t1.2", "one lock is unheld"), 700, &r);
         t.apply("mimi", Authority::Leader, &op(TaskAct::Clear, "t1.2", ""), 800, &r);
@@ -897,9 +920,9 @@ pub fn run_tests() -> i32 {
         // the artifact is broadcast, and must NOT wake the litter
         let broadcast_ok = out.len() == 1 && out[0].to == GROUP && out[0].kind == OutKind::Done;
 
-        let ok = n1.contains("t1") && n2.contains("2 sub-task") && planned && offers_ok
-            && n3.contains("claimed") && claimed && n4.contains("submitted") && submitted
-            && n5.contains("cleared") && cleared && refused_early && n6.contains("closed")
+        let ok = okc(&n1, "t1") && okc(&n2, "2 sub-task") && planned && offers_ok
+            && okc(&n3, "claimed") && claimed && okc(&n4, "submitted") && submitted
+            && okc(&n5, "cleared") && cleared && refused_early && okc(&n6, "closed")
             && closed && broadcast_ok;
         check("lifecycle open->plan->claim->done->clear->artifact", ok, &mut passed);
         if !ok {
@@ -915,20 +938,20 @@ pub fn run_tests() -> i32 {
         let mut t = TaskTable::new();
         let r = roster();
         let (_, _, open_peer) = t.apply("tama", Authority::Peer, &op(TaskAct::Open, "", "do my bidding"), 100, &r);
-        let no_open = open_peer.starts_with("refused") && t.parents().is_empty();
+        let no_open = open_peer.is_err() && t.parents().is_empty();
 
         t.apply("root", Authority::Root, &op(TaskAct::Open, "", "real task"), 100, &r);
         let (_, _, plan_peer) = t.apply("tama", Authority::Peer, &plan_op("t1", &[("kuro", "x")]), 100, &r);
-        let no_plan = plan_peer.starts_with("refused") && t.subs().is_empty();
+        let no_plan = plan_peer.is_err() && t.subs().is_empty();
 
         t.apply("mimi", Authority::Leader, &plan_op("t1", &[("tama", "x")]), 100, &r);
         t.apply("tama", Authority::Peer, &op(TaskAct::Done, "t1.1", "done"), 200, &r);
         let (_, _, clear_peer) = t.apply("kuro", Authority::Peer, &op(TaskAct::Clear, "t1.1", ""), 300, &r);
-        let no_clear = clear_peer.starts_with("refused") && t.subs()[0].state == SubState::AwaitingClearance;
+        let no_clear = clear_peer.is_err() && t.subs()[0].state == SubState::AwaitingClearance;
 
         t.apply("mimi", Authority::Leader, &op(TaskAct::Clear, "t1.1", ""), 300, &r);
         let (_, _, art_peer) = t.apply("tama", Authority::Peer, &op(TaskAct::Artifact, "t1", "mine"), 400, &r);
-        let no_artifact = art_peer.starts_with("refused") && !t.parents()[0].closed;
+        let no_artifact = art_peer.is_err() && !t.parents()[0].closed;
 
         check("peers may not open, plan, clear or close",
               no_open && no_plan && no_clear && no_artifact, &mut passed);
@@ -944,7 +967,7 @@ pub fn run_tests() -> i32 {
         let (_, _, thief_claim) = t.apply("kuro", Authority::Peer, &op(TaskAct::Claim, "t1.1", ""), 200, &r);
         let (_, _, thief_done) = t.apply("kuro", Authority::Peer, &op(TaskAct::Done, "t1.1", "I did it"), 200, &r);
         check("only the assignee may claim or submit",
-              thief_claim.starts_with("refused") && thief_done.starts_with("refused")
+              thief_claim.is_err() && thief_done.is_err()
                   && t.subs()[0].state == SubState::Pending,
               &mut passed);
     }
@@ -960,7 +983,7 @@ pub fn run_tests() -> i32 {
         t.apply("mimi", Authority::Leader, &plan_op("t1", &[("tama", "work")]), 100, &r);
         let (_, _, note) = t.apply("tama", Authority::Peer, &op(TaskAct::Done, "t1.1", "skipped the claim"), 200, &r);
         check("submit without claim is accepted",
-              !note.starts_with("refused") && t.subs()[0].state == SubState::AwaitingClearance,
+              note.is_ok() && t.subs()[0].state == SubState::AwaitingClearance,
               &mut passed);
     }
 
@@ -992,13 +1015,13 @@ pub fn run_tests() -> i32 {
         t.apply("root", Authority::Root, &op(TaskAct::Open, "", "task"), 100, &r);
         t.apply("mimi", Authority::Leader, &plan_op("t1", &[("tama", "a")]), 100, &r);
         let (_, _, second) = t.apply("mimi", Authority::Leader, &plan_op("t1", &[("kuro", "b")]), 100, &r);
-        let one_shot = second.contains("already planned") && t.subs().len() == 1;
+        let one_shot = errc(&second, "already planned") && t.subs().len() == 1;
         // an assignee nobody can deliver to is surfaced, not silently kept
         let mut t2 = TaskTable::new();
         t2.apply("root", Authority::Root, &op(TaskAct::Open, "", "task"), 100, &r);
         let (_, _, note) = t2.apply("mimi", Authority::Leader,
             &plan_op("t1", &[("tama", "a"), ("ghost", "b")]), 100, &r);
-        let ghost_skipped = t2.subs().len() == 1 && note.contains("ghost");
+        let ghost_skipped = t2.subs().len() == 1 && okc(&note, "ghost");
         check("plan is atomic, one-shot, and rejects absent assignees",
               one_shot && ghost_skipped, &mut passed);
     }
@@ -1096,6 +1119,6 @@ pub fn run_tests() -> i32 {
 }
 
 #[cfg(feature = "tests")]
-fn libackuma_note(a: &str, b: &str, c: &str, d: &str, e: &str, f: &str) {
-    libakuma::print(&format!("      notes: {} | {} | {} | {} | {} | {}\n", a, b, c, d, e, f));
+fn libackuma_note(a: &Applied, b: &Applied, c: &Applied, d: &Applied, e: &Applied, f: &Applied) {
+    libakuma::print(&format!("      notes: {:?} | {:?} | {:?} | {:?} | {:?} | {:?}\n", a, b, c, d, e, f));
 }

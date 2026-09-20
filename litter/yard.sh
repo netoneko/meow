@@ -75,10 +75,12 @@ talk)
 
 task)
     msg="${2:?usage: yard.sh task \"do this\"}"
-    # [task] is the wire-level task-table hook: the leader's raft thread
-    # opens a tracked task, leases it to the least-loaded agent, requeues
-    # it if the lease expires, and folds the [done] into the event log.
-    op litter send --to litter --body "[task] $msg" --from root
+    # A task is a RECORD, not a chat body (protocol v4). The hub opens a
+    # parent task, the owner loop directs the leader to plan it into one
+    # sub-task per agent, each assignee claims and reports, the leader
+    # clears each result and finally produces the artifact.
+    # See docs/LITTER_WORKFLOW.md.
+    op litter task --text "$msg" --from root
     ;;
 
 respawn)

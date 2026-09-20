@@ -277,13 +277,45 @@ impl HubState {
                     Authority::Peer
                 };
                 let roster = self.members.roster().to_vec();
-                let (outbound, events, note) =
+                let (outbound, events, outcome) =
                     self.record.tasks.apply(&from, authority, &op, now, &roster);
                 for e in events {
                     self.record.event(e);
                 }
+
+                // Replicate the record itself, not just what it caused.
+                //
+                // A public tool call IS the unit that travels: every agent
+                // sees "kuro reported t1.2 done" in its own history, the
+                // same way it sees chat, so the litter's picture of who is
+                // doing what is maintained by the protocol instead of by
+                // agents remembering to narrate themselves. The derived
+                // traffic (offers, leader directives) is a separate,
+                // *targeted* thing — this is the broadcast copy.
+                //
+                // Only ACCEPTED records: a refusal never changed any state,
+                // so replicating it would put a transition in everyone's
+                // history that did not happen.
+                if outcome.is_ok() {
+                    let line = record_line(&from, &op);
+                    let ts = self.members.stamp(now);
+                    let msg = Message {
+                        // Done, not Assignment: every agent should *see*
+                        // every record, but a record is not an instruction
+                        // to anyone. Waking the whole litter on each one
+                        // turns a four-agent task into sixteen LLM turns.
+                        kind: litter_wire::MessageKind::Done,
+                        role: litter_wire::SenderRole::Leader,
+                        ..Message::chat(String::from(GROUP_NAME), 0, line, ts)
+                    };
+                    self.members.broadcast(&msg);
+                }
+
                 self.dispatch(outbound, now);
-                Response::Task { note }
+                match outcome {
+                    Ok(note) => Response::Task { applied: true, note },
+                    Err(why) => Response::Task { applied: false, note: why },
+                }
             }
             Request::Peers { since } => Response::Peers {
                 names: self.members.roster().to_vec(),
@@ -370,6 +402,34 @@ impl HubState {
         };
         let response = self.handle(req);
         write_frame(stream, &encode_response(&response))
+    }
+}
+
+/// One replicated task record, as every agent reads it. Deliberately a
+/// short line rather than the raw JSON: it lands in an LLM's context, and
+/// the point is that the litter can follow along, not that it can re-parse
+/// the wire.
+fn record_line(from: &str, op: &litter_wire::TaskOp) -> String {
+    let what = if op.plan.is_empty() {
+        op.text.clone()
+    } else {
+        let mut s = String::new();
+        for (who, brief) in &op.plan {
+            if !s.is_empty() {
+                s.push_str("; ");
+            }
+            s.push_str(who);
+            s.push_str(" -> ");
+            s.push_str(brief);
+        }
+        s
+    };
+    if op.id.is_empty() {
+        format!("[record] {} {}: {}", from, op.act.as_str(), what)
+    } else if what.is_empty() {
+        format!("[record] {} {} {}", from, op.act.as_str(), op.id)
+    } else {
+        format!("[record] {} {} {}: {}", from, op.act.as_str(), op.id, what)
     }
 }
 
@@ -641,11 +701,11 @@ pub fn run_tests() -> i32 {
         hub.handle(task("tiger", litter_wire::TaskAct::Claim, "t1.1", ""));
         hub.handle(task("tiger", litter_wire::TaskAct::Done, "t1.1", "all clear"));
         let peer_clear = hub.handle(task("tiger", litter_wire::TaskAct::Clear, "t1.1", ""));
-        let peer_refused = matches!(&peer_clear, Response::Task { note } if note.starts_with("refused"));
+        let peer_refused = matches!(&peer_clear, Response::Task { applied: false, .. });
 
         hub.handle(task("sherlock", litter_wire::TaskAct::Clear, "t1.1", ""));
         let closed = hub.handle(task("sherlock", litter_wire::TaskAct::Artifact, "t1", "FINAL: fine"));
-        let closed_ok = matches!(&closed, Response::Task { note } if note.contains("closed"));
+        let closed_ok = matches!(&closed, Response::Task { applied: true, note } if note.contains("closed"));
 
         let peers = hub.handle(Request::Peers { since: 0 });
         let events_ok = matches!(&peers, Response::Peers { events, .. }

@@ -510,10 +510,13 @@ pub enum Response {
     /// the caller's `since` cursor — elections, joins, leaves, task
     /// requeues. Consumed at tick level, surfaced to the model as context.
     Peers { names: Vec<String>, term: u64, leader: Option<String>, epoch: u64, events: Vec<String> },
-    /// A task record was applied. `note` is what the state machine did —
-    /// surfaced straight back to the model, because "refused: not the
-    /// assignee" is the only way it learns it guessed wrong.
-    Task { note: String },
+    /// The outcome of a task record. `applied` is the state machine's own
+    /// verdict, carried as a field rather than left to be inferred from
+    /// `note`'s wording — the caller must not have to parse prose to find
+    /// out whether state changed. `note` is what happened, surfaced
+    /// straight back to the model, because "t1.1 is assigned to kuro" is
+    /// the only way it learns it guessed wrong.
+    Task { applied: bool, note: String },
     Error { message: String },
 }
 
@@ -552,10 +555,11 @@ impl DisplayJson for Response {
                 f.member("epoch", *epoch)?;
                 f.member("events", events)
             }),
-            Response::Task { note } => f.object(|f| {
+            Response::Task { applied, note } => f.object(|f| {
                 f.member("v", PROTOCOL_VERSION)?;
                 f.member("ok", true)?;
                 f.member("op", "task")?;
+                f.member("applied", *applied)?;
                 f.member("note", note)
             }),
             Response::Error { message } => f.object(|f| {
@@ -681,8 +685,9 @@ pub fn decode_response(json: &str) -> Result<Response, WireError> {
     match op.as_str() {
         "joined" => Ok(Response::Joined),
         "task" => {
+            let applied: Option<bool> = value.to_member("applied")?.try_into()?;
             let note: Option<String> = value.to_member("note")?.try_into()?;
-            Ok(Response::Task { note: note.unwrap_or_default() })
+            Ok(Response::Task { applied: applied.unwrap_or(false), note: note.unwrap_or_default() })
         }
         "sent" => {
             let bytes: usize = value.to_member("bytes")?.required()?.try_into()?;

@@ -114,14 +114,15 @@ pub extern "C" fn main() {
                         i = 3; // resume normal flag parsing after "litter live"
                     }
                     Some("send") => exit(run_litter_send()),
+                    Some("task") => exit(run_litter_task()),
                     Some("observe") => exit(run_litter_observe()),
                     Some(other) => {
                         libakuma::print(&format!("meow: unknown 'meow litter' subcommand '{}'\n", other));
-                        libakuma::print("Usage: meow litter {peers|inbox|send|chase|live|observe} [args]\n");
+                        libakuma::print("Usage: meow litter {peers|inbox|send|task|chase|live|observe} [args]\n");
                         exit(1);
                     }
                     None => {
-                        libakuma::print("Usage: meow litter {peers|inbox|send|chase|live|observe} [args]\n");
+                        libakuma::print("Usage: meow litter {peers|inbox|send|task|chase|live|observe} [args]\n");
                         exit(1);
                     }
                 }
@@ -673,6 +674,41 @@ fn run_litter_send() -> i32 {
 
     tools::litter::set_agent_name(from);
     run_litter_inspect(tools::litter::tool_send_message(&to, &body, round))
+}
+
+/// `meow litter task`: submit one task record as the operator.
+///
+/// The operator's route into the workflow. It exists because opening a
+/// parent task is a *record*, not chat — `litter send --body "[task] …"`
+/// used to work and deliberately no longer does, since task traffic that
+/// travels as prose is task traffic anyone can forge by typing.
+///
+/// `--from` defaults to `root`, which is the identity the hub grants
+/// operator authority to. That is a string today, and should become a
+/// signature (`docs/LITTER_WORKFLOW.md` § Future work): right now anyone
+/// who can reach the socket can pass `--from root`.
+fn run_litter_task() -> i32 {
+    let mut status = String::from("open");
+    let mut task = String::new();
+    let mut text = String::new();
+    let mut from = String::from("root");
+    let mut j = 3;
+    while j < argc() {
+        match arg(j) {
+            Some("--status") => { j += 1; if let Some(v) = arg(j) { status = String::from(v); } }
+            Some("--task") => { j += 1; if let Some(v) = arg(j) { task = String::from(v); } }
+            Some("--text") => { j += 1; if let Some(v) = arg(j) { text = String::from(v); } }
+            Some("--from") => { j += 1; if let Some(v) = arg(j) { from = String::from(v); } }
+            _ => {}
+        }
+        j += 1;
+    }
+    if text.is_empty() && status == "open" {
+        libakuma::print("Usage: meow litter task --text \"<what to do>\" [--status open|clear|reopen|artifact] [--task tN] [--from <name>]\n");
+        return 1;
+    }
+    tools::litter::set_agent_name(from);
+    run_litter_inspect(tools::litter::tool_task_update(&task, &status, &text))
 }
 
 /// `meow litter observe`: print every participant's messages merged into one

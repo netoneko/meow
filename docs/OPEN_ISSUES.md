@@ -129,3 +129,33 @@ previous command instead of the conversation scrolling.
   alternative fix would need to change.
 - `userspace/meow/src/ui/tui/input.rs`, `app/state.rs` — cursor/history index
   tracking (Issue 1's `.chars().count()` sites, Issue 2's `history_index`).
+
+## `meow test` never exits, and spins at 100% CPU
+
+Found 2026-09-20 while running the suite in a container. `meow test`
+prints every suite's result, reports `=== N test suite(s) failed ===`,
+and then **does not exit** — it burns a full core indefinitely.
+
+Under `docker run --rm` this is worse than it sounds: killing the docker
+CLI (a `timeout`, a ^C) does not stop the container, so every abandoned
+test run leaves a container pinning a core. Six of them had accumulated
+before anyone noticed; the symptom presented as "Docker is at 800%" with
+the litter container itself idle at 0.3%.
+
+Triage that localizes it quickly, since the process is unkillable-looking
+rather than crashed:
+
+```bash
+docker stats --no-stream --format '{{.Name}} {{.CPUPerc}}'   # which container
+docker exec <id> sh -c 'for t in /proc/1/task/*; do \
+  echo "${t##*/} $(cut -d" " -f3 $t/stat) $(cut -d" " -f1 $t/syscall)"; done'
+```
+
+`R` with no syscall is a spin; the aarch64 numbers worth knowing are
+101 `nanosleep`, 98 `futex`, 207 `recvfrom`, 203 `connect`.
+
+Not yet root-caused. The suite completes, so this is after the last
+`run_tests` returns — `main`'s exit path for the `test` subcommand, or a
+detached `rt.rs` test thread that never stops (the rt suite spawns one).
+Anything that runs `meow test` unattended should pass `--rm` **and** an
+outer `docker kill`, not just a CLI-side timeout.

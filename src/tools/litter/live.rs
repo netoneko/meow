@@ -327,17 +327,20 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
     // trip to `addr`, and when we just won the bind that is a self-call only
     // a live raft thread or our own loop can answer. Reading locally costs
     // nothing and cannot stall (see the loop's `local_inbox_count` note).
-    let mut seen = match &machine {
+    // A timestamp cursor, not a count: the turn is built from the messages
+    // themselves now, so what matters is *which* are new, and the hub
+    // guarantees strictly increasing stamps (`Membership::stamp`).
+    let mut cursor: u64 = match &machine {
         // Solo leaders read their own state; everyone else — including a
         // leader with a live owner thread — asks over the socket.
         Machine::Leader { solo: true, .. } => match owner_ctx() {
             // SAFETY: solo ⇒ no owner thread ⇒ we are the single owner.
-            Some(ctx) => local_inbox_count(unsafe { ctx.state() }, &me),
+            Some(ctx) => high_water(&local_feed(unsafe { ctx.state() }, &me, 0), 0),
             None => 0,
         },
-        _ => inbox_count(&addr, &me),
+        _ => high_water(&remote_feed(&addr, &me, 0), 0),
     };
-    libakuma::safe_print!(128, "[live] {} awake; {} message(s) already in history\n", me, seen);
+    libakuma::safe_print!(128, "[live] {} awake; history cursor at {}\n", me, cursor);
 
     let mut tick: u64 = 0;
     let mut latest_term: u64 = 0; // highest term any pulse reported
@@ -377,12 +380,18 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                     if let Some(ctx) = owner_ctx() {
                         let st = unsafe { ctx.state() };
                         serve::drain(listener, st);
-                        let count = local_inbox_count(st, &me);
-                        if count > seen {
-                            run_turn(&me, &model, &provider, &system_prompt);
+                        let feed = local_feed(st, &me, cursor);
+                        if feed.iter().any(wakeable) {
+                            cursor = high_water(&feed, cursor);
+                            run_turn(&me, &model, &provider, &system_prompt, &feed);
                             let st = unsafe { ctx.state() };
                             serve::drain(listener, st);
-                            seen = local_inbox_count(st, &me);
+                            cursor = high_water(&local_feed(st, &me, cursor), cursor);
+                        } else {
+                            // Nothing worth waking for, but it has still
+                            // been read: leaving non-wakeable traffic under
+                            // the cursor would re-feed it every tick.
+                            cursor = high_water(&feed, cursor);
                         }
                     }
                 } else {
@@ -391,10 +400,11 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                     // identical to a follower. This is what single ownership
                     // buys: the agent loop holds nothing, locks nothing, and
                     // cannot starve the hub by thinking for four minutes.
-                    let count = inbox_count(&addr, &me);
-                    if count > seen {
-                        run_turn(&me, &model, &provider, &system_prompt);
-                        seen = inbox_count(&addr, &me);
+                    let feed = remote_feed(&addr, &me, cursor);
+                    cursor = high_water(&feed, cursor);
+                    if feed.iter().any(wakeable) {
+                        run_turn(&me, &model, &provider, &system_prompt, &feed);
+                        cursor = high_water(&remote_feed(&addr, &me, cursor), cursor);
                     }
                 }
             }
@@ -421,10 +431,11 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                         continue;
                     }
                 }
-                let count = inbox_count(&addr, &me);
-                if count > seen {
-                    run_turn(&me, &model, &provider, &system_prompt);
-                    seen = inbox_count(&addr, &me);
+                let feed = remote_feed(&addr, &me, cursor);
+                cursor = high_water(&feed, cursor);
+                if feed.iter().any(wakeable) {
+                    run_turn(&me, &model, &provider, &system_prompt, &feed);
+                    cursor = high_water(&remote_feed(&addr, &me, cursor), cursor);
                 }
             }
             Machine::Wayward { epoch, roster, term } => {
@@ -1037,24 +1048,29 @@ fn load_history(addr: &str, me: &str, system_prompt: &str) {
     let _ = system_prompt;
 }
 
-/// Count wakeable messages in our own inbox from the hub state we already
-/// hold. The leader's version of `inbox_count`, with no socket in it — see
-/// the note in the `Machine::Leader` arm for why that distinction is
-/// load-bearing rather than an optimization.
-fn local_inbox_count(st: &mut HubState, me: &str) -> usize {
+/// Everything in our own inbox newer than `cursor`, read from the state we
+/// already hold. The solo leader's version — see the `Machine::Leader`
+/// arm for why that distinction is load-bearing rather than an
+/// optimization.
+fn local_feed(st: &mut HubState, me: &str, cursor: u64) -> Vec<Message> {
     match st.handle(Request::Inbox { name: alloc::string::String::from(me) }) {
-        Response::Inbox { messages } => messages.iter().filter(|m| wakeable(m)).count(),
-        _ => 0,
+        Response::Inbox { messages } => messages.into_iter().filter(|m| m.ts > cursor).collect(),
+        _ => Vec::new(),
     }
 }
 
-/// Count wakeable messages by asking the hub over the network. For
-/// FOLLOWERs and WAYWARD agents, where the hub really is another process.
-fn inbox_count(addr: &str, me: &str) -> usize {
+/// The same, over the network. For FOLLOWERs, WAYWARD agents, and — since
+/// the owner thread took sole ownership of the hub state — the LEADER too.
+fn remote_feed(addr: &str, me: &str, cursor: u64) -> Vec<Message> {
     match hub::inbox_messages(addr, me) {
-        Ok(messages) => messages.iter().filter(|m| wakeable(m)).count(),
-        Err(_) => 0, // unreachable hub (or WAYWARD) — count simply stalls
+        Ok(messages) => messages.into_iter().filter(|m| m.ts > cursor).collect(),
+        Err(_) => Vec::new(), // unreachable hub (or WAYWARD) — the cursor stalls
     }
+}
+
+/// The newest timestamp in a batch, for advancing the cursor.
+fn high_water(messages: &[Message], cursor: u64) -> u64 {
+    messages.iter().map(|m| m.ts).fold(cursor, |a, b| if b > a { b } else { a })
 }
 
 /// What wakes an agent: real conversation and task assignments. Compaction
@@ -1064,16 +1080,20 @@ fn wakeable(m: &Message) -> bool {
     !matches!(m.kind, MessageKind::Marker | MessageKind::Done)
 }
 
-/// One chat-with-tools turn — the same shape as `litter chase` (fresh
-/// conversation, persona system prompt, full tool loop), but the user
-/// message is the wake-up instruction plus fresh cluster context.
-fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str) {
-    // A wake-up turn runs on the main thread — the hub's only serving thread
-    // while the raft thread is not running — so the turn must be SHORT. A
-    // reasoning model spends its budget in `reasoning_content` that produces
-    // no visible reply; uncapped it measured 17 minutes (2026-09-20) while
-    // the main thread sat in this request. 2048 is ample for the
-    // catch-up + reply + a few tool iterations, each its own request.
+/// One chat-with-tools turn. The agent's inbox is **delivered into the
+/// prompt**, not fetched by the model: there is no `ReadInbox` tool any
+/// more, and receiving is not something a model has to remember to do.
+///
+/// The other half of that bargain is that *finishing* stays explicit. A
+/// turn ending is not a task ending — the agent has to say so with
+/// `TaskUpdate`. That asymmetry is what lets an agent absorb a pile of
+/// events in one pass instead of round-tripping a whole turn per message
+/// (`docs/LITTER_WORKFLOW.md` § "Auto-feed, explicit completion").
+fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str, feed: &[Message]) {
+    // A wake-up turn must be SHORT. A reasoning model spends its budget in
+    // `reasoning_content` that produces no visible reply; uncapped it
+    // measured 17 minutes (2026-09-20). 2048 is ample for the catch-up plus
+    // a reply plus a few tool iterations, each its own request.
     api_client::set_max_tokens(2048);
 
     let session_id = session::generate_session_id();
@@ -1082,17 +1102,32 @@ fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str) {
     conversation.append(&ChatMessage::new("user", "[System Context] Current working directory: /\nNo sandbox restrictions."));
     conversation.append(&ChatMessage::new("assistant", "Understood."));
 
-    libakuma::safe_print!(128, "\n[live] {} wakes on new inbox activity\n", me);
-    let wake = format!(
-        "You are '{}' in a litter of agents. Your inbox has message(s) you haven't seen. \
-         Use ListPeers to see who's here (the response also carries recent cluster events), \
-         ReadInbox to catch up, then do whatever the newest messages ask of you and reply \
-         with SendMessage — to a specific peer, or to 'litter' to reach everyone. \
-         Start a message body with `[task] …` to open a tracked task, and answer an \
-         assignment with `[done: tN] …` when finished. If there is genuinely nothing \
-         worth responding to, just finish without sending anything.",
-        me
+    libakuma::safe_print!(128, "\n[live] {} wakes on {} new message(s)\n", me, feed.len());
+
+    let mut wake = alloc::format!("You are '{}' in a litter of agents.\n\nNew since you last acted:\n", me);
+    for m in feed {
+        // Cap each one: a single 32KB message must not crowd out the rest
+        // of the feed, and the whole feed shares one 2048-token budget.
+        let body = if m.body.len() > 1500 {
+            let mut cut = 1500;
+            while cut > 0 && !m.body.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            alloc::format!("{}…", &m.body[..cut])
+        } else {
+            m.body.clone()
+        };
+        wake.push_str(&alloc::format!("\n[{}] {}\n", m.from, body));
+    }
+    wake.push_str(
+        "\nDo whatever these ask of you. To say something, use SendMessage — to one peer by \
+         name, or to 'litter' for everyone. If one of them assigned you a sub-task, use \
+         TaskUpdate exactly as that message instructs: claim it, and report your result with \
+         status=\"done\" (or status=\"failed\" if you cannot). A sub-task stays open until you \
+         say otherwise, so do not leave one unanswered. If there is genuinely nothing worth \
+         doing, finish without sending anything.",
     );
+
     if let Err(e) = chat_once(model, provider, &wake, &mut conversation, None, system_prompt) {
         libakuma::safe_print!(256, "[live] {}'s turn failed: {}\n", me, e);
     }
@@ -1548,15 +1583,18 @@ pub mod sim {
                 ("island", Litter::seed("island", "10.0.0.2:7700", &["bob"], "yard@10.0.0.1:7700")),
             ];
             let i_yard = sw.iter().position(|(n, _)| *n == "yard").unwrap();
-            // Baseline the receiving agent's own loop would have captured at
-            // its own startup, before anything arrived (`live::run`'s `seen`).
-            let seen = super::local_inbox_count(&mut sw[i_yard].1.hub, "al");
+            // Baseline cursor the receiving agent's own loop would have
+            // captured at startup, before anything arrived (`live::run`).
+            let cursor = super::high_water(&super::local_feed(&mut sw[i_yard].1.hub, "al", 0), 0);
 
             say(&mut sw, "island", "bob", "al", "direct hello", 3);
             let crossed = relay_tick(&mut sw, "island");
 
-            let count = super::local_inbox_count(&mut sw[i_yard].1.hub, "al");
-            let woke = count > seen;
+            // The relayed message is past the cursor AND wakeable, which is
+            // what the agent loop requires to run a turn at all.
+            let feed = super::local_feed(&mut sw[i_yard].1.hub, "al", cursor);
+            let seen = cursor;
+            let woke = feed.iter().any(super::wakeable);
             let landed_wakeably = matches!(
                 sw[i_yard].1.hub.handle(Request::Inbox { name: String::from("al") }),
                 Response::Inbox { messages }
@@ -1566,8 +1604,8 @@ pub mod sim {
             if ok { passed += 1; }
             else {
                 libakuma::print(&format!(
-                    "  [!] direct wake: crossed={} seen={} count={} woke={} landed_wakeably={}\n",
-                    crossed, seen, count, woke, landed_wakeably
+                    "  [!] direct wake: crossed={} cursor={} new={} woke={} landed_wakeably={}\n",
+                    crossed, seen, feed.len(), woke, landed_wakeably
                 ));
             }
         }

@@ -270,13 +270,8 @@ pub fn tool_send_message(addr: &str, from: &str, to: &str, body: &str, round: i6
 pub fn tool_task(addr: &str, from: &str, op: litter_wire::TaskOp) -> ToolResult {
     let req = Request::Task { from: String::from(from), op };
     match call(addr, &req) {
-        Ok(Response::Task { note }) => {
-            if note.starts_with("refused") {
-                ToolResult::err(note)
-            } else {
-                ToolResult::ok(note)
-            }
-        }
+        Ok(Response::Task { applied: true, note }) => ToolResult::ok(note),
+        Ok(Response::Task { applied: false, note }) => ToolResult::err(note),
         Ok(Response::Error { message }) => ToolResult::err(message),
         Ok(other) => ToolResult::err(format!("hub returned an unexpected response to 'task': {:?}", other)),
         Err(e) => ToolResult::err(e),
