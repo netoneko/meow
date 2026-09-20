@@ -27,6 +27,31 @@ static HUB_ADDR_INIT: AtomicBool = AtomicBool::new(false);
 // same pattern as `tools::litter::AGENT_NAME`.
 static mut HUB_ADDR: Option<String> = None;
 
+/// A leader's self-rescue for `ConnectionRefused`: on Akuma the listening
+/// socket backs onto ONE smoltcp socket, so a backlog of unaccepted
+/// connections turns later connects into refusals — which is exactly what a
+/// live agent's tool calls hit mid-turn, when its own serving thread (the
+/// main thread, raft thread not running) is busy in the LLM stream and cannot
+/// drain. The live module registers a hook that drains its own listener;
+/// `call_addr` invokes it on refusal and retries once.
+static DRAIN_HOOK: AtomicU64 = AtomicU64::new(0);
+
+/// Register [`DRAIN_HOOK`]. `f` must be safe to call from any task in this
+/// process and must not block indefinitely.
+pub fn set_drain_hook(f: fn()) {
+    DRAIN_HOOK.store(f as *const () as u64, Ordering::Release);
+}
+
+fn drain_and_retry() -> bool {
+    let f = DRAIN_HOOK.load(Ordering::Acquire);
+    if f == 0 {
+        return false;
+    }
+    let f = unsafe { core::mem::transmute::<u64, fn()>(f) };
+    f();
+    true
+}
+
 /// Liveness bookkeeping for the WAYWARD state (`docs/LITTER_STATE_MACHINE.md`):
 /// every successful hub round trip refreshes `LAST_ALIVE_US`; the agent loop
 /// records a probe failure by *not* refreshing it. When `now - LAST_ALIVE`
@@ -109,7 +134,16 @@ pub fn call_addr(addr: &str, req: &Request) -> Result<Response, String> {
 /// [`PROBE_TIMEOUT_US`] instead, and a hub that cannot answer a `Peers` frame in
 /// half a second is, for the purpose of that question, not alive.
 pub fn call_addr_timeout(addr: &str, req: &Request, timeout_us: u64) -> Result<Response, String> {
-    let stream = TcpStream::connect(addr).map_err(|e| format!("hub connect to '{}' failed: {:?}", addr, e.kind()))?;
+    let stream = match TcpStream::connect(addr) {
+        Ok(s) => s,
+        // Refused with a drain hook registered (i.e. we are a live agent whose
+        // hub is our own listener): the backlog is full of connections nobody
+        // could accept mid-turn. Drain, then try once more.
+        Err(e) if e.kind() == libakuma::net::ErrorKind::ConnectionRefused && drain_and_retry() => {
+            TcpStream::connect(addr).map_err(|_| format!("hub connect to '{}' failed: {:?}", addr, libakuma::net::ErrorKind::ConnectionRefused))?
+        }
+        Err(e) => return Err(format!("hub connect to '{}' failed: {:?}", addr, e.kind())),
+    };
     let _ = libakuma::set_nonblocking(stream.as_raw_fd(), true);
 
     let payload = encode_request(req);

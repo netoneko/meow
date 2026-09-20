@@ -28,6 +28,32 @@ fn debug_print(msg: &str) {
 const MAX_RETRIES: u32 = 10;
 const DEFAULT_MAX_TOKENS: usize = 16384;
 
+/// Caller-settable cap on one response's token budget. 0 = use
+/// [`DEFAULT_MAX_TOKENS`]. Exists for the **live agent**: a reasoning model
+/// burns its budget in `reasoning_content` meow does not render, so an
+/// uncapped wake-up turn measured 17 minutes of wall clock (2026-09-20) while
+/// the main thread — the hub's only serving thread — sat in this request.
+static MAX_TOKENS_OVERRIDE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Set the token budget for subsequent requests (0 restores the default).
+pub fn set_max_tokens(n: usize) {
+    MAX_TOKENS_OVERRIDE.store(n, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn effective_max_tokens() -> usize {
+    match MAX_TOKENS_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => DEFAULT_MAX_TOKENS,
+        n => n,
+    }
+}
+
+/// How long a streaming response may deliver NO data before it is abandoned.
+/// A healthy backend emits SSE chunks continuously; silence past this point
+/// is a stuck server, not a slow model. Two minutes: far above any honest
+/// time-to-first-byte, far below the 17-minute wedge that motivated it.
+const STREAM_STALL_TIMEOUT_US: u64 = 120 * 1_000_000;
+
 /// Hard ceiling on one streamed response, in bytes.
 ///
 /// The reader had **no** bound of its own on a chatty server. `read_attempts`
@@ -491,7 +517,7 @@ fn write_chat_body_inner(
     }
 
     scratch.clear();
-    let _ = write!(scratch, "],\"stream\":true,\"max_tokens\":{},\"tools\":", DEFAULT_MAX_TOKENS);
+    let _ = write!(scratch, "],\"stream\":true,\"max_tokens\":{},\"tools\":", effective_max_tokens());
     if !fd_write_str(fd, &scratch, total) {
         return false;
     }
@@ -559,6 +585,12 @@ fn read_streaming_with_http_stream_tls(
     let mut stream_start_us = 0;
     let mut pending_tool_calls: Vec<ToolCallData> = Vec::new();
     let mut guard = RunawayGuard::new();
+    // Last time a chunk arrived. `WouldBlock` only means "no data yet", so a
+    // wedged backend presents identically to a slow one until a deadline
+    // exists — and this loop is the live agent's ONLY serving thread, so an
+    // unbounded wait here also deafens the litter hub (measured 2026-09-20:
+    // 17 minutes at 0 bytes, every tool call refused behind a full backlog).
+    let mut last_progress_us = now_us();
 
     loop {
         tui_app::tui_handle_input(current_tokens, token_limit, mem_kb);
@@ -568,6 +600,7 @@ fn read_streaming_with_http_stream_tls(
         if tui_app::tui_is_cancelled() { return Err("Request cancelled"); }
         match stream.read_chunk() {
             StreamResult::Data(data) => {
+                last_progress_us = now_us();
                 if let Ok(s) = core::str::from_utf8(&data) { pending_lines.push_str(s); }
                 while let Some(newline_pos) = pending_lines.find('\n') {
                     let line = &pending_lines[..newline_pos];
@@ -619,6 +652,9 @@ fn read_streaming_with_http_stream_tls(
                 }
             }
             StreamResult::WouldBlock => {
+                if now_us().saturating_sub(last_progress_us) > STREAM_STALL_TIMEOUT_US {
+                    return Err("stream stalled: no data from provider");
+                }
                 if tui_app::TUI_ACTIVE.load(Ordering::SeqCst) {
                     crate::ui::tui::render::render_footer(current_tokens, token_limit, mem_kb);
                 }

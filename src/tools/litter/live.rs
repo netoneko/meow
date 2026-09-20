@@ -29,6 +29,7 @@ use libakuma::net::TcpListener;
 
 use litter_wire::{Message, MessageKind, Request, Response};
 
+use crate::api::client as api_client;
 use crate::app::session;
 use crate::app::{chat_once, Conversation, Message as ChatMessage};
 use crate::config::Provider;
@@ -316,7 +317,14 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
     };
 
     // Baseline: history predates us — wake only on what arrives from now.
-    let mut seen = inbox_count(&addr, &me);
+    // The LEADER reads its own state directly: `inbox_count` is a TCP round
+    // trip to `addr`, and when we just won the bind that is a self-call only
+    // a live raft thread or our own loop can answer. Reading locally costs
+    // nothing and cannot stall (see the loop's `local_inbox_count` note).
+    let mut seen = match &machine {
+        Machine::Leader { state, .. } => local_inbox_count(&mut state.lock(), &me),
+        _ => inbox_count(&addr, &me),
+    };
     libakuma::safe_print!(128, "[live] {} awake; {} message(s) already in history\n", me, seen);
 
     let mut tick: u64 = 0;
@@ -330,11 +338,12 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
         // syscall, so a child that is alive but cannot do I/O still shows up.
         if tick % 10 == 0 {
             raft_logf!(
-                96,
-                "agent tick {} sees RAFT_TICKS={} alive={}",
+                128,
+                "agent tick {} sees RAFT_TICKS={} alive={} stage={}",
                 tick,
                 RAFT_TICKS.load(core::sync::atomic::Ordering::Acquire),
-                RAFT_ALIVE.load(core::sync::atomic::Ordering::Acquire)
+                RAFT_ALIVE.load(core::sync::atomic::Ordering::Acquire),
+                RAFT_STAGE.load(core::sync::atomic::Ordering::Acquire)
             );
         }
 
@@ -479,6 +488,33 @@ static RAFT_ALIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// one of the things under suspicion.
 static RAFT_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// How far the child got before stopping. Written by the child after each
+/// step, read by the main thread's tick log. Stages:
+/// 1 = entered `raft_entry`, 2 = survived the first log write,
+/// 3 = `RAFT_CTX` loaded and non-null, 4 = entered `raft_tick_loop`.
+/// A stage that stops advancing localizes the death to one step — the whole
+/// point of the §6 plan in docs/archive/AMD64_SPAWNED_THREAD_NEVER_RUNS.md.
+static RAFT_STAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn stage(n: u64) {
+    RAFT_STAGE.store(n, core::sync::atomic::Ordering::Release);
+}
+
+/// The hub module's `ConnectionRefused` self-rescue (see `DRAIN_HOOK` there):
+/// drain our own listener once. Reads the same leaked [`RAFT_CTX`] the raft
+/// thread uses; safe as long as this process holds the bind — which is the
+/// only situation in which `start_raft_thread` runs and registers the hook.
+fn local_drain() {
+    let ptr = RAFT_CTX.load(core::sync::atomic::Ordering::Acquire) as *const RaftCtx;
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: leaked by start_raft_thread, process-outlived (same contract as
+    // raft_entry's use).
+    let ctx = unsafe { &*ptr };
+    serve::drain(&ctx.listener, &mut ctx.state.lock());
+}
+
 /// How long the parent waits for the child to announce itself. Generous: this
 /// runs once, at startup, and a false "it did not start" would be worse than
 /// the wait.
@@ -486,15 +522,19 @@ const RAFT_START_TIMEOUT_MS: u64 = 2000;
 
 fn raft_entry() {
     RAFT_ALIVE.store(true, core::sync::atomic::Ordering::Release);
+    stage(1);
     raft_logf!(64, "raft_entry running");
+    stage(2);
     let ptr = RAFT_CTX.load(core::sync::atomic::Ordering::Acquire) as *const RaftCtx;
     if ptr.is_null() {
         raft_logf!(64, "raft_entry: RAFT_CTX is NULL, thread exits");
         return;
     }
+    stage(3);
     // SAFETY: the ctx was leaked by start_raft_thread before the child was
     // spawned; the child is its only reader and the process outlives it.
     let ctx = unsafe { &*ptr };
+    stage(4);
     raft_tick_loop(ctx.listener.clone(), ctx.state.clone(), &ctx.peers);
 }
 
@@ -509,6 +549,13 @@ fn start_raft_thread(listener: &Arc<TcpListener>, state: &Arc<PMutex<HubState>>,
         peers: PMutex::new(static_peers),
     }));
     RAFT_CTX.store(ctx as *const RaftCtx as u64, core::sync::atomic::Ordering::Release);
+    // From here on this process holds a listener it serves only from its own
+    // loop and (in principle) the raft thread. Every hub client call from
+    // this process now serves as it waits (tools inside an LLM turn would
+    // otherwise deadlock until their deadline), and refused connects drain
+    // and retry once.
+    serve::deadline::set_io_poll_hook(local_drain);
+    hub::set_drain_hook(local_drain);
     let spawned = unsafe { crate::rt::spawn_detached(raft_entry) };
     // Wait for the child to say it is running, rather than trusting the clone's
     // return value.
@@ -854,6 +901,14 @@ fn wakeable(m: &Message) -> bool {
 /// conversation, persona system prompt, full tool loop), but the user
 /// message is the wake-up instruction plus fresh cluster context.
 fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str) {
+    // A wake-up turn runs on the main thread — the hub's only serving thread
+    // while the raft thread is not running — so the turn must be SHORT. A
+    // reasoning model spends its budget in `reasoning_content` that produces
+    // no visible reply; uncapped it measured 17 minutes (2026-09-20) while
+    // the main thread sat in this request. 2048 is ample for the
+    // catch-up + reply + a few tool iterations, each its own request.
+    api_client::set_max_tokens(2048);
+
     let session_id = session::generate_session_id();
     let mut conversation = Conversation::new_session(session_id);
     conversation.append(&ChatMessage::new("system", system_prompt));
@@ -874,6 +929,10 @@ fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str) {
     if let Err(e) = chat_once(model, provider, &wake, &mut conversation, None, system_prompt) {
         libakuma::safe_print!(256, "[live] {}'s turn failed: {}\n", me, e);
     }
+    // Restore the interactive budget: the override is process-global and the
+    // operator's own `meow` turns in this process (none today, but the TUI
+    // shares this client) should not inherit the live agent's cap.
+    api_client::set_max_tokens(0);
 }
 
 // ============================================================================

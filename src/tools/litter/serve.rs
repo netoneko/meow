@@ -797,6 +797,28 @@ pub mod deadline {
     pub const IO_TIMEOUT_US: u64 = 5 * 1_000_000;
     const POLL_SLEEP_MS: u64 = 2;
 
+    /// Invoked from inside the polling waits below, every iteration. The live
+    /// agent registers a drain of its own listener here: when the ONLY thread
+    /// that can serve the hub is the same thread making a hub call (a tool
+    /// call inside an LLM turn, raft thread not running), the wait must serve
+    /// as it waits or it deadlocks until the deadline. See
+    /// docs/archive/AMD64_SPAWNED_THREAD_NEVER_RUNS.md.
+    static IO_POLL_HOOK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    pub fn set_io_poll_hook(f: fn()) {
+        IO_POLL_HOOK.store(f as *const () as u64, core::sync::atomic::Ordering::Release);
+    }
+
+    fn poll_hook() {
+        let f = IO_POLL_HOOK.load(core::sync::atomic::Ordering::Acquire);
+        if f != 0 {
+            // SAFETY: the hook is registered once at startup as a plain fn();
+            // see live.rs `local_drain` for its contract.
+            let f = unsafe { core::mem::transmute::<u64, fn()>(f) };
+            f();
+        }
+    }
+
     fn now_us() -> u64 {
         crate::util::now_us()
     }
@@ -816,6 +838,7 @@ pub mod deadline {
             } else if now_us() >= deadline {
                 return false; // timeout (or hard error — same treatment)
             } else {
+                poll_hook();
                 libakuma::sleep_ms(POLL_SLEEP_MS);
             }
         }
@@ -835,6 +858,7 @@ pub mod deadline {
             } else if now_us() >= deadline {
                 return false;
             } else {
+                poll_hook();
                 libakuma::sleep_ms(POLL_SLEEP_MS);
             }
         }
