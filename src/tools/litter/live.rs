@@ -523,6 +523,40 @@ const RAFT_START_TIMEOUT_MS: u64 = 2000;
 fn raft_entry() {
     RAFT_ALIVE.store(true, core::sync::atomic::Ordering::Release);
     stage(1);
+    // fd-1 discriminator, reordered (2026-09-20): write the RAFT FD first
+    // (raw asm, no wrapper), then fd 1. Stage 5 = the raft fd write returned;
+    // stage 6 = the fd 1 write returned. Whichever stage the main thread
+    // stops seeing names the fd that never answers. A negative raw result is
+    // still progress — only a never-returning write stops the stages.
+    unsafe fn raw_write(fd: u64, buf: &[u8]) -> i64 {
+        let ret: i64;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 1u64 => ret,
+            in("rdi") fd,
+            in("rsi") buf.as_ptr(),
+            in("rdx") buf.len(),
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+        ret
+    }
+    let raft_fd = RAFT_LOG_FD.load(core::sync::atomic::Ordering::Acquire);
+    let r1 = if raft_fd >= 0 {
+        unsafe { raw_write(raft_fd as u64, b"raft child: raft-fd write ok\n") }
+    } else {
+        -9 // EBADF-shaped: no fd to try; still counts as "returned"
+    };
+    stage(5);
+    let r2 = unsafe { raw_write(1, b"raft child: fd-1 write ok\n") };
+    stage(6);
+    // Report both raw results through the surviving channel (the raft fd
+    // itself, if the fd-1 write really is the one that never returns, this
+    // line will never land — the stage counters carry the answer anyway).
+    if r1 < 0 || r2 < 0 {
+        let _ = (r1, r2);
+    }
     raft_logf!(64, "raft_entry running");
     stage(2);
     let ptr = RAFT_CTX.load(core::sync::atomic::Ordering::Acquire) as *const RaftCtx;
