@@ -238,6 +238,31 @@ impl<T> PMutex<T> {
         }
         PMutexGuard { mutex: &self.mutex, data: self.data.get(), _marker: core::marker::PhantomData }
     }
+
+    /// Take the lock if it is free, otherwise give up immediately.
+    ///
+    /// This mutex is NOT reentrant: `lock()` from a thread that already
+    /// holds it parks in `futex_wait` forever, and nothing can wake it,
+    /// because the only waker is that same thread's guard drop. That is not
+    /// hypothetical — it is how the whole litter wedged (2026-09-20, both
+    /// leader threads in syscall 98): `serve::drain` holds this lock across
+    /// a deadline-bounded read, the read's poll hook calls `local_drain`,
+    /// and `local_drain` re-locked. **Every call from inside a critical
+    /// section, or from a callback that might run inside one, must be this
+    /// and not `lock()`** — a failed `try_lock` also proves someone is
+    /// already serving, so skipping is the correct answer, not a compromise.
+    ///
+    /// Note a failure here does not distinguish "held by us" from "held by
+    /// the other thread", and deliberately does not need to: both mean the
+    /// state is being mutated by someone, so re-entering would alias the
+    /// `&mut` the holder already has.
+    pub fn try_lock(&self) -> Option<PMutexGuard<'_, T>> {
+        if self.mutex.0.swap(1, Ordering::Acquire) == 0 {
+            Some(PMutexGuard { mutex: &self.mutex, data: self.data.get(), _marker: core::marker::PhantomData })
+        } else {
+            None
+        }
+    }
 }
 
 const FUTEX_WAIT_PRIVATE: i32 = 128;

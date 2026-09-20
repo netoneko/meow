@@ -7,6 +7,13 @@
 # Usage:
 #   litter/yard.sh start [akuma-src-dir]   stand the yard up (detached)
 #
+# No static peers by default. A single-host yard has none, and naming one that
+# is not there is not free: the peer probe runs INSIDE the thread that serves
+# the hub, and `TcpStream::connect` has no timeout, so one unreachable address
+# parks the hub for the kernel's full SYN retry (minutes) on every pulse. Set
+# LITTER_STATIC_PEERS=name@host:port,... only for a host that answers:
+#   LITTER_STATIC_PEERS=ryzen@192.168.1.126:7700 litter/yard.sh start
+#
 # To join another litter, the peer's relay has to reach this hub, so the hub
 # must listen on more than loopback AND the port must be published:
 #   HUB_ADDR=0.0.0.0:7700 HUB_PUBLISH=7700:7700 litter/yard.sh start
@@ -46,7 +53,7 @@ start)
       -e AGENTS="${LITTER_AGENTS:-sherlock:qwen3:4b hercules:gemma4-yolo-4b:latest zenigata:gemma4:e4b ressler:qwen3.5:0.8b}" \
       -e OLLAMA_URL="${OLLAMA_URL:-http://192.168.65.254:11434}" \
       -e LITTER_NAME="${LITTER_NAME:-yard}" \
-      -e LITTER_STATIC_PEERS="${LITTER_STATIC_PEERS:-ryzen@192.168.1.126:7700}" \
+      -e LITTER_STATIC_PEERS="${LITTER_STATIC_PEERS:-}" \
       -e HUB_ADDR="${HUB_ADDR:-127.0.0.1:7700}" \
       ${HUB_PUBLISH:+-p "$HUB_PUBLISH"} \
       -v "$BIN:/bin/meow:ro" \

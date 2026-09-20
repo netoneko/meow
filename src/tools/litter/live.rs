@@ -504,6 +504,20 @@ fn stage(n: u64) {
 /// drain our own listener once. Reads the same leaked [`RAFT_CTX`] the raft
 /// thread uses; safe as long as this process holds the bind — which is the
 /// only situation in which `start_raft_thread` runs and registers the hook.
+///
+/// **`try_lock`, never `lock`.** This function is a *callback from inside an
+/// I/O wait* (`serve::deadline`'s poll hook and `hub`'s drain hook), and both
+/// of those waits happen on paths that may already hold the state lock — the
+/// leader's own `serve::drain` is exactly one. `PMutex` is not reentrant, so
+/// `lock()` here is a self-deadlock the process cannot recover from: measured
+/// 2026-09-20, both leader threads parked in `FUTEX_WAIT` on the same word at
+/// the same PC, the lock word left at 1 with every thread that could clear it
+/// asleep. The hub answered nobody — not even `Join` — while looking alive
+/// from outside, which is the same "went silent before answering" signature as
+/// three unrelated faults.
+///
+/// Giving up on a contended lock loses nothing: the hook exists to serve *when
+/// nobody else is*, and a lock we cannot take means someone already is.
 fn local_drain() {
     let ptr = RAFT_CTX.load(core::sync::atomic::Ordering::Acquire) as *const RaftCtx;
     if ptr.is_null() {
@@ -512,7 +526,9 @@ fn local_drain() {
     // SAFETY: leaked by start_raft_thread, process-outlived (same contract as
     // raft_entry's use).
     let ctx = unsafe { &*ptr };
-    serve::drain(&ctx.listener, &mut ctx.state.lock());
+    if let Some(mut st) = ctx.state.try_lock() {
+        serve::drain(&ctx.listener, &mut st);
+    }
 }
 
 /// How long the parent waits for the child to announce itself. Generous: this
@@ -528,6 +544,26 @@ fn raft_entry() {
     // stage 6 = the fd 1 write returned. Whichever stage the main thread
     // stops seeing names the fd that never answers. A negative raw result is
     // still progress — only a never-returning write stops the stages.
+    // Per-arch, like rt.rs's trampoline: `write` is nr 64 on aarch64 (x8,
+    // args x0-x2, `svc #0`) and nr 1 on x86_64 (rax, rdi/rsi/rdx, `syscall`,
+    // which clobbers rcx and r11). The x86_64-only version of this block
+    // broke the aarch64 build outright — the same mistake as Phase 2 bug 5,
+    // mirrored, so the fix is the same shape: gate both, fail loudly on a
+    // third arch rather than silently losing the instrument.
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn raw_write(fd: u64, buf: &[u8]) -> i64 {
+        let ret: i64;
+        core::arch::asm!(
+            "svc #0",
+            in("x8") 64u64,
+            inlateout("x0") fd => ret,
+            in("x1") buf.as_ptr(),
+            in("x2") buf.len(),
+            options(nostack)
+        );
+        ret
+    }
+    #[cfg(target_arch = "x86_64")]
     unsafe fn raw_write(fd: u64, buf: &[u8]) -> i64 {
         let ret: i64;
         core::arch::asm!(
@@ -542,6 +578,8 @@ fn raft_entry() {
         );
         ret
     }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    core::compile_error!("litter raft_entry: no raw_write for this architecture yet");
     let raft_fd = RAFT_LOG_FD.load(core::sync::atomic::Ordering::Acquire);
     let r1 = if raft_fd >= 0 {
         unsafe { raw_write(raft_fd as u64, b"raft child: raft-fd write ok\n") }
