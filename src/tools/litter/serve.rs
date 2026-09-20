@@ -414,13 +414,13 @@ fn record_line(from: &str, op: &litter_wire::TaskOp) -> String {
         op.text.clone()
     } else {
         let mut s = String::new();
-        for (who, brief) in &op.plan {
+        for item in &op.plan {
             if !s.is_empty() {
                 s.push_str("; ");
             }
-            s.push_str(who);
+            s.push_str(&item.who);
             s.push_str(" -> ");
-            s.push_str(brief);
+            s.push_str(&item.what);
         }
         s
     };
@@ -680,7 +680,12 @@ pub fn run_tests() -> i32 {
                 act: litter_wire::TaskAct::Plan,
                 id: String::from("t1"),
                 text: String::new(),
-                plan: alloc::vec![(String::from("tiger"), String::from("read main.rs"))],
+                expect: String::new(),
+                plan: alloc::vec![litter_wire::PlanItem {
+                    who: String::from("tiger"),
+                    what: String::from("read main.rs"),
+                    expect: String::new(),
+                }],
             },
         });
         hub.task_tick();

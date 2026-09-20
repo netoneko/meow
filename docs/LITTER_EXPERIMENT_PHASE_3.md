@@ -200,3 +200,21 @@ Two things worth trying, in order: cap the tool-loop iterations per wake
 (a turn that has made its decision should stop), and prefer a
 non-reasoning model for the leader, whose job is dispatch rather than
 analysis.
+
+## Trap: rebuilding kills a running yard
+
+`litter/yard.sh` used to bind-mount the build output
+(`target/aarch64-unknown-linux-musl/release/meow`) straight into the
+container. A bind-mounted *file* is bound to an inode, and `cargo build`
+replaces the binary by rename — so a rebuild while the yard is running
+pulls the executable out from under every agent.
+
+Measured 2026-09-21: all four agents died mid-turn, and the container
+stayed up, because `yard_init.sh` is PID 1 and its `wait` loop survives
+its children. The symptom is a yard that answers nothing while
+`docker ps` says it is healthy; the tell is `docker stats` showing ~1 MB
+instead of ~4 MB.
+
+`yard.sh start` now copies the binary to `target/yard/meow` and mounts
+that, so rebuilding is safe while a litter is running. Restarting the
+yard picks up the new build, as before.

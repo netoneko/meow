@@ -25,9 +25,12 @@
 #   litter/yard.sh talk <agent|litter> "message"
 #                                          operator -> one agent, or the whole
 #                                          litter (`to: litter` fans out)
-#   litter/yard.sh task "do this"          open a TRACKED task: the leader's
-#                                          table assigns it to the least
-#                                          loaded agent with a lease
+#   litter/yard.sh task "do this" ["shape of the answer"]
+#                                          open a TRACKED task: the leader
+#                                          splits it into one directed
+#                                          sub-task per agent. The optional
+#                                          second argument states what the
+#                                          final report should look like.
 #   litter/yard.sh respawn <agent>         (re)start one resident after a kill
 #   litter/yard.sh watch                   transcript (meow litter observe)
 #   litter/yard.sh logs                    tail every agent's log
@@ -39,8 +42,27 @@ set -e
 cd "$(dirname "$0")/.."
 
 NAME=litter-yard
-BIN="$PWD/target/aarch64-unknown-linux-musl/release/meow"
+SRC_BIN="$PWD/target/aarch64-unknown-linux-musl/release/meow"
+# The container gets its OWN copy, not the build output.
+#
+# A bind-mounted file is bound to an inode. `cargo build` replaces the
+# binary by rename, so a rebuild while the yard is running pulls the file
+# out from under every agent: measured 2026-09-21, all four agents died
+# mid-turn and the container stayed up at 1 MB with only the init script
+# left, which reads as "the litter silently stopped" rather than as
+# anything to do with the build. Same trap as the devbox release ELF.
+BIN="$PWD/target/yard/meow"
 AKUMA_SRC="${2:-$(cd "$(dirname "$0")/../.." && pwd)}"   # akuma repo root by default
+
+# What the agents actually get to read: the kernel source, and nothing else.
+#
+# NOT the repo root. That is 27 GB — 707 MB of .git, 1.5 GB of rumpkernel and
+# the rest vendored submodules and build output — and none of it is what an
+# agent is being asked about. Mounting a directory that large is not free
+# even when idle, and it gives a wandering agent 27 GB of places to wander.
+#
+# Set LITTER_SRC to mount something else.
+SRC_SUBDIR="${LITTER_SRC:-$AKUMA_SRC/src}"
 
 op() {  # run meow as the operator (root) inside the yard
     docker exec -e MEOW_HOME=/operator "$NAME" /bin/meow "$@"
@@ -49,9 +71,23 @@ op() {  # run meow as the operator (root) inside the yard
 case "${1:-}" in
 start)
     docker rm -f "$NAME" 2>/dev/null || true
+    if [ ! -f "$SRC_BIN" ]; then
+        echo "[yard] no binary at $SRC_BIN — build it first (see docs/LITTER_EXPERIMENT_PHASE_3.md)" >&2
+        exit 1
+    fi
+    mkdir -p "$(dirname "$BIN")"
+    cp "$SRC_BIN" "$BIN"
+
+    if [ ! -d "$SRC_SUBDIR" ]; then
+        echo "[yard] no source directory at $SRC_SUBDIR" >&2
+        exit 1
+    fi
+
     docker run -d --platform linux/arm64 --name "$NAME" \
       -e AGENTS="${LITTER_AGENTS:-sherlock:qwen3:4b hercules:gemma4-yolo-4b:latest zenigata:gemma4:e4b ressler:qwen3.5:0.8b}" \
       -e OLLAMA_URL="${OLLAMA_URL:-http://192.168.65.254:11434}" \
+      -e LITTER_BASE_PORT="${LITTER_BASE_PORT:-}" \
+      -e LLM_HOST="${LLM_HOST:-192.168.65.254}" \
       -e LITTER_NAME="${LITTER_NAME:-yard}" \
       -e LITTER_STATIC_PEERS="${LITTER_STATIC_PEERS:-}" \
       -e HUB_ADDR="${HUB_ADDR:-127.0.0.1:7700}" \
@@ -59,7 +95,7 @@ start)
       -v "$BIN:/bin/meow:ro" \
       -v "$PWD/litter/yard_init.sh:/yard_init.sh:ro" \
       -v "$PWD/litter/personas:/personas:ro" \
-      -v "$AKUMA_SRC:/akuma-src:ro" \
+      -v "$SRC_SUBDIR:/akuma-src:ro" \
       alpine:3.20 sh /yard_init.sh
     ;;
 
@@ -74,13 +110,14 @@ talk)
     ;;
 
 task)
-    msg="${2:?usage: yard.sh task \"do this\"}"
+    msg="${2:?usage: yard.sh task \"do this\" [\"what the answer should look like\"]}"
+    want="${3:-}"
     # A task is a RECORD, not a chat body (protocol v4). The hub opens a
     # parent task, the owner loop directs the leader to plan it into one
     # sub-task per agent, each assignee claims and reports, the leader
     # clears each result and finally produces the artifact.
     # See docs/LITTER_WORKFLOW.md.
-    op litter task --text "$msg" --from root
+    op litter task --text "$msg" ${want:+--expect "$want"} --from root
     ;;
 
 respawn)

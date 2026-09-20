@@ -101,9 +101,16 @@ pub fn chat_once(
     conversation: &mut Conversation,
     context_window: Option<usize>,
     system_prompt: &str,
-) -> Result<(), &'static str> {
+) -> Result<bool, &'static str> {
     auto_compact_if_needed(conversation, system_prompt);
     conversation.append(&Message::new("user", user_message));
+
+    // Did this turn actually do anything? A reasoning model can stream for
+    // minutes, hit its token budget while still thinking, and return with
+    // an empty `content` and no tool call — which is indistinguishable from
+    // "nothing needed doing" unless we say so. Callers that must not lose a
+    // turn (the live agent) use this to re-prompt.
+    let mut produced = false;
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
         let current_tokens = conversation.tokens();
@@ -159,11 +166,13 @@ pub fn chat_once(
                             ]);
                             let tokens_after = conversation.tokens();
                             print_msg(COLOR_GREEN_LIGHT, &format!("\n[*] Context compacted: {} -> {} tokens\n", tokens_before, tokens_after));
-                            return Ok(());
+                            // Compaction is work, even if nothing was said.
+                            return Ok(true);
                         }
                         continue;
                     }
 
+                    produced = true;
                     announce_tool_call(tc);
                     let tool_start = crate::util::now_us();
                     let tool_result = tools::execute_tool_by_name(&tc.name, &tc.arguments)
@@ -179,6 +188,7 @@ pub fn chat_once(
             StreamResponse::Complete(assistant_response, stats) => {
                 print_stats(&stats, &assistant_response);
                 if !assistant_response.is_empty() {
+                    produced = true;
                     conversation.append(&Message::new("assistant", &assistant_response));
                 }
                 auto_compact_if_needed(conversation, system_prompt);
@@ -188,12 +198,12 @@ pub fn chat_once(
                         print_msg(COLOR_RESET, "\n[!] Token count is high - consider asking to compact context\n");
                     }
                 }
-                return Ok(());
+                return Ok(produced);
             } // end StreamResponse::Complete
         } // end match stream_result
     } // end for iteration
     print_msg(COLOR_RESET, "\n[!] Max tool iterations reached\n");
-    Ok(())
+    Ok(produced)
 }
 
 /// `tc.id`/`tc.name` come from `extract_json_string`/`accumulate_tool_call_delta`

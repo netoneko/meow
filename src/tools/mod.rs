@@ -105,7 +105,9 @@ pub fn execute_tool_by_name(name: &str, args_json: &str) -> Option<ToolResult> {
             let status = extract_string_field(args_json, "status")?;
             // `text` is optional: claim and clear carry none.
             let text = extract_string_field(args_json, "text").unwrap_or_default();
-            Some(litter::tool_task_update(&task, &status, &text))
+            // `expect` only means anything on an open; harmless elsewhere.
+            let expect = extract_string_field(args_json, "expect").unwrap_or_default();
+            Some(litter::tool_task_update(&task, &status, &text, &expect))
         }
         #[cfg(feature = "litter")]
         "TaskPlan" => {
@@ -116,9 +118,23 @@ pub fn execute_tool_by_name(name: &str, args_json: &str) -> Option<ToolResult> {
             // stops at the shorter side, which is the forgiving reading.
             let who = crate::json::strings_at(args_json, &["assignments", "*", "who"]);
             let what = crate::json::strings_at(args_json, &["assignments", "*", "what"]);
-            let pairs: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> =
-                who.into_iter().zip(what).collect();
-            Some(litter::tool_task_plan(&task, &pairs))
+            // `expect` is optional per item, so it cannot be zipped
+            // positionally — an assignment that omits it would shift every
+            // later expectation onto the wrong sub-task. Only trust the
+            // column when it is complete.
+            let expect = crate::json::strings_at(args_json, &["assignments", "*", "expect"]);
+            let aligned = expect.len() == who.len();
+            let items: alloc::vec::Vec<litter_wire::PlanItem> = who
+                .into_iter()
+                .zip(what)
+                .enumerate()
+                .map(|(i, (who, what))| litter_wire::PlanItem {
+                    who,
+                    what,
+                    expect: if aligned { expect[i].clone() } else { alloc::string::String::new() },
+                })
+                .collect();
+            Some(litter::tool_task_plan(&task, &items))
         }
         #[cfg(feature = "litter")]
         "ListPeers" => Some(litter::tool_list_peers()),

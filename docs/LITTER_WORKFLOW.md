@@ -534,6 +534,144 @@ fakes a role. Escaped JSON puts an unambiguous boundary between what was
 said and who said it, and a message can no longer claim to be its own
 context.
 
+### Kafka meets cats: an edifice to bureaucracy
+
+That is the operator's verdict on this design, and it is recorded here
+because it is **accurate**, not as a joke. Look at what one question to
+four agents now costs: a parent task, a plan, a directed sub-task each, an
+offer, a claim, a lease, a reminder schedule, a submission, a clearance
+decision, and a final artifact — plus a roll call if the leader changes.
+Kafka in both senses: an append-only log of records fanned out to
+subscribers, and a castle of procedure where a thing is not done until the
+right official has stamped it.
+
+The ceremony buys three specific things, and it is worth being able to
+name them, because anything it does not buy is pure overhead:
+
+1. **Work survives an agent.** A claim has a lease; a holder that dies is
+   requeued to someone else. Without the ceremony a dropped task is
+   silently dropped.
+2. **"Done" is a decision, not an inference.** A turn ending means the
+   model stopped talking, which is not the same as the work being
+   finished. Making completion an explicit act is what lets an agent
+   absorb a batch of events in one pass instead of one turn per message —
+   the throughput argument.
+3. **The state is inspectable.** The event log says exactly who holds
+   what, who answered and who did not. A litter that coordinated purely
+   through chat has no such view, and neither does its operator.
+
+And the costs are just as real: every stamp is an LLM turn, every reminder
+wakes a model, and a leader can spend minutes deciding something a human
+would settle in a sentence. Most of the tuning in this document —
+`MAX_WORK_NUDGES`, the takeover-only election wake, `expect` — is about
+cutting ceremony that was not buying one of those three things.
+
+The honest summary: this is bureaucracy, deliberately, because the
+alternative for unreliable agents is losing work quietly. The design goal
+is the *smallest* bureaucracy that still keeps those three properties, and
+every rule above that line should be deleted.
+
+### Stating what you expect back
+
+Each plan assignment carries an `expect`: what the answer should look
+like. The leader sets it per sub-task, because only the leader knows what
+it is going to do with the answers, and it is repeated in the reminder as
+well as the first offer.
+
+```
+TaskPlan(task="t1", assignments=[
+  {"who":"hercules", "what":"introduce yourself",
+   "expect":"two sentences of plain text, nothing else"}, ...])
+```
+
+`TaskUpdate(status="open", expect=…)` sets the same thing one level up —
+what the *final artifact* should look like — and the plan directive shows
+it to the leader so an expectation set by the operator survives the task
+being split.
+
+This exists because of a specific failure: asked simply to introduce
+itself, an agent ran `Shell`, `FolderList` and `FileList` before answering.
+Nothing had told it that a sentence was wanted, so it went looking for
+work to do. A stated contract is cheaper than a smarter model.
+
+### A turn that produces nothing is a first-class outcome
+
+Three separate mechanisms failed, live, in the same way: an agent was
+asked to do something, appeared to work, and returned **nothing at all**.
+Each looked like a different bug, and all three were the same one.
+
+**The cause.** A reasoning model puts its working in `reasoning_content`
+and leaves `content` empty until it has finished thinking — and if the
+token budget runs out first, `content` is never populated. meow read only
+`content`, so a model that streamed two thousand tokens registered as
+silent. Measured directly against `llama-server`:
+
+```
+content:           ''
+reasoning_content: 'Okay, the user asked me to "say hello in one short sentence"...'
+finish_reason:     length
+```
+
+Note `--reasoning off` does **not** prevent this: it only decides which
+field the thoughts land in. Neither does
+`--chat-template-kwargs '{"enable_thinking":false}'` on every build.
+
+**Three fixes, at three layers:**
+
+1. *Read it.* `reasoning_content` counts as content. The distinction that
+   matters upstream is "did the model produce anything", and for that they
+   are the same thing.
+2. *Give it room.* The wake-turn budget was 2048 — chosen when a long turn
+   starved the hub, a coupling single ownership removed. Since the budget
+   is spent on thinking **first**, a small cap guarantees an empty turn
+   rather than preventing a slow one. It is now the default 16384.
+3. *Ask again, then say so.* `chat_once` reports whether the turn produced
+   anything. An empty turn is re-prompted ("do not think further — act
+   now"), up to `MAX_WORK_NUDGES` times — the same budget as the holder
+   reminders, because there is only one answer to "how many times do we
+   ask before concluding this will not happen".
+
+**And then it is announced, not swallowed.** On giving up, the agent does
+not just log it:
+
+- holding sub-tasks → each is reported `failed` on the protocol, with the
+  reason. The labels are scraped from the offer and reminder messages in
+  the feed, *not* asked of the model — a model that has produced nothing
+  three times is not the thing to rely on for reporting that it produced
+  nothing.
+- holding none → it says so to the litter ("I had nothing to say this
+  time"), so silence is visible.
+
+The principle underneath: **an agent that cannot answer must be
+distinguishable from an agent that was never asked.** Every silent path in
+this protocol eventually becomes a task nobody is working on and nobody
+knows is stalled.
+
+### One inference server per agent
+
+Four agents sharing one endpoint serialize: whichever model is loaded
+serves one request at a time, and a model swap costs a reload. Measured
+against a single Ollama, turns ran 9-17 minutes each.
+
+`LITTER_BASE_PORT=8081` gives agent *i* (in `AGENTS` order)
+`http://$LLM_HOST:$((8081+i))` and uses its own name as the model alias —
+which is what `llama-server --alias <name>` answers to. An entry may also
+pin its own endpoint as `name:model@url`, so a litter can be mixed:
+
+```bash
+LITTER_BASE_PORT=8081 \
+LITTER_AGENTS="sherlock:gemma4:e4b@http://192.168.65.254:11434 hercules:x zenigata:x ressler:x" \
+  litter/yard.sh start
+```
+
+That runs the leader on a large model through Ollama while the three
+workers think concurrently on their own `llama-server` instances — which
+is also the way to compare models on identical work in a single run.
+
+Run the workers single-threaded (`-t 1 -np 1`): four servers each opening
+a full thread pool fight over the CPU, and on Metal the generation is
+GPU-bound anyway.
+
 ### Where this stands
 
 | Piece | State |

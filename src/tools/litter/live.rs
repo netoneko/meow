@@ -1158,6 +1158,31 @@ fn high_water(messages: &[Message], cursor: u64) -> u64 {
     messages.iter().map(|m| m.ts).fold(cursor, |a, b| if b > a { b } else { a })
 }
 
+/// Sub-task labels this agent is currently on the hook for, scraped from
+/// the messages it was just handed.
+///
+/// The table is the leader's memory and a follower cannot query it, so the
+/// only place a worker learns what it holds is the offer and reminder
+/// messages addressed to it — which are exactly what is in this feed.
+fn held_subtasks(feed: &[Message]) -> Vec<alloc::string::String> {
+    let mut out: Vec<alloc::string::String> = Vec::new();
+    for m in feed {
+        for marker in ["[assigned: ", "[still yours: "] {
+            let mut rest = m.body.as_str();
+            while let Some(i) = rest.find(marker) {
+                rest = &rest[i + marker.len()..];
+                if let Some(end) = rest.find(']') {
+                    let label = rest[..end].trim();
+                    if !label.is_empty() && !out.iter().any(|l| l == label) {
+                        out.push(alloc::string::String::from(label));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Whether this message should start a turn *for us*.
 ///
 /// Two filters, and both are load-bearing:
@@ -1190,24 +1215,16 @@ fn wakeable(m: &Message) -> bool {
 /// events in one pass instead of round-tripping a whole turn per message
 /// (`docs/LITTER_WORKFLOW.md` § "Auto-feed, explicit completion").
 fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str, feed: &[Message], events: &[String], addr: &str) {
-    // The cap exists because a reasoning model spends its budget in
-    // `reasoning_content` that meow does not render; uncapped, one turn
-    // measured 17 minutes (2026-09-20).
-    //
-    // It used to be 2048, and that number was protecting the *hub*: back
-    // when the agent loop was one of the two threads serving the socket, a
-    // long turn was a litter-wide outage. Single ownership removed that
-    // coupling — the owner thread serves on its own cadence no matter what
-    // the model is doing — so the only thing a long turn now costs is that
-    // agent's own responsiveness.
-    //
-    // 2048 turned out to be under the floor for a reasoning model: measured
-    // live on qwen3:4b, a leader asked to plan a task streamed for 117
-    // seconds and emitted **zero** visible tokens — the entire budget went
-    // to thinking, so no tool call was ever made and the task could not
-    // progress. The nag timer re-sent the directive and it failed again the
-    // same way. A budget that cannot fit one decision is not a safety
-    // margin, it is a deadlock with a timeout.
+    // Give the turn room. The old cap was protecting the hub from a long
+    // agent turn; single ownership removed that coupling, and a cap that
+    // cannot fit "think, then answer" produces nothing at all — a reasoning
+    // model spends the budget on thinking first and hits
+    // `finish_reason: length` before it ever writes an answer or a tool
+    // call. Measured at 2048: 117 s of streaming, zero visible tokens.
+    // 8k: enough for a reasoning model to think AND answer, which 2048 was
+    // not — at 2048 the budget ran out mid-thought and the turn produced no
+    // answer and no tool call at all. Not unlimited, because the budget is
+    // also the ceiling on how long one agent can hold its own loop.
     api_client::set_max_tokens(8192);
 
     let session_id = session::generate_session_id();
@@ -1310,9 +1327,82 @@ fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str, fee
          sending anything.",
     );
 
-    if let Err(e) = chat_once(model, provider, &wake, &mut conversation, None, system_prompt) {
-        libakuma::safe_print!(256, "[live] {}'s turn failed: {}\n", me, e);
+    // Sub-tasks this turn is responsible for, read off the feed rather than
+    // asked of the model: if the agent gives up, the litter must still be
+    // told, and a model that just produced nothing three times is not the
+    // thing to rely on for saying so.
+    let held = held_subtasks(feed);
+
+    // Re-prompt on an empty answer.
+    //
+    // A model that spends its budget thinking, or replies with nothing at
+    // all, leaves the litter waiting on a sub-task it believes is being
+    // worked on. One nudge inside the same turn is far cheaper than waiting
+    // out a lease.
+    //
+    // Same budget as the holder reminders (`MAX_WORK_NUDGES`) on purpose:
+    // there is one answer to "how many times do we ask before concluding
+    // this is not going to happen", and having two would mean tuning it
+    // twice.
+    let mut attempt = 0usize;
+    let mut prompt = wake;
+    loop {
+        match chat_once(model, provider, &prompt, &mut conversation, None, system_prompt) {
+            Err(e) => {
+                libakuma::safe_print!(256, "[live] {}'s turn failed: {}\n", me, e);
+                break;
+            }
+            Ok(true) => break,
+            Ok(false) => {
+                attempt += 1;
+                if attempt >= super::tasks::MAX_WORK_NUDGES as usize {
+                    libakuma::safe_print!(
+                        192,
+                        "[live] {} produced nothing in {} attempts; reporting its work failed\n",
+                        me,
+                        attempt
+                    );
+                    // Say so on the protocol, not just on the console. An
+                    // unanswered sub-task is indistinguishable from one in
+                    // progress; a failed one is a decision the leader can
+                    // act on immediately instead of waiting for a lease.
+                    if held.is_empty() {
+                        // Nothing was assigned, so there is no sub-task to
+                        // fail — but the silence should still be on the
+                        // record. An agent that says nothing is otherwise
+                        // indistinguishable from one that was never woken,
+                        // and the litter has no way to tell that it tried.
+                        let r = super::tool_send_message(
+                            serve::GROUP_NAME,
+                            "I had nothing to say this time — I could not produce an answer.",
+                            0,
+                        );
+                        libakuma::safe_print!(160, "[live] {} announced its silence: {}\n", me, r.output);
+                    } else {
+                        for label in &held {
+                            let r = super::tool_task_update(
+                                label,
+                                "failed",
+                                "the agent produced no answer after repeated attempts",
+                                "",
+                            );
+                            libakuma::safe_print!(192, "[live] {} -> failed {}: {}\n", me, label, r.output);
+                        }
+                    }
+                    break;
+                }
+                libakuma::safe_print!(128, "[live] {} said nothing; asking it to continue ({}/{})\n",
+                    me, attempt, super::tasks::MAX_WORK_NUDGES);
+                prompt = alloc::string::String::from(
+                    "You produced no answer and made no tool call. Do not think further — \
+                     act now. If you were assigned a sub-task, report it with TaskUpdate \
+                     (status=\"done\" and your findings, or status=\"failed\" and why). \
+                     Otherwise reply with SendMessage. Keep it short.",
+                );
+            }
+        }
     }
+
     // Restore the interactive budget: the override is process-global and the
     // operator's own `meow` turns in this process (none today, but the TUI
     // shares this client) should not inherit the live agent's cap.

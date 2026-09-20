@@ -399,14 +399,21 @@ impl DisplayJson for Request {
                 f.member("act", op.act.as_str())?;
                 f.member("id", &op.id)?;
                 f.member("text", &op.text)?;
+                if !op.expect.is_empty() {
+                    f.member("expect", &op.expect)?;
+                }
                 if !op.plan.is_empty() {
                     f.member("plan", nojson::json(|f| {
                         f.array(|f| {
-                            for (who, what) in &op.plan {
+                            for item in &op.plan {
                                 f.element(nojson::json(|f| {
                                     f.object(|f| {
-                                        f.member("who", who)?;
-                                        f.member("what", what)
+                                        f.member("who", &item.who)?;
+                                        f.member("what", &item.what)?;
+                                        if !item.expect.is_empty() {
+                                            f.member("expect", &item.expect)?;
+                                        }
+                                        Ok(())
                                     })
                                 }))?;
                             }
@@ -481,22 +488,47 @@ impl TaskAct {
     }
 }
 
-/// One task record. Flat on the wire (`act`/`id`/`text`/`plan`) rather than
-/// a variant per act: the acts share almost all their fields, and a flat
-/// shape is one decode path instead of eight.
+/// One sub-task in a plan: who does it, what they do, and **what shape the
+/// answer should take**.
+///
+/// `expect` is the response contract. Without it the only thing telling a
+/// worker what form to reply in is the generic wake prompt, so a leader
+/// that wants two sentences and a leader that wants a table are
+/// indistinguishable to the agent doing the work. It is the leader's to
+/// set, per sub-task, because only the leader knows what it is going to do
+/// with the answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanItem {
+    pub who: String,
+    pub what: String,
+    /// May be empty: no stated contract, answer however you like.
+    pub expect: String,
+}
+
+/// One task record. Flat on the wire (`act`/`id`/`text`/`expect`/`plan`)
+/// rather than a variant per act: the acts share almost all their fields,
+/// and a flat shape is one decode path instead of eight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskOp {
     pub act: TaskAct,
     /// `"t1"` for a parent, `"t1.2"` for a sub-task, empty for `Open`.
     pub id: String,
     pub text: String,
-    /// `Plan` only: (assignee, brief) per sub-task.
-    pub plan: Vec<(String, String)>,
+    /// `Open` only: the shape the *parent's* final artifact should take.
+    /// Carried to the leader with the plan directive, so the operator's
+    /// expectation survives being split into sub-tasks.
+    pub expect: String,
+    /// `Plan` only.
+    pub plan: Vec<PlanItem>,
 }
 
 impl TaskOp {
     pub fn new(act: TaskAct, id: String, text: String) -> Self {
-        Self { act, id, text, plan: Vec::new() }
+        Self { act, id, text, expect: String::new(), plan: Vec::new() }
+    }
+
+    pub fn expecting(act: TaskAct, id: String, text: String, expect: String) -> Self {
+        Self { act, id, text, expect, plan: Vec::new() }
     }
 }
 
@@ -649,17 +681,25 @@ pub fn decode_request(json: &str) -> Result<Request, WireError> {
             };
             let id: Option<String> = value.to_member("id")?.try_into()?;
             let text: Option<String> = value.to_member("text")?.try_into()?;
-            let mut plan: Vec<(String, String)> = Vec::new();
+            let expect: Option<String> = value.to_member("expect")?.try_into()?;
+            let mut plan: Vec<PlanItem> = Vec::new();
             if let Some(arr) = value.to_member("plan")?.optional() {
                 for entry in arr.to_array()? {
                     let who: String = entry.to_member("who")?.required()?.try_into()?;
                     let what: String = entry.to_member("what")?.required()?.try_into()?;
-                    plan.push((who, what));
+                    let expect: Option<String> = entry.to_member("expect")?.try_into()?;
+                    plan.push(PlanItem { who, what, expect: expect.unwrap_or_default() });
                 }
             }
             Ok(Request::Task {
                 from,
-                op: TaskOp { act, id: id.unwrap_or_default(), text: text.unwrap_or_default(), plan },
+                op: TaskOp {
+                    act,
+                    id: id.unwrap_or_default(),
+                    text: text.unwrap_or_default(),
+                    expect: expect.unwrap_or_default(),
+                    plan,
+                },
             })
         }
         _ => Err(value.invalid("unknown 'op'").into()),

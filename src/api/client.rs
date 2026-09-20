@@ -29,10 +29,19 @@ const MAX_RETRIES: u32 = 10;
 const DEFAULT_MAX_TOKENS: usize = 16384;
 
 /// Caller-settable cap on one response's token budget. 0 = use
-/// [`DEFAULT_MAX_TOKENS`]. Exists for the **live agent**: a reasoning model
-/// burns its budget in `reasoning_content` meow does not render, so an
-/// uncapped wake-up turn measured 17 minutes of wall clock (2026-09-20) while
-/// the main thread — the hub's only serving thread — sat in this request.
+/// [`DEFAULT_MAX_TOKENS`].
+///
+/// It existed for the **live agent**, to stop a reasoning model spending 17
+/// minutes of wall clock in one request while the main thread — then the
+/// hub's only serving thread — sat waiting. Single ownership removed that
+/// coupling: the owner thread serves regardless of what the agent is doing,
+/// so a long turn now costs only that agent's own responsiveness.
+///
+/// A small cap was actively harmful, because the budget is spent on
+/// thinking *first*: at 2048 a reasoning model hit `finish_reason: length`
+/// while still working and emitted no answer and no tool call at all. A
+/// budget that cannot fit the thinking plus the answer is not a safety
+/// margin, it is a guaranteed empty turn.
 static MAX_TOKENS_OVERRIDE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
@@ -939,6 +948,16 @@ fn parse_streaming_line(line: &str) -> Option<(String, bool)> {
     if json.is_empty() || json == "[DONE]" { return Some((String::new(), json == "[DONE]")); }
     let content = extract_openai_delta_content(json).unwrap_or_default();
     let finished = crate::json::string_at(json, &["choices", "0", "finish_reason"]).is_some();
+    if content.is_empty() && !finished {
+        // Thinking: show it so the wait is legible, but never return it as
+        // answer text — the caller accumulates what it is given.
+        if let Some(think) = extract_openai_delta_reasoning(json) {
+            if !think.is_empty() {
+                let mut stdout = Stdout;
+                let _ = write!(stdout, "{}", think);
+            }
+        }
+    }
     Some((content, finished))
 }
 
@@ -1002,8 +1021,29 @@ fn accumulate_tool_call_delta(line: &str, pending: &mut Vec<ToolCallData>) -> bo
     is_finish
 }
 
+/// One streamed delta's *answer* text — `content` only.
+///
+/// Deliberately NOT `reasoning_content`. A reasoning model puts its working
+/// there and leaves `content` empty until it has finished thinking, and if
+/// the budget runs out first `content` is never populated at all. Both are
+/// worth showing an operator (see [`extract_openai_delta_reasoning`]), but
+/// only one of them is an answer, and conflating them makes a model that
+/// thought for two thousand tokens and then stopped look like it replied.
+///
+/// That distinction is what the live agent's empty-turn retry keys on
+/// (`docs/LITTER_WORKFLOW.md` § "A turn that produces nothing").
 fn extract_openai_delta_content(json: &str) -> Option<String> {
     crate::json::string_at(json, &["choices", "0", "delta", "content"])
+}
+
+/// One streamed delta's *thinking*, if the server reports it separately.
+///
+/// Rendered so a long silence is legible as work rather than as a hang —
+/// before this, a model thinking for minutes printed nothing at all and was
+/// indistinguishable from a stalled connection. It is never accumulated
+/// into the answer.
+fn extract_openai_delta_reasoning(json: &str) -> Option<String> {
+    crate::json::string_at(json, &["choices", "0", "delta", "reasoning_content"])
 }
 
 fn print_elapsed(ms: u64) {

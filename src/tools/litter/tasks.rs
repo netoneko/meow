@@ -132,6 +132,9 @@ pub struct SubTask {
     /// `InProgress`: lease expiry. Unused in the terminal states.
     pub until: u64,
     pub body: String,
+    /// What shape the answer should take, as the leader stated it. Empty
+    /// means "no stated contract".
+    pub expect: String,
     pub result: String,
     /// When its holder was last reminded that it still owes a result.
     /// `0` means "due now" — set at claim, so the first nudge goes out on
@@ -152,13 +155,32 @@ impl SubTask {
     /// indistinguishable from an agent that never woke.
     pub fn offer_message(&self) -> String {
         format!(
-            "[assigned: {label}] {body}\
+            "[assigned: {label}] {body}{expect}\
              \n\nTake it with TaskUpdate(task=\"{label}\", status=\"claim\"). \
              When you have an answer, report it with \
              TaskUpdate(task=\"{label}\", status=\"done\", text=\"<your findings>\"). \
              If you cannot do it, say so with status=\"failed\" and why.",
             label = self.label(),
-            body = self.body
+            body = self.body,
+            expect = self.expectation_line()
+        )
+    }
+
+    /// The stated response contract, rendered for a worker — or nothing at
+    /// all when the leader did not state one. Phrased as a constraint
+    /// rather than a suggestion, because the point of stating it is to stop
+    /// an agent going and doing research when a sentence was wanted.
+    fn expectation_line(&self) -> String {
+        if self.expect.is_empty() {
+            return String::new();
+        }
+        // Trim trailing punctuation: the leader writes the expectation as
+        // a sentence about as often as it writes a phrase, and gluing our
+        // own full stop onto "…Role, Skill, Interest." reads as a typo.
+        let want = self.expect.trim_end_matches(['.', ',', ';', ' ']);
+        format!(
+            "\n\nWhat is expected back: {}. Answer in exactly that form — do not do more work than that requires.",
+            want
         )
     }
 
@@ -171,6 +193,10 @@ impl SubTask {
 pub struct Parent {
     pub id: u64,
     pub body: String,
+    /// What the *operator* asked the final artifact to look like. Shown to
+    /// the leader with the plan directive, so an expectation set at the top
+    /// survives the task being split up.
+    pub expect: String,
     /// Set by a `[plan: tN]`, which is atomic — see `note_message`.
     pub planned: bool,
     pub closed: bool,
@@ -350,7 +376,7 @@ impl TaskTable {
         let mut out = Vec::new();
         let mut events = Vec::new();
         let outcome = match op.act {
-            TaskAct::Open => self.op_open(from, authority, &op.text, &mut events),
+            TaskAct::Open => self.op_open(from, authority, &op.text, &op.expect, &mut events),
             TaskAct::Plan => self.op_plan(authority, op, roster, &mut events),
             TaskAct::Claim => self.op_claim(from, &op.id, now_us, &mut events),
             TaskAct::Done => self.op_done(from, &op.id, &op.text, &mut events),
@@ -362,7 +388,7 @@ impl TaskTable {
         (out, events, outcome)
     }
 
-    fn op_open(&mut self, from: &str, authority: Authority, text: &str, events: &mut Vec<String>) -> Applied {
+    fn op_open(&mut self, from: &str, authority: Authority, text: &str, expect: &str, events: &mut Vec<String>) -> Applied {
         if !authority.may_open_parent() {
             // Otherwise any agent can mint work for the whole litter —
             // observed live, an agent tasking the litter to police the
@@ -378,6 +404,7 @@ impl TaskTable {
         self.parents.push(Parent {
             id,
             body: String::from(text),
+            expect: String::from(expect.trim()),
             planned: false,
             closed: false,
             artifact: String::new(),
@@ -414,9 +441,9 @@ impl TaskTable {
 
         let mut n = 0u64;
         let mut skipped: Vec<String> = Vec::new();
-        for (who, what) in &op.plan {
-            let who = who.trim();
-            let what = what.trim();
+        for item in &op.plan {
+            let who = item.who.trim();
+            let what = item.what.trim();
             if who.is_empty() || what.is_empty() {
                 continue;
             }
@@ -436,6 +463,7 @@ impl TaskTable {
                 state: SubState::Pending,
                 until: 0, // never offered yet; the next tick offers it
                 body: String::from(what),
+                expect: String::from(item.expect.trim()),
                 result: String::new(),
                 nagged: 0,
                 nudges: 0,
@@ -745,7 +773,7 @@ impl TaskTable {
                 body: format!(
                     "[still yours: {label}] You claimed this and have not reported yet \
                      (reminder {n} of {max}):\
-                     \n\n{body}\
+                     \n\n{body}{expect}\
                      \n\nProceed with the work now and report it with \
                      TaskUpdate(task=\"{label}\", status=\"done\", text=\"<what you found>\"). \
                      If you cannot do it, say so with status=\"failed\" and why. Until you send \
@@ -754,6 +782,7 @@ impl TaskTable {
                     n = s.nudges,
                     max = MAX_WORK_NUDGES,
                     body = truncate(&s.body, 300),
+                    expect = s.expectation_line(),
                     tail = tail
                 ),
                 kind: OutKind::Assignment,
@@ -881,16 +910,30 @@ impl TaskTable {
                     .map(|s| s.as_str())
                     .filter(|n| *n != leader && assignable(n))
                     .collect();
+                let wanted = if self.parents[i].expect.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\nThe final report is expected to be: {}. Set each agent's `expect` so \
+                         their answers fit that.",
+                        self.parents[i].expect
+                    )
+                };
                 format!(
                     "[plan-needed: {label}] You are the leader. Split this task into one \
                      sub-task per agent and submit them in a SINGLE TaskPlan call:\
                      \n  TaskPlan(task=\"{label}\", assignments=[{{\"who\":\"<agent>\",\
-                     \"what\":\"<what they should do>\"}}, ...])\
+                     \"what\":\"<what they should do>\", \"expect\":\"<what their answer \
+                     should look like>\"}}, ...])\
                      \nOne call, every sub-task — a partial plan cannot be completed later.\
-                     \n\nThe task is: {body}\
+                     \n\nUse `expect` to say what you want back — for example \"two sentences \
+                     of plain text and nothing else\". An agent told what shape the answer \
+                     takes does not go off and do work you did not ask for.\
+                     \n\nThe task is: {body}{wanted}\
                      \nAgents available: {who}",
                     label = label,
                     body = self.parents[i].body,
+                    wanted = wanted,
                     who = who.join(", ")
                 )
             } else {
@@ -1004,7 +1047,15 @@ pub fn run_tests() -> i32 {
             act: TaskAct::Plan,
             id: String::from(id),
             text: String::new(),
-            plan: pairs.iter().map(|(a, b)| (String::from(*a), String::from(*b))).collect(),
+            expect: String::new(),
+            plan: pairs
+                .iter()
+                .map(|(a, b)| litter_wire::PlanItem {
+                    who: String::from(*a),
+                    what: String::from(*b),
+                    expect: String::new(),
+                })
+                .collect(),
         }
     }
     // Assert against the typed outcome. A test that matched on the note's
@@ -1312,6 +1363,47 @@ pub fn run_tests() -> i32 {
                 "      proceeds={} not_spammed={} sent={} requeued={} fresh={}\n",
                 proceeds, not_spammed, sent, requeued, fresh_start));
         }
+    }
+
+    // ---- the response contract reaches the worker -----------------------
+    total += 1;
+    {
+        let mut t = TaskTable::new();
+        let r = roster();
+        t.apply("root", Authority::Root,
+                &TaskOp::expecting(TaskAct::Open, String::new(),
+                                   String::from("canvass"), String::from("one paragraph")),
+                100, &r);
+        // the operator's expectation reaches the leader's plan directive
+        let (d, _) = t.tick(&r, Some("mimi"), 1_000);
+        let leader_told = d.iter().any(|o| o.to == "mimi" && o.body.contains("one paragraph"));
+
+        // the leader's per-assignment expectation reaches the worker
+        let plan = TaskOp {
+            act: TaskAct::Plan,
+            id: String::from("t1"),
+            text: String::new(),
+            expect: String::new(),
+            plan: alloc::vec![litter_wire::PlanItem {
+                who: String::from("tama"),
+                what: String::from("introduce yourself"),
+                expect: String::from("two sentences, plain text"),
+            }],
+        };
+        t.apply("mimi", Authority::Leader, &plan, 1_100, &r);
+        let (offers, _) = t.tick(&r, Some("mimi"), 1_200);
+        let worker_told = offers.iter().any(|o| {
+            o.to == "tama" && o.body.contains("two sentences, plain text")
+                && o.body.contains("do not do more work than that requires")
+        });
+
+        // ...and it is repeated in the reminder, not just the first offer
+        t.apply("tama", Authority::Peer, &op(TaskAct::Claim, "t1.1", ""), 1_300, &r);
+        let (nudge, _) = t.tick(&r, Some("mimi"), 1_400);
+        let nudge_told = nudge.iter().any(|o| o.body.contains("two sentences, plain text"));
+
+        check("the response contract reaches the worker, and is repeated",
+              leader_told && worker_told && nudge_told, &mut passed);
     }
 
     // ---- the operator is never given work ------------------------------

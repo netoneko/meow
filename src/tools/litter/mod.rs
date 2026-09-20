@@ -150,7 +150,7 @@ pub fn tool_send_message(to: &str, body: &str, round: i64) -> ToolResult {
 /// model picks a value more reliably than it picks among near-identical
 /// tool names, and a new act — `failed` was the first — costs a value
 /// rather than new surface.
-pub fn tool_task_update(task: &str, status: &str, text: &str) -> ToolResult {
+pub fn tool_task_update(task: &str, status: &str, text: &str, expect: &str) -> ToolResult {
     let from = match require_agent_name() {
         Ok(n) => n,
         Err(e) => return e,
@@ -170,7 +170,11 @@ pub fn tool_task_update(task: &str, status: &str, text: &str) -> ToolResult {
         Ok(a) => a,
         Err(e) => return e,
     };
-    hub::tool_task(&addr, &from, litter_wire::TaskOp::new(act, String::from(task), String::from(text)))
+    hub::tool_task(
+        &addr,
+        &from,
+        litter_wire::TaskOp::expecting(act, String::from(task), String::from(text), String::from(expect)),
+    )
 }
 
 /// `TaskPlan` — the leader splitting a parent into directed sub-tasks.
@@ -180,7 +184,7 @@ pub fn tool_task_update(task: &str, status: &str, text: &str) -> ToolResult {
 /// plan that arrived in pieces would leave the table unable to tell that
 /// planning had finished, and "all sub-tasks cleared" — the trigger for the
 /// final artifact — would never fire.
-pub fn tool_task_plan(task: &str, assignments: &[(String, String)]) -> ToolResult {
+pub fn tool_task_plan(task: &str, assignments: &[litter_wire::PlanItem]) -> ToolResult {
     let from = match require_agent_name() {
         Ok(n) => n,
         Err(e) => return e,
@@ -196,6 +200,7 @@ pub fn tool_task_plan(task: &str, assignments: &[(String, String)]) -> ToolResul
         act: litter_wire::TaskAct::Plan,
         id: String::from(task),
         text: alloc::string::String::new(),
+        expect: alloc::string::String::new(),
         plan: assignments.to_vec(),
     };
     hub::tool_task(&addr, &from, op)

@@ -691,11 +691,13 @@ fn run_litter_task() -> i32 {
     let mut status = String::from("open");
     let mut task = String::new();
     let mut text = String::new();
+    let mut expect = String::new();
     let mut from = String::from("root");
     let mut j = 3;
     while j < argc() {
         match arg(j) {
             Some("--status") => { j += 1; if let Some(v) = arg(j) { status = String::from(v); } }
+            Some("--expect") => { j += 1; if let Some(v) = arg(j) { expect = String::from(v); } }
             Some("--task") => { j += 1; if let Some(v) = arg(j) { task = String::from(v); } }
             Some("--text") => { j += 1; if let Some(v) = arg(j) { text = String::from(v); } }
             Some("--from") => { j += 1; if let Some(v) = arg(j) { from = String::from(v); } }
@@ -704,11 +706,11 @@ fn run_litter_task() -> i32 {
         j += 1;
     }
     if text.is_empty() && status == "open" {
-        libakuma::print("Usage: meow litter task --text \"<what to do>\" [--status open|clear|reopen|artifact] [--task tN] [--from <name>]\n");
+        libakuma::print("Usage: meow litter task --text \"<what to do>\" [--expect \"<shape of the answer>\"] [--status open|clear|reopen|artifact] [--task tN] [--from <name>]\n");
         return 1;
     }
     tools::litter::set_agent_name(from);
-    run_litter_inspect(tools::litter::tool_task_update(&task, &status, &text))
+    run_litter_inspect(tools::litter::tool_task_update(&task, &status, &text, &expect))
 }
 
 /// `meow litter observe`: print every participant's messages merged into one
