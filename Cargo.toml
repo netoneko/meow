@@ -20,7 +20,7 @@ name = "meow"
 path = "src/main.rs"
 
 [features]
-default = ["compact-tools", "litter"]
+default = ["compact-tools", "litter", "linux-net"]
 
 # Drop every per-tool `description` from the OpenAI tools schema (~930 fewer
 # tokens on every request). ON by default; disable with `--no-default-features`
