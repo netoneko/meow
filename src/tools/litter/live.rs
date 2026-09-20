@@ -41,6 +41,22 @@ use super::serve::{self, HubState};
 const TICK_SECS: u64 = 1;
 /// Pulse (Peers probe) and task-table cadence, in ticks.
 const PULSE_TICKS: u64 = 5;
+
+/// I/O budget for a **peer probe**, as opposed to a real request.
+///
+/// Half a second, against `deadline::IO_TIMEOUT_US`'s five. The probe runs in
+/// the raft thread, which is the thread that answers the hub, so this number is
+/// how long this litter goes deaf each pulse when a peer does not respond. It
+/// has to stay far below the pulse interval or two litters pointed at each
+/// other spend all their time waiting on one another instead of serving.
+const PROBE_TIMEOUT_US: u64 = 500_000;
+
+/// How many pulses to skip after a failed probe, doubling to this cap.
+///
+/// A peer that answers is probed every pulse; one that does not is probed on
+/// pulses 1, 2, 4, 8, 16 … so a dead or starved peer costs a bounded fraction of
+/// this hub's serving time instead of all of it.
+const PROBE_BACKOFF_MAX: u32 = 5;
 /// History compaction cadence, in ticks (~30s).
 const COMPACT_TICKS: u64 = 30;
 /// How many newest messages per inbox the compaction marker spares.
@@ -67,6 +83,21 @@ pub struct StaticPeer {
     /// delivered to this peer's hub. Cursor only advances on confirmed
     /// `Sent`, so an unreachable peer re-drives its batch next tick.
     pub last_relay_ts: u64,
+    /// Consecutive failed probes, capped at [`PROBE_BACKOFF_MAX`]. Only a peer
+    /// that answers resets it.
+    ///
+    /// This exists because probing costs **this hub's ability to serve**. The
+    /// probe runs in the raft thread, and the connect inside it is not bounded
+    /// by anything meow controls — an unanswered SYN sits there for Akuma's
+    /// `CONNECT_TIMEOUT_US`, ten seconds, which is longer than the pulse
+    /// interval. Two litters listing each other therefore reach a stable state
+    /// where each one's serve loop is permanently inside a connect to the other,
+    /// neither answers, and both probes keep failing: measured 2026-09-20
+    /// between `trashcan` and `ryzen`, where the hub port answered nobody at all
+    /// — not each other, not a third machine — while ssh on the same box
+    /// answered in 60 ms. Backing off a silent peer is what lets a serve window
+    /// exist for the other side's probe to land in.
+    pub probe_failures: u32,
 }
 
 pub fn parse_static_peers(spec: Option<&str>) -> Vec<StaticPeer> {
@@ -79,7 +110,7 @@ pub fn parse_static_peers(spec: Option<&str>) -> Vec<StaticPeer> {
             }
             if let Some((name, addr)) = entry.split_once('@') {
                 if litter_wire::is_valid_name(name.trim()) && addr.contains(':') {
-                    out.push(StaticPeer { name: String::from(name.trim()), addr: String::from(addr.trim()), online: false, last_relay_ts: 0 });
+                    out.push(StaticPeer { name: String::from(name.trim()), addr: String::from(addr.trim()), online: false, last_relay_ts: 0, probe_failures: 0 });
                 }
             }
         }
@@ -205,9 +236,18 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
             // by the raft thread; this is how the trashcan/laptop split
             // shows up as status changes instead of absence.
             let static_peers = parse_static_peers(super::static_peers_spec().as_deref());
-            start_raft_thread(&listener, &state, static_peers);
-            libakuma::print(&format!("[live] {} holds the hub at {} (won the bind race) — raft thread up\n", me, addr));
-            raft_log(&format!("state=leader term=1 hub={}", addr));
+            // **Not discarded.** This line used to print "raft thread up"
+            // unconditionally, so a leader with no raft thread announced itself
+            // exactly like a healthy one and the log was actively misleading
+            // while the hub answered nobody.
+            let raft_up = start_raft_thread(&listener, &state, static_peers);
+            libakuma::print(&format!(
+                "[live] {} holds the hub at {} (won the bind race) — raft thread {}\n",
+                me,
+                addr,
+                if raft_up { "up" } else { "DOWN (serving from the agent loop only)" }
+            ));
+            raft_log(&format!("state=leader term=1 hub={} raft={}", addr, if raft_up { "up" } else { "down" }));
             Machine::Leader { listener, state }
         }
         Err(_) => {
@@ -349,7 +389,25 @@ struct RaftCtx {
 
 static RAFT_CTX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Flipped by the raft thread itself, as its first act.
+///
+/// `spawn_detached` returning `true` is **not** evidence the thread runs.
+/// Measured 2026-09-20 on the Firecracker guest: it returned true, no warning
+/// printed, and `/proc/<pid>/status` said `Threads: 1` — the hub then accepted
+/// connections that nothing ever answered, and the agent loop parked in a futex
+/// on a lock the absent thread was supposed to release. The clone reporting
+/// success and the child never running are two different facts, so the parent
+/// waits for the child to say so itself. Same shape as `rt.rs`'s own
+/// `spawn_detached` test.
+static RAFT_ALIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// How long the parent waits for the child to announce itself. Generous: this
+/// runs once, at startup, and a false "it did not start" would be worse than
+/// the wait.
+const RAFT_START_TIMEOUT_MS: u64 = 2000;
+
 fn raft_entry() {
+    RAFT_ALIVE.store(true, core::sync::atomic::Ordering::Release);
     let ptr = RAFT_CTX.load(core::sync::atomic::Ordering::Acquire) as *const RaftCtx;
     if ptr.is_null() {
         return;
@@ -360,9 +418,10 @@ fn raft_entry() {
     raft_tick_loop(ctx.listener.clone(), ctx.state.clone(), &ctx.peers);
 }
 
-/// Leak the context and spawn the raft thread. Returns false when the
-/// spawn failed (the caller keeps running as leader with its own drain —
-/// degraded, not dead).
+/// Leak the context and spawn the raft thread. Returns false when the thread is
+/// not **running** — which is a stronger claim than "the clone succeeded", and
+/// deliberately so (see [`RAFT_ALIVE`]). The caller keeps running as leader
+/// with its own drain — degraded, not dead.
 fn start_raft_thread(listener: &Arc<TcpListener>, state: &Arc<PMutex<HubState>>, static_peers: Vec<StaticPeer>) -> bool {
     let ctx: &'static RaftCtx = Box::leak(Box::new(RaftCtx {
         listener: listener.clone(),
@@ -371,6 +430,26 @@ fn start_raft_thread(listener: &Arc<TcpListener>, state: &Arc<PMutex<HubState>>,
     }));
     RAFT_CTX.store(ctx as *const RaftCtx as u64, core::sync::atomic::Ordering::Release);
     let spawned = unsafe { crate::rt::spawn_detached(raft_entry) };
+    // Wait for the child to say it is running, rather than trusting the clone's
+    // return value.
+    let mut alive = false;
+    if spawned {
+        let mut waited = 0;
+        while waited < RAFT_START_TIMEOUT_MS {
+            if RAFT_ALIVE.load(core::sync::atomic::Ordering::Acquire) {
+                alive = true;
+                break;
+            }
+            libakuma::sleep_ms(20);
+            waited += 20;
+        }
+        if !alive {
+            libakuma::print(
+                "[live] WARNING: raft thread was created but never ran - this agent cannot serve the hub\n",
+            );
+            raft_log("raft thread created but never ran");
+        }
+    }
     if !spawned {
         // Loud, because everything downstream assumes this thread exists:
         // the hub is served from here, not from the agent loop, and an
@@ -379,7 +458,7 @@ fn start_raft_thread(listener: &Arc<TcpListener>, state: &Arc<PMutex<HubState>>,
         libakuma::print("[live] WARNING: raft thread failed to spawn - this agent cannot serve the hub\n");
         raft_log("raft thread spawn FAILED");
     }
-    spawned
+    alive
 }
 
 fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, static_peers: &PMutex<Vec<StaticPeer>>) {
@@ -396,9 +475,18 @@ fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, stat
         // do with the LLM; it appears the moment a peer is configured.
         let pulse = tick % PULSE_TICKS == 0;
         let probe_results = if pulse {
+            // Only the peers due this pulse. A peer that answered is due every
+            // time; a silent one is due on a doubling schedule, because probing
+            // it is paid for out of this hub's own serving time (see
+            // `StaticPeer::probe_failures`).
+            let pulse_no = tick / PULSE_TICKS;
             let targets: Vec<(String, String)> = static_peers
                 .lock()
                 .iter()
+                .filter(|p| {
+                    let every = 1u64 << p.probe_failures.min(PROBE_BACKOFF_MAX);
+                    pulse_no.is_multiple_of(every)
+                })
                 .map(|p| (p.name.clone(), p.addr.clone()))
                 .collect();
             probe_peers_io(&targets)
@@ -551,8 +639,14 @@ fn probe_peers_io(targets: &[(String, String)]) -> Vec<(String, String, bool)> {
     for (name, addr) in targets {
         // `hub::peers` targets `hub_addr()`, so for a remote peer issue the
         // request directly through a one-shot connect on its address.
+        //
+        // **On a probe budget, not a request budget** — see
+        // `hub::call_addr_timeout`. This call is inline in the thread that
+        // serves the hub, so its timeout is how long this litter stops
+        // answering; at the request budget two litters that list each other
+        // starve each other's serve loops indefinitely.
         let reachable = matches!(
-            super::hub::call_addr(addr, &Request::Peers { since: 0 }),
+            super::hub::call_addr_timeout(addr, &Request::Peers { since: 0 }, PROBE_TIMEOUT_US),
             Ok(Response::Peers { .. })
         );
         out.push((name.clone(), addr.clone(), reachable));
@@ -569,6 +663,13 @@ fn probe_peers_io(targets: &[(String, String)]) -> Vec<(String, String, bool)> {
 fn apply_probe_results(st: &mut HubState, peers: &mut [StaticPeer], results: &[(String, String, bool)]) {
     for (_, addr, reachable) in results {
         let Some(peer) = peers.iter_mut().find(|p| &p.addr == addr) else { continue };
+        // Backoff bookkeeping first: an answer clears it outright, silence
+        // doubles the interval up to the cap.
+        if *reachable {
+            peer.probe_failures = 0;
+        } else {
+            peer.probe_failures = peer.probe_failures.saturating_add(1).min(PROBE_BACKOFF_MAX);
+        }
         if *reachable && !peer.online {
             peer.online = true;
             st.event(format!("[event] static peer {} discovered at {}", peer.name, peer.addr));

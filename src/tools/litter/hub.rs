@@ -88,17 +88,38 @@ fn call(addr: &str, req: &Request) -> Result<Response, String> {
 /// forever, so the tick loop stays alive long enough to go WAYWARD and
 /// re-elect (docs/LITTER_STATE_MACHINE.md).
 pub fn call_addr(addr: &str, req: &Request) -> Result<Response, String> {
+    call_addr_timeout(addr, req, super::serve::deadline::IO_TIMEOUT_US)
+}
+
+/// [`call_addr`] with an explicit I/O budget.
+///
+/// Exists for the **peer probe**, which must not spend a request-sized budget.
+/// The probe runs inline in the raft thread — the same thread that runs
+/// `serve::drain` — so every microsecond it waits is a microsecond this hub is
+/// not answering anybody. At the shared `IO_TIMEOUT_US` (5 s) that is fatal in
+/// the exact configuration the relay exists for: two litters listing each other
+/// as static peers. Each side's serve thread parks in a probe of the other,
+/// neither answers, both probes time out, and both hubs report `went silent
+/// before answering` forever. Measured 2026-09-20 between `trashcan` and
+/// `ryzen`; it is not a deadlock (the state lock is not held — that was fixed
+/// earlier) but a mutual starvation of the serving threads, and it survives
+/// every restart because it is symmetric.
+///
+/// A probe answers one question — "is that hub alive?" — so it gets
+/// [`PROBE_TIMEOUT_US`] instead, and a hub that cannot answer a `Peers` frame in
+/// half a second is, for the purpose of that question, not alive.
+pub fn call_addr_timeout(addr: &str, req: &Request, timeout_us: u64) -> Result<Response, String> {
     let stream = TcpStream::connect(addr).map_err(|e| format!("hub connect to '{}' failed: {:?}", addr, e.kind()))?;
     let _ = libakuma::set_nonblocking(stream.as_raw_fd(), true);
 
     let payload = encode_request(req);
     let framed = super::serve::deadline::frame(&payload);
-    if !super::serve::deadline::write_all(&stream, &framed, super::serve::deadline::IO_TIMEOUT_US) {
+    if !super::serve::deadline::write_all(&stream, &framed, timeout_us) {
         return Err(format!("hub at '{}' did not accept the request in time", addr));
     }
 
     let mut header = [0u8; 4];
-    if !super::serve::deadline::read_exact(&stream, &mut header, super::serve::deadline::IO_TIMEOUT_US) {
+    if !super::serve::deadline::read_exact(&stream, &mut header, timeout_us) {
         return Err(format!("hub at '{}' went silent before answering", addr));
     }
     let len = decode_len_header(header);
@@ -107,7 +128,7 @@ pub fn call_addr(addr: &str, req: &Request) -> Result<Response, String> {
     }
 
     let mut body = alloc::vec![0u8; len as usize];
-    if !super::serve::deadline::read_exact(&stream, &mut body, super::serve::deadline::IO_TIMEOUT_US) {
+    if !super::serve::deadline::read_exact(&stream, &mut body, timeout_us) {
         return Err(format!("hub at '{}' went silent mid-answer", addr));
     }
     let text = core::str::from_utf8(&body).map_err(|_| String::from("hub response is not valid UTF-8"))?;
