@@ -39,7 +39,7 @@ use litter_wire::{
     Message, Request, Response, MAX_FRAME_LEN,
 };
 
-use super::tasks::TableEvent;
+use super::tasks::{Authority, OutKind};
 
 pub use super::membership::{GROUP_NAME, KEEP_RECENT};
 pub use super::relay::{RelayEntry, Seen};
@@ -93,9 +93,12 @@ impl HubState {
         st
     }
 
-    /// The bind-race winner announces itself.
+    /// The bind-race winner announces itself — and is queued a wake-up, so
+    /// that taking the socket is also an instruction to take stock of the
+    /// litter's outstanding work (`TaskTable::note_new_leader`).
     pub fn set_leader(&mut self, name: &str, new_term: u64) {
         self.record.set_leader(name, new_term);
+        self.record.tasks.note_new_leader(name);
     }
 
     /// Append one cluster event. Kept on the façade because callers
@@ -232,28 +235,11 @@ impl HubState {
                     }
                 }
 
-                // Task-table hooks. Only the operator (root) or the leader
-                // may OPEN tracked work — otherwise every peer chat that
-                // starts with "[task]" mints work for the whole litter
-                // (observed live: an agent tasking the litter to police the
-                // kernel). Any holder may still close their own.
-                let can_open = matches!(msg.role, litter_wire::SenderRole::Root | litter_wire::SenderRole::Leader);
-                match self.record.tasks.note_message(&msg.from, &msg.body, msg.ts, can_open) {
-                    TableEvent::Done(event_text, summary) => {
-                        self.record.event(event_text);
-                        // Completion knowledge belongs in history: a short
-                        // system line under the group name.
-                        let ts = self.members.stamp(now);
-                        let done_line = Message {
-                            kind: litter_wire::MessageKind::Done,
-                            role: litter_wire::SenderRole::Leader,
-                            ..Message::chat(String::from(GROUP_NAME), msg.round, format!("[done] {}", summary), ts)
-                        };
-                        self.members.broadcast(&done_line);
-                    }
-                    TableEvent::Noted => {}
-                    TableEvent::Requeued => {}
-                }
+                // Task traffic no longer rides chat bodies: it is its own
+                // record (`Request::Task`). A message beginning "[task]" is
+                // now just a message, which is the point — authority and
+                // arguments are checked on a typed call, not scraped out of
+                // prose an LLM wrote.
 
                 if to == GROUP_NAME {
                     let echo = Message::chat(msg.from.clone(), msg.round, msg.body.clone(), msg.ts);
@@ -275,6 +261,30 @@ impl HubState {
                 }
                 Response::Inbox { messages: self.members.history(&name, before, limit as usize) }
             }
+            Request::Task { from, op } => {
+                if !is_valid_name(&from) {
+                    return Response::Error { message: String::from("'from' must be a plain agent name") };
+                }
+                // Authority is the hub's call, from the socket it owns —
+                // never a claim in the record. (It is still derived from
+                // `from`, which a sender chooses; recovering it from a
+                // signature instead is `LITTER_WORKFLOW.md` § Future work.)
+                let authority = if self.record.is_leader(&from) {
+                    Authority::Leader
+                } else if from == "root" {
+                    Authority::Root
+                } else {
+                    Authority::Peer
+                };
+                let roster = self.members.roster().to_vec();
+                let (outbound, events, note) =
+                    self.record.tasks.apply(&from, authority, &op, now, &roster);
+                for e in events {
+                    self.record.event(e);
+                }
+                self.dispatch(outbound, now);
+                Response::Task { note }
+            }
             Request::Peers { since } => Response::Peers {
                 names: self.members.roster().to_vec(),
                 term: self.record.term,
@@ -285,6 +295,34 @@ impl HubState {
         }
     }
 
+    /// Deliver whatever the task table produced. The table names a
+    /// recipient and a kind and knows nothing about mailboxes; this turns
+    /// that into delivered messages.
+    ///
+    /// The kind is load-bearing: `Assignment` is wakeable and `Done` is
+    /// not (`live::wakeable`), so offers and directives rouse their
+    /// recipient while a closing artifact does not rouse the whole litter
+    /// into another round of turns about it.
+    fn dispatch(&mut self, outbound: Vec<super::tasks::Outbound>, now: u64) {
+        for item in outbound {
+            let kind = match item.kind {
+                OutKind::Assignment => litter_wire::MessageKind::Assignment,
+                OutKind::Done => litter_wire::MessageKind::Done,
+            };
+            let ts = self.members.stamp(now);
+            let msg = Message {
+                kind,
+                role: litter_wire::SenderRole::Leader,
+                ..Message::chat(String::from(GROUP_NAME), 0, item.body, ts)
+            };
+            if item.to == GROUP_NAME {
+                self.members.broadcast(&msg);
+            } else if self.members.contains(&item.to) {
+                self.members.deliver(&item.to, msg);
+            }
+        }
+    }
+
     /// One coordinator tick over the task table: requeue expired leases,
     /// assign unassigned tasks, deliver the resulting assignment messages,
     /// and log the events. Cheap; called every few ticks by the raft
@@ -292,21 +330,12 @@ impl HubState {
     pub fn task_tick(&mut self) {
         let now = Self::now_us();
         let roster = self.members.roster().to_vec();
-        let (messages, events) = self.record.tasks.tick(&roster, now);
-        for (to, body) in messages {
-            if !self.members.contains(&to) {
-                continue;
-            }
-            let ts = self.members.stamp(now);
-            self.members.deliver(&to, Message {
-                kind: litter_wire::MessageKind::Assignment,
-                role: litter_wire::SenderRole::Leader,
-                ..Message::chat(String::from(GROUP_NAME), 0, body, ts)
-            });
-        }
+        let leader = self.record.leader.clone();
+        let (outbound, events) = self.record.tasks.tick(&roster, leader.as_deref(), now);
         for e in events {
             self.record.event(e);
         }
+        self.dispatch(outbound, now);
     }
 
     /// Fold inbox history into one marker per inbox, carrying the open
@@ -567,24 +596,79 @@ pub fn run_tests() -> i32 {
         super::sig::set_our_key(None);
     }
 
-    // task hooks: [task] seeds the table, coordinator tick assigns and
-    // delivers, [done: tN] closes and logs an event
+    // Task records drive the table through the hub: Open seeds it, the
+    // coordinator tick offers the sub-task to its NAMED assignee, and the
+    // lifecycle closes with an artifact. The unit-level transitions are
+    // `tasks::run_tests`; what this proves is the wiring — authority
+    // stamped from the socket, outbound dispatched into real inboxes, and
+    // events reaching the pulse.
     total += 1;
     {
-        let mut hub = HubState::new();
-        hub.handle(Request::Join { name: String::from("sherlock") });
-        hub.handle(Request::send(String::from("root"), String::from(GROUP_NAME), String::from("[task] audit main.rs"), 0));
+        let mut hub = HubState::new_seeded("sherlock", 1);
+        hub.handle(Request::Join { name: String::from("tiger") });
+
+        let task = |from: &str, act: litter_wire::TaskAct, id: &str, text: &str| Request::Task {
+            from: String::from(from),
+            op: litter_wire::TaskOp::new(act, String::from(id), String::from(text)),
+        };
+
+        hub.handle(task("root", litter_wire::TaskAct::Open, "", "audit main.rs"));
+        // Only the leader may plan, and sherlock holds the socket here.
+        hub.handle(Request::Task {
+            from: String::from("sherlock"),
+            op: litter_wire::TaskOp {
+                act: litter_wire::TaskAct::Plan,
+                id: String::from("t1"),
+                text: String::new(),
+                plan: alloc::vec![(String::from("tiger"), String::from("read main.rs"))],
+            },
+        });
         hub.task_tick();
-        let inbox = hub.handle(Request::Inbox { name: String::from("sherlock") });
-        let msgs = match inbox { Response::Inbox { messages } => messages, _ => Vec::new() };
-        let got_assignment = msgs.iter().any(|m| m.body.starts_with("[assigned: t1]") && m.body.contains("audit main.rs"));
-        let done = hub.handle(Request::send(String::from("sherlock"), String::from(GROUP_NAME), String::from("[done: t1] all clear"), 0));
+
+        let msgs = match hub.handle(Request::Inbox { name: String::from("tiger") }) {
+            Response::Inbox { messages } => messages,
+            _ => Vec::new(),
+        };
+        // The offer must be an Assignment: `live::wakeable` ignores Done, so
+        // an offer delivered with the wrong kind never wakes anyone.
+        let got_offer = msgs.iter().any(|m| {
+            m.body.starts_with("[assigned: t1.1]")
+                && m.body.contains("read main.rs")
+                && m.kind == litter_wire::MessageKind::Assignment
+        });
+
+        // A peer cannot clear its own work; the leader can.
+        hub.handle(task("tiger", litter_wire::TaskAct::Claim, "t1.1", ""));
+        hub.handle(task("tiger", litter_wire::TaskAct::Done, "t1.1", "all clear"));
+        let peer_clear = hub.handle(task("tiger", litter_wire::TaskAct::Clear, "t1.1", ""));
+        let peer_refused = matches!(&peer_clear, Response::Task { note } if note.starts_with("refused"));
+
+        hub.handle(task("sherlock", litter_wire::TaskAct::Clear, "t1.1", ""));
+        let closed = hub.handle(task("sherlock", litter_wire::TaskAct::Artifact, "t1", "FINAL: fine"));
+        let closed_ok = matches!(&closed, Response::Task { note } if note.contains("closed"));
+
         let peers = hub.handle(Request::Peers { since: 0 });
-        let done_ok = matches!(done, Response::Sent { .. })
-            && matches!(&peers, Response::Peers { events, .. } if events.iter().any(|e| e.contains("t1 done by sherlock")))
-            && hub.record.tasks.is_empty();
-        if got_assignment && done_ok { passed += 1; }
-        else { libakuma::print(&format!("  [!] task hooks: got_assignment={} done_ok={}\n", got_assignment, done_ok)); }
+        let events_ok = matches!(&peers, Response::Peers { events, .. }
+            if events.iter().any(|e| e.contains("t1.1 cleared by sherlock"))
+                && events.iter().any(|e| e.contains("closed by sherlock")));
+
+        // The artifact is broadcast to the litter as history, not as a wake.
+        let tiger = match hub.handle(Request::Inbox { name: String::from("tiger") }) {
+            Response::Inbox { messages } => messages,
+            _ => Vec::new(),
+        };
+        let artifact_ok = tiger.iter().any(|m| {
+            m.body.contains("[artifact: t1]") && m.kind == litter_wire::MessageKind::Done
+        });
+
+        if got_offer && peer_refused && closed_ok && events_ok && artifact_ok && hub.record.tasks.is_empty() {
+            passed += 1;
+        } else {
+            libakuma::print(&format!(
+                "  [!] task records: offer={} peer_refused={} closed={} events={} artifact={}\n",
+                got_offer, peer_refused, closed_ok, events_ok, artifact_ok
+            ));
+        }
     }
 
     libakuma::print(&format!("  result: {}/{}\n", passed, total));

@@ -50,11 +50,15 @@ pub use nojson::JsonParseError;
 /// not a field added, since every decode here already ignores unknown keys).
 /// v2: `Peers` became the pulse (event-bearing, cursor-aware) and `History`
 /// added paged reads.
+/// v4: `Task` — task lifecycle stopped travelling as bracket-prefixed chat
+/// bodies and became its own request with a typed act. A v3 hub would
+/// silently treat a v4 task record as an unknown op, so this is a real
+/// break rather than an additive field.
 /// v3: `Message` grew the relay envelope — `ol`/`ot`/`sig` (origin litter /
 /// origin ts / origin signature) and `rl`/`rs` (relayer litter / relayer
 /// signature). A v2 peer refuses a v3 client outright, so both sides of a
 /// relay link must run v3; plain same-litter traffic is shape-identical.
-pub const PROTOCOL_VERSION: i64 = 3;
+pub const PROTOCOL_VERSION: i64 = 4;
 
 /// Sanity cap on a single frame's declared length, checked against the 4-byte
 /// header before a caller allocates a buffer for it — generous enough for a
@@ -309,6 +313,15 @@ pub enum Request {
     /// with `ts < before`, newest first, at most `limit` of them. The agent
     /// pages back until a batch contains the `"[compacted: …]"` marker.
     History { name: String, before: u64, limit: u32 },
+    /// A task-lifecycle record: the typed replacement for the bracket
+    /// prefixes task traffic used to travel as (`[task]`, `[done: tN]`).
+    ///
+    /// It is a **record**, not chat: it is applied to the task state
+    /// machine, and what it produces — assignments, directives, events —
+    /// is fanned out by the hub. `from` is the claimed sender; authority
+    /// is decided hub-side against it, and should eventually be recovered
+    /// from a signature instead (see `LITTER_WORKFLOW.md` § Future work).
+    Task { from: String, op: TaskOp },
 }
 
 impl Request {
@@ -379,7 +392,111 @@ impl DisplayJson for Request {
                 f.member("before", *before)?;
                 f.member("limit", *limit)
             }),
+            Request::Task { from, op } => f.object(|f| {
+                f.member("v", PROTOCOL_VERSION)?;
+                f.member("op", "task")?;
+                f.member("from", from)?;
+                f.member("act", op.act.as_str())?;
+                f.member("id", &op.id)?;
+                f.member("text", &op.text)?;
+                if !op.plan.is_empty() {
+                    f.member("plan", nojson::json(|f| {
+                        f.array(|f| {
+                            for (who, what) in &op.plan {
+                                f.element(nojson::json(|f| {
+                                    f.object(|f| {
+                                        f.member("who", who)?;
+                                        f.member("what", what)
+                                    })
+                                }))?;
+                            }
+                            Ok(())
+                        })
+                    }))?;
+                }
+                Ok(())
+            }),
         }
+    }
+}
+
+/// What a task record does. One act per record, and the act is the whole
+/// vocabulary of the workflow (`docs/LITTER_WORKFLOW.md`).
+///
+/// `Failed` is deliberately a sibling of `Done` rather than a flavour of
+/// it: a sub-task that cannot be completed must be distinguishable from
+/// one still being worked on, and without its own act the only way to say
+/// so is prose in a result nobody parses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskAct {
+    /// Open a parent task. `text` is the brief; `id` is unused.
+    Open,
+    /// Atomically create every sub-task of a parent. `id` is the parent,
+    /// `plan` the (assignee, brief) pairs. One record, because partial
+    /// planning would make "all sub-tasks cleared" undecidable.
+    Plan,
+    /// Take an offered sub-task. `id` is the sub-task.
+    Claim,
+    /// Submit a result for a claimed sub-task. `text` is the finding.
+    Done,
+    /// Give a sub-task back unfinished. `text` is why.
+    Failed,
+    /// Leader accepts a submitted result.
+    Clear,
+    /// Leader rejects a submitted result. `text` is what is missing.
+    Reopen,
+    /// Leader closes a parent with the synthesized answer. `text` is it.
+    Artifact,
+}
+
+impl TaskAct {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskAct::Open => "open",
+            TaskAct::Plan => "plan",
+            TaskAct::Claim => "claim",
+            TaskAct::Done => "done",
+            TaskAct::Failed => "failed",
+            TaskAct::Clear => "clear",
+            TaskAct::Reopen => "reopen",
+            TaskAct::Artifact => "artifact",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "open" => TaskAct::Open,
+            "plan" => TaskAct::Plan,
+            "claim" => TaskAct::Claim,
+            // "submit" is accepted as a spelling of done: it is the word the
+            // workflow diagrams use, and a model that reads them will reach
+            // for it.
+            "done" | "submit" => TaskAct::Done,
+            "failed" | "fail" => TaskAct::Failed,
+            "clear" => TaskAct::Clear,
+            "reopen" => TaskAct::Reopen,
+            "artifact" => TaskAct::Artifact,
+            _ => return None,
+        })
+    }
+}
+
+/// One task record. Flat on the wire (`act`/`id`/`text`/`plan`) rather than
+/// a variant per act: the acts share almost all their fields, and a flat
+/// shape is one decode path instead of eight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskOp {
+    pub act: TaskAct,
+    /// `"t1"` for a parent, `"t1.2"` for a sub-task, empty for `Open`.
+    pub id: String,
+    pub text: String,
+    /// `Plan` only: (assignee, brief) per sub-task.
+    pub plan: Vec<(String, String)>,
+}
+
+impl TaskOp {
+    pub fn new(act: TaskAct, id: String, text: String) -> Self {
+        Self { act, id, text, plan: Vec::new() }
     }
 }
 
@@ -393,6 +510,10 @@ pub enum Response {
     /// the caller's `since` cursor — elections, joins, leaves, task
     /// requeues. Consumed at tick level, surfaced to the model as context.
     Peers { names: Vec<String>, term: u64, leader: Option<String>, epoch: u64, events: Vec<String> },
+    /// A task record was applied. `note` is what the state machine did —
+    /// surfaced straight back to the model, because "refused: not the
+    /// assignee" is the only way it learns it guessed wrong.
+    Task { note: String },
     Error { message: String },
 }
 
@@ -430,6 +551,12 @@ impl DisplayJson for Response {
                 }
                 f.member("epoch", *epoch)?;
                 f.member("events", events)
+            }),
+            Response::Task { note } => f.object(|f| {
+                f.member("v", PROTOCOL_VERSION)?;
+                f.member("ok", true)?;
+                f.member("op", "task")?;
+                f.member("note", note)
             }),
             Response::Error { message } => f.object(|f| {
                 f.member("v", PROTOCOL_VERSION)?;
@@ -510,6 +637,27 @@ pub fn decode_request(json: &str) -> Result<Request, WireError> {
             let limit: Option<u32> = value.to_member("limit")?.try_into()?;
             Ok(Request::History { name, before: before.unwrap_or(0), limit: limit.unwrap_or(32) })
         }
+        "task" => {
+            let from: String = value.to_member("from")?.required()?.try_into()?;
+            let act: String = value.to_member("act")?.required()?.try_into()?;
+            let Some(act) = TaskAct::parse(&act) else {
+                return Err(value.invalid("unknown task 'act'").into());
+            };
+            let id: Option<String> = value.to_member("id")?.try_into()?;
+            let text: Option<String> = value.to_member("text")?.try_into()?;
+            let mut plan: Vec<(String, String)> = Vec::new();
+            if let Some(arr) = value.to_member("plan")?.get() {
+                for entry in arr.to_array()? {
+                    let who: String = entry.to_member("who")?.required()?.try_into()?;
+                    let what: String = entry.to_member("what")?.required()?.try_into()?;
+                    plan.push((who, what));
+                }
+            }
+            Ok(Request::Task {
+                from,
+                op: TaskOp { act, id: id.unwrap_or_default(), text: text.unwrap_or_default(), plan },
+            })
+        }
         _ => Err(value.invalid("unknown 'op'").into()),
     }
 }
@@ -532,6 +680,10 @@ pub fn decode_response(json: &str) -> Result<Response, WireError> {
     let op: String = value.to_member("op")?.required()?.try_into()?;
     match op.as_str() {
         "joined" => Ok(Response::Joined),
+        "task" => {
+            let note: Option<String> = value.to_member("note")?.try_into()?;
+            Ok(Response::Task { note: note.unwrap_or_default() })
+        }
         "sent" => {
             let bytes: usize = value.to_member("bytes")?.required()?.try_into()?;
             Ok(Response::Sent { bytes })
@@ -674,7 +826,7 @@ mod tests {
 
     #[test]
     fn decode_request_rejects_unknown_op() {
-        let json = "{\"v\":3,\"op\":\"deploy_confetti\"}";
+        let json = "{\"v\":4,\"op\":\"deploy_confetti\"}";
         assert!(matches!(decode_request(json), Err(WireError::Parse(_))));
     }
 
@@ -724,7 +876,7 @@ mod tests {
         let r = Request::History { name: String::from("ressler"), before: 999, limit: 16 };
         assert_eq!(decode_request(&encode_request(&r)).expect("decode"), r);
 
-        let bare = decode_request("{\"v\":3,\"op\":\"history\",\"name\":\"ressler\"}").expect("decode");
+        let bare = decode_request("{\"v\":4,\"op\":\"history\",\"name\":\"ressler\"}").expect("decode");
         assert_eq!(bare, Request::History { name: String::from("ressler"), before: 0, limit: 32 });
     }
 
@@ -732,7 +884,7 @@ mod tests {
     fn peers_request_carries_event_cursor() {
         let r = Request::Peers { since: 42 };
         assert_eq!(decode_request(&encode_request(&r)).expect("decode"), r);
-        let bare = decode_request("{\"v\":3,\"op\":\"peers\"}").expect("decode");
+        let bare = decode_request("{\"v\":4,\"op\":\"peers\"}").expect("decode");
         assert_eq!(bare, Request::Peers { since: 0 });
     }
 
@@ -753,8 +905,12 @@ mod tests {
 
     #[test]
     fn decode_response_rejects_wrong_version() {
-        let json = "{\"v\":4,\"ok\":true,\"op\":\"peers\",\"names\":[]}";
-        assert!(matches!(decode_response(json), Err(WireError::UnsupportedVersion(4))));
+        // Built from PROTOCOL_VERSION rather than a literal: this test had
+        // to be edited on every bump, which is exactly the moment it is
+        // most load-bearing and least worth hand-editing.
+        let bad = PROTOCOL_VERSION + 1;
+        let json = alloc::format!("{{\"v\":{},\"ok\":true,\"op\":\"peers\",\"names\":[]}}", bad);
+        assert!(matches!(decode_response(&json), Err(WireError::UnsupportedVersion(v)) if v == bad));
     }
 
     #[test]

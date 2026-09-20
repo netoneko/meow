@@ -1,274 +1,1101 @@
-//! The litter's task table — in-memory, coordinator-owned (see
-//! `docs/LITTER_STATE_MACHINE.md`). Tasks enter as ordinary messages whose
-//! body starts with `[task]` (operator or peer — the table doesn't care);
-//! completion is a `[done: <id>]` reply from the assigned holder. The
-//! coordinator's tick assigns pending tasks round-robin across the roster
-//! with a lease (`holder`/`until`), requeues expired leases, and turns
-//! completions into cluster events. Everything here is a pure state
-//! transition so the whole table is unit-testable with no socket and no
-//! clock — `now` is always a parameter.
+//! The litter's task table — the **parent → directed sub-task → claim →
+//! submit → clear → artifact** lifecycle of `docs/LITTER_WORKFLOW.md`,
+//! coordinator-owned and in memory (see `docs/LITTER_STATE_MACHINE.md`).
+//!
+//! Task traffic arrives as ordinary messages whose body starts with a
+//! bracketed verb; that doc's "Implementation" section is the table of
+//! spellings and is the design of record. Authority (`Authority`) is what
+//! the HUB stamped on the sender, never a string the body claims: "only the
+//! leader may clear" is enforced against whoever owns the socket.
+//!
+//! Everything here is a pure state transition — `now_us` is always a
+//! parameter, there is no clock, no socket and no interior mutability — so
+//! the whole lifecycle is unit-testable with neither thread and the table
+//! adds **no synchronization of its own**. It runs inside the one
+//! `PMutex<HubState>` that already exists, and (unlike the code that used to
+//! serve requests) nothing it does can block.
 //!
 //! Deliberately NOT persisted: the table is leader memory. If the leader
-//! dies mid-queue, unfinished tasks are re-posted by whoever remembers
-//! them; continuity of *knowledge* is the protocol history's job (the
-//! compaction marker carries the folded `[done]` summaries).
+//! dies mid-flight, unfinished work is re-posted by whoever remembers it;
+//! continuity of *knowledge* is the protocol history's job — compaction
+//! folds the open sub-task list into the marker (`open_subtask_lines`).
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-/// How long an assignment may go without a `[done: <id>]` reply. Generous
-/// on purpose (an LLM turn can take minutes): an expired lease just means
-/// the task is re-offered — assume good will, accept duplicate work on the
-/// margin.
+use litter_wire::{TaskAct, TaskOp};
+
+/// How long an *offer* stands before it is made again. An assignee that is
+/// mid-turn on something else, or has just died, should not hold a
+/// sub-task hostage — but an LLM turn is minutes, so this is not short.
+pub const CLAIM_WINDOW_US: u64 = 180 * 1_000_000;
+
+/// How long a *claimed* sub-task may go without a submission. Generous on
+/// purpose: an expired lease just means the work is re-offered — assume
+/// good will, accept duplicate work on the margin.
 pub const LEASE_US: u64 = 900 * 1_000_000;
 
+/// How often an outstanding leader directive is repeated. Directives are
+/// nagged rather than sent once because a single dropped message would
+/// otherwise stall a parent task forever.
+pub const NAG_US: u64 = 120 * 1_000_000;
+
+/// The sender's authority, as the hub stamped it at delivery.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Authority {
+    /// The operator. Outranks everyone, including the leader.
+    Root,
+    /// Whoever currently owns the hub socket.
+    Leader,
+    /// Every other agent.
+    Peer,
+}
+
+impl Authority {
+    fn may_open_parent(self) -> bool {
+        matches!(self, Authority::Root | Authority::Leader)
+    }
+    fn is_leader(self) -> bool {
+        matches!(self, Authority::Leader)
+    }
+}
+
+/// Sub-task status, straight out of the workflow diagrams.
+impl SubState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubState::Pending => "pending",
+            SubState::InProgress => "in progress",
+            SubState::AwaitingClearance => "awaiting clearance",
+            SubState::Cleared => "cleared",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SubState {
+    /// Created (or requeued), waiting for its assignee to claim it.
+    Pending,
+    /// Claimed, lease running.
+    InProgress,
+    /// Result submitted; the leader has not verified it yet.
+    AwaitingClearance,
+    /// Leader verified it. Counts toward the parent's artifact.
+    Cleared,
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct Task {
-    pub id: u64,
-    pub holder: Option<String>,
-    /// Lease expiry (µs since the epoch); 0 = unassigned.
+pub struct SubTask {
+    pub parent: u64,
+    pub n: u64,
+    /// The agent this was **directed** to. Not a queue: sub-tasks are
+    /// assigned by name in the leader's plan.
+    pub assignee: String,
+    pub state: SubState,
+    /// `Pending`: when the standing offer lapses and is made again.
+    /// `InProgress`: lease expiry. Unused in the terminal states.
     pub until: u64,
     pub body: String,
+    pub result: String,
 }
 
-impl Task {
-    pub fn is_leased(&self, now_us: u64) -> bool {
-        self.holder.is_some() && self.until > now_us
+impl SubTask {
+    pub fn label(&self) -> String {
+        format!("t{}.{}", self.parent, self.n)
     }
 
-    /// The message an agent receives when this task is assigned to it.
-    pub fn assignment_message(&self) -> String {
+    /// What the assignee is sent when this sub-task is offered. It names
+    /// the exact tool call to make, because a small model will not infer it
+    /// from a design document — and a task that is never claimed is
+    /// indistinguishable from an agent that never woke.
+    pub fn offer_message(&self) -> String {
         format!(
-            "[assigned: t{}] {}\
-             \nReply with a message starting `[done: t{}]` when finished.",
-            self.id, self.body, self.id
+            "[assigned: {label}] {body}\
+             \n\nTake it with TaskUpdate(task=\"{label}\", status=\"claim\"). \
+             When you have an answer, report it with \
+             TaskUpdate(task=\"{label}\", status=\"done\", text=\"<your findings>\"). \
+             If you cannot do it, say so with status=\"failed\" and why.",
+            label = self.label(),
+            body = self.body
         )
     }
+
+    fn is_open(&self) -> bool {
+        matches!(self.state, SubState::Pending | SubState::InProgress)
+    }
 }
 
-/// One cluster event worth telling every agent about, plus the table's
-/// own bookkeeping. `TaskEvent`s are appended to the hub's event log by
-/// the caller (they belong to the shared feed, not to this table).
 #[derive(Debug, Clone, PartialEq)]
-pub enum TableEvent {
-    /// "[event] task t3 assigned to sherlock"
-    Noted,
-    /// "[event] task t3 requeued (lease expired)"
-    Requeued,
-    /// ("[event] task t3 done by hercules: <summary>", summary)
-    Done(String, String),
+pub struct Parent {
+    pub id: u64,
+    pub body: String,
+    /// Set by a `[plan: tN]`, which is atomic — see `note_message`.
+    pub planned: bool,
+    pub closed: bool,
+    pub artifact: String,
+    /// When the last leader directive for this parent went out.
+    nagged: u64,
 }
+
+impl Parent {
+    pub fn label(&self) -> String {
+        format!("t{}", self.id)
+    }
+}
+
+/// A message the table wants delivered. `to` may be [`GROUP`], meaning
+/// every roster member.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Outbound {
+    pub to: String,
+    pub body: String,
+    pub kind: OutKind,
+}
+
+/// Which message kind the hub should stamp on an [`Outbound`].
+///
+/// The distinction is not cosmetic: `Assignment` is **wakeable** and
+/// `Done` is not (`live::wakeable`). Directives and offers must wake their
+/// recipient or nothing happens; the final artifact must NOT wake the whole
+/// litter, or closing a parent task immediately starts another round of
+/// turns about it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OutKind {
+    Assignment,
+    Done,
+}
+
+/// The reserved broadcast name, mirroring `serve::GROUP_NAME`. Repeated
+/// rather than imported so this module keeps depending on nothing.
+pub const GROUP: &str = "litter";
 
 pub struct TaskTable {
-    next_id: u64,
-    tasks: Vec<Task>,
+    next_parent: u64,
+    parents: Vec<Parent>,
+    subs: Vec<SubTask>,
+    /// A leader that has just taken the socket and has not yet been told
+    /// to take stock. Consumed by the first `tick`.
+    ///
+    /// It is a flag rather than a message delivered at election time
+    /// because of *when* election happens: the binder seeds its state
+    /// before the agent loop takes its inbox baseline, so anything
+    /// delivered during `set_leader` is counted as history-it-has-seen and
+    /// never wakes anybody. Emitting it from the tick puts it after the
+    /// baseline, where it is new mail.
+    leader_wake: Option<String>,
 }
 
 impl TaskTable {
     pub fn new() -> Self {
-        Self { next_id: 1, tasks: Vec::new() }
+        Self { next_parent: 1, parents: Vec::new(), subs: Vec::new(), leader_wake: None }
     }
 
-    pub fn tasks(&self) -> &[Task] {
-        &self.tasks
+    pub fn parents(&self) -> &[Parent] {
+        &self.parents
+    }
+
+    pub fn subs(&self) -> &[SubTask] {
+        &self.subs
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tasks.is_empty()
+        self.parents.iter().all(|p| p.closed)
     }
 
-    /// One line per still-open task, for the compaction marker to carry
-    /// forward. The table is leader memory and dies with the leader, so
-    /// what has to survive a leadership change has to be in history.
+    /// One line per still-open sub-task, for the compaction marker to carry
+    /// forward. This is the "carry forward active sub-tasks" half of the
+    /// workflow's atomic compaction: the table itself dies with the leader,
+    /// so what survives has to be in history.
     pub fn open_work_lines(&self) -> Vec<String> {
-        self.tasks
+        self.subs
             .iter()
-            .map(|t| {
+            .filter(|s| !matches!(s.state, SubState::Cleared))
+            .map(|s| {
                 format!(
-                    "[open] t{} -> {}: {}",
-                    t.id,
-                    t.holder.as_deref().unwrap_or("unassigned"),
-                    t.body
+                    "[open] {} ({}) -> {}: {}",
+                    s.label(),
+                    s.state.as_str(),
+                    s.assignee,
+                    truncate(&s.body, 90)
                 )
             })
             .collect()
     }
 
-    /// Feed one inbound message through the table. `[task] …` opens a task;
-    /// `[done: tN] …` from the task's holder closes it. Everything else is
-    /// ignored. `now_us` stamps new tasks' unassigned state.
-    /// `can_open=false` demotes `[task]` bodies to ordinary chat (peer
-    /// role); `[done: tN]` closes are accepted from the holder regardless.
-    pub fn note_message(&mut self, from: &str, body: &str, now_us: u64, can_open: bool) -> TableEvent {
-        if let Some(rest) = body.trim().strip_prefix("[task]") {
-            if !can_open {
-                return TableEvent::Noted;
-            }
-            let id = self.next_id;
-            self.next_id += 1;
-            self.tasks.push(Task {
-                id,
-                holder: None,
-                until: 0,
-                body: String::from(rest.trim()),
-            });
-            let _ = (from, now_us);
-            return TableEvent::Noted;
-        }
-        if let Some(rest) = body.trim().strip_prefix("[done:") {
-            let mut parts = rest.splitn(2, ']');
-            let id_part = parts.next().unwrap_or("").trim();
-            let summary = parts.next().unwrap_or("").trim();
-            let id: u64 = match id_part.trim_start_matches('t').parse() {
-                Ok(v) => v,
-                Err(_) => return TableEvent::Noted, // not a well-formed done — ignore
-            };
-            if let Some(pos) = self.tasks.iter().position(|t| t.id == id) {
-                let task = &self.tasks[pos];
-                if task.holder.as_deref() != Some(from) {
-                    // Only the holder can close a task — goodwill plus a
-                    // little bookkeeping discipline.
-                    return TableEvent::Noted;
-                }
-                self.tasks.remove(pos);
-                return TableEvent::Done(
-                    format!("[event] task t{} done by {}: {}", id, from, summary),
-                    String::from(summary),
-                );
-            }
-        }
-        TableEvent::Noted
+    /// A new leader has taken the socket. The next tick wakes it.
+    ///
+    /// Leadership changes are how work gets lost in this design: the table
+    /// is the old leader's memory and dies with it, so the successor starts
+    /// empty while the litter still has unfinished business. What survives
+    /// is in history — the compaction marker's `[still open]` block, put
+    /// there by `open_work_lines`. Somebody has to go and read it, and the
+    /// only agent that can act on it is the one now holding the socket.
+    pub fn note_new_leader(&mut self, name: &str) {
+        self.leader_wake = Some(String::from(name));
     }
 
-    /// One coordinator tick: assign unassigned tasks round-robin over
-    /// `roster`, requeue expired leases, and return (recipient, body)
-    /// messages to deliver plus event-log lines. Idempotent when nothing
+    fn parent_mut(&mut self, id: u64) -> Option<&mut Parent> {
+        self.parents.iter_mut().find(|p| p.id == id)
+    }
+
+    fn sub_pos(&self, parent: u64, n: u64) -> Option<usize> {
+        self.subs.iter().position(|s| s.parent == parent && s.n == n)
+    }
+
+    /// Apply one task record. **The deterministic half of the workflow**:
+    /// same record + same state ⇒ same result, on any agent, with no clock
+    /// and no socket reachable from here. Returns the messages to deliver,
+    /// the events to log, and a one-line note for the caller to hand back
+    /// to whoever submitted the record.
+    ///
+    /// Every refusal returns a note rather than failing silently. A model
+    /// that claimed the wrong sub-task learns it did; a model whose record
+    /// was dropped for lack of authority learns that too. Silence here
+    /// would be indistinguishable from "accepted and nothing happened".
+    pub fn apply(
+        &mut self,
+        from: &str,
+        authority: Authority,
+        op: &TaskOp,
+        now_us: u64,
+        roster: &[String],
+    ) -> (Vec<Outbound>, Vec<String>, String) {
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        let note = match op.act {
+            TaskAct::Open => self.op_open(from, authority, &op.text, &mut events),
+            TaskAct::Plan => self.op_plan(authority, op, roster, &mut events),
+            TaskAct::Claim => self.op_claim(from, &op.id, now_us, &mut events),
+            TaskAct::Done => self.op_done(from, &op.id, &op.text, &mut events),
+            TaskAct::Failed => self.op_failed(from, &op.id, &op.text, &mut events),
+            TaskAct::Clear => self.op_clear(from, authority, &op.id, &mut events),
+            TaskAct::Reopen => self.op_reopen(from, authority, &op.id, &op.text, &mut events),
+            TaskAct::Artifact => self.op_artifact(from, authority, op, &mut out, &mut events),
+        };
+        (out, events, note)
+    }
+
+    fn op_open(&mut self, from: &str, authority: Authority, text: &str, events: &mut Vec<String>) -> String {
+        if !authority.may_open_parent() {
+            // Otherwise any agent can mint work for the whole litter —
+            // observed live, an agent tasking the litter to police the
+            // kernel.
+            return String::from("refused: only the operator or the leader may open a task");
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            return String::from("refused: a task needs a brief");
+        }
+        let id = self.next_parent;
+        self.next_parent += 1;
+        self.parents.push(Parent {
+            id,
+            body: String::from(text),
+            planned: false,
+            closed: false,
+            artifact: String::new(),
+            nagged: 0,
+        });
+        events.push(format!("[event] parent task t{} opened by {}", id, from));
+        format!("opened t{}", id)
+    }
+
+    /// **Atomic, and refused if the parent is already planned.** One record
+    /// carrying the whole plan is what makes "all sub-tasks cleared"
+    /// decidable: with sub-tasks trickling in, the table could never know
+    /// planning had finished, so the trigger for the final artifact would
+    /// never fire.
+    fn op_plan(
+        &mut self,
+        authority: Authority,
+        op: &TaskOp,
+        roster: &[String],
+        events: &mut Vec<String>,
+    ) -> String {
+        if !authority.is_leader() {
+            return String::from("refused: only the leader may plan a task");
+        }
+        let Some(pid) = parse_parent(&op.id) else {
+            return String::from("refused: 'task' must be a parent id like t1");
+        };
+        match self.parents.iter().find(|p| p.id == pid) {
+            None => return format!("refused: no task t{}", pid),
+            Some(p) if p.planned => return format!("refused: t{} is already planned", pid),
+            Some(p) if p.closed => return format!("refused: t{} is closed", pid),
+            Some(_) => {}
+        }
+
+        let mut n = 0u64;
+        let mut skipped: Vec<String> = Vec::new();
+        for (who, what) in &op.plan {
+            let who = who.trim();
+            let what = what.trim();
+            if who.is_empty() || what.is_empty() {
+                continue;
+            }
+            // An assignee nobody can deliver to is a sub-task that stalls
+            // forever while looking healthy. Surface it instead.
+            if !roster.iter().any(|m| m == who) {
+                skipped.push(String::from(who));
+                events.push(format!("[event] plan for t{} skipped '{}': not in the roster", pid, who));
+                continue;
+            }
+            n += 1;
+            self.subs.push(SubTask {
+                parent: pid,
+                n,
+                assignee: String::from(who),
+                state: SubState::Pending,
+                until: 0, // never offered yet; the next tick offers it
+                body: String::from(what),
+                result: String::new(),
+            });
+            events.push(format!("[event] t{}.{} assigned to {}", pid, n, who));
+        }
+
+        if n == 0 {
+            return format!("refused: plan for t{} had no assignable sub-tasks", pid);
+        }
+        if let Some(p) = self.parent_mut(pid) {
+            p.planned = true;
+            p.nagged = 0;
+        }
+        if skipped.is_empty() {
+            format!("planned t{}: {} sub-task(s)", pid, n)
+        } else {
+            format!("planned t{}: {} sub-task(s); not in the roster: {}", pid, n, skipped.join(", "))
+        }
+    }
+
+    fn op_claim(&mut self, from: &str, id: &str, now_us: u64, events: &mut Vec<String>) -> String {
+        let Some(pos) = self.sub_by_id(id) else {
+            return format!("refused: no sub-task {}", id);
+        };
+        let s = &mut self.subs[pos];
+        if s.assignee != from {
+            return format!("refused: {} is assigned to {}", s.label(), s.assignee);
+        }
+        if !matches!(s.state, SubState::Pending) {
+            return format!("{} is already {}", s.label(), s.state.as_str());
+        }
+        s.state = SubState::InProgress;
+        s.until = now_us.saturating_add(LEASE_US);
+        events.push(format!("[event] {} claimed by {}", s.label(), from));
+        format!("claimed {}", s.label())
+    }
+
+    /// Accepted from `Pending` as well as `InProgress`: a model that skips
+    /// the claim handshake and goes straight to the answer has still done
+    /// the work, and losing the ceremony is cheaper than losing the result.
+    fn op_done(&mut self, from: &str, id: &str, text: &str, events: &mut Vec<String>) -> String {
+        let Some(pos) = self.sub_by_id(id) else {
+            return format!("refused: no sub-task {}", id);
+        };
+        let result = text.trim();
+        if result.is_empty() {
+            return String::from("refused: a result needs text");
+        }
+        let s = &mut self.subs[pos];
+        if s.assignee != from {
+            return format!("refused: {} is assigned to {}", s.label(), s.assignee);
+        }
+        if !s.is_open() {
+            return format!("{} is already {}", s.label(), s.state.as_str());
+        }
+        s.state = SubState::AwaitingClearance;
+        s.until = 0;
+        s.result = String::from(result);
+        events.push(format!("[event] {} submitted by {}, awaiting clearance", s.label(), from));
+        format!("submitted {} — awaiting the leader's clearance", s.label())
+    }
+
+    /// The rejected branch of the future. Without its own act, a sub-task
+    /// that cannot be done is indistinguishable from one still in flight.
+    /// It goes to the leader as a clearance decision rather than silently
+    /// requeueing: whether to retry, re-assign or drop it is the leader's
+    /// call, not the table's.
+    fn op_failed(&mut self, from: &str, id: &str, text: &str, events: &mut Vec<String>) -> String {
+        let Some(pos) = self.sub_by_id(id) else {
+            return format!("refused: no sub-task {}", id);
+        };
+        let s = &mut self.subs[pos];
+        if s.assignee != from {
+            return format!("refused: {} is assigned to {}", s.label(), s.assignee);
+        }
+        if !s.is_open() {
+            return format!("{} is already {}", s.label(), s.state.as_str());
+        }
+        let why = text.trim();
+        s.state = SubState::AwaitingClearance;
+        s.until = 0;
+        s.result = format!("[FAILED] {}", if why.is_empty() { "no reason given" } else { why });
+        events.push(format!("[event] {} reported FAILED by {}", s.label(), from));
+        format!("marked {} failed — the leader will decide what happens to it", s.label())
+    }
+
+    fn op_clear(&mut self, from: &str, authority: Authority, id: &str, events: &mut Vec<String>) -> String {
+        if !authority.is_leader() {
+            return String::from("refused: only the leader may clear a sub-task");
+        }
+        let Some(pos) = self.sub_by_id(id) else {
+            return format!("refused: no sub-task {}", id);
+        };
+        let pid = self.subs[pos].parent;
+        let s = &mut self.subs[pos];
+        if !matches!(s.state, SubState::AwaitingClearance) {
+            return format!("refused: {} is {}, not awaiting clearance", s.label(), s.state.as_str());
+        }
+        s.state = SubState::Cleared;
+        let label = s.label();
+        events.push(format!("[event] {} cleared by {}", label, from));
+        if let Some(p) = self.parent_mut(pid) {
+            p.nagged = 0; // the artifact directive should follow promptly
+        }
+        format!("cleared {}", label)
+    }
+
+    /// The leader rejecting a submission: back to `Pending` for a fresh
+    /// offer, with the reason carried into the sub-task body so the worker
+    /// is told what was wrong rather than being handed the same brief.
+    fn op_reopen(&mut self, from: &str, authority: Authority, id: &str, text: &str, events: &mut Vec<String>) -> String {
+        if !authority.is_leader() {
+            return String::from("refused: only the leader may reopen a sub-task");
+        }
+        let Some(pos) = self.sub_by_id(id) else {
+            return format!("refused: no sub-task {}", id);
+        };
+        let why = text.trim();
+        let s = &mut self.subs[pos];
+        if !matches!(s.state, SubState::AwaitingClearance) {
+            return format!("refused: {} is {}, not awaiting clearance", s.label(), s.state.as_str());
+        }
+        s.state = SubState::Pending;
+        s.until = 0;
+        s.result = String::new();
+        if !why.is_empty() {
+            s.body = format!("{} (reopened: {})", s.body, why);
+        }
+        let label = s.label();
+        events.push(format!("[event] {} reopened by {}", label, from));
+        format!("reopened {}", label)
+    }
+
+    fn op_artifact(
+        &mut self,
+        from: &str,
+        authority: Authority,
+        op: &TaskOp,
+        out: &mut Vec<Outbound>,
+        events: &mut Vec<String>,
+    ) -> String {
+        if !authority.is_leader() {
+            return String::from("refused: only the leader may close a task");
+        }
+        let Some(pid) = parse_parent(&op.id) else {
+            return String::from("refused: 'task' must be a parent id like t1");
+        };
+        let text = op.text.trim();
+        if text.is_empty() {
+            return String::from("refused: an artifact needs the report text");
+        }
+        // Refuse to close over unfinished work: the artifact is a synthesis
+        // of cleared results, and a leader declaring one early would strand
+        // sub-tasks their workers are still holding.
+        let outstanding = self
+            .subs
+            .iter()
+            .filter(|s| s.parent == pid && !matches!(s.state, SubState::Cleared))
+            .count();
+        if outstanding > 0 {
+            return format!("refused: t{} still has {} uncleared sub-task(s)", pid, outstanding);
+        }
+        let Some(p) = self.parent_mut(pid) else {
+            return format!("refused: no task t{}", pid);
+        };
+        if p.closed {
+            return format!("t{} is already closed", pid);
+        }
+        p.closed = true;
+        p.artifact = String::from(text);
+        let label = p.label();
+        events.push(format!("[event] parent task {} closed by {} with an artifact", label, from));
+        out.push(Outbound {
+            to: String::from(GROUP),
+            body: format!("[artifact: {}] {}", label, text),
+            // Done, not Assignment: closing a parent must not wake the whole
+            // litter into another round of turns about it.
+            kind: OutKind::Done,
+        });
+        // The finished sub-tasks have served their purpose; the artifact and
+        // the history carry what they found.
+        self.subs.retain(|s| s.parent != pid);
+        format!("closed {} with the final artifact", label)
+    }
+
+    fn sub_by_id(&self, id: &str) -> Option<usize> {
+        let (p, n) = parse_sub(id)?;
+        self.sub_pos(p, n)
+    }
+
+    /// One coordinator tick: expire offers and leases, re-home sub-tasks
+    /// whose assignee has left, make standing offers, and deliver the
+    /// leader whatever decision it currently owes. Idempotent when nothing
     /// needs doing.
-    pub fn tick(&mut self, roster: &[String], now_us: u64) -> (Vec<(String, String)>, Vec<String>) {
-        let mut messages = Vec::new();
+    pub fn tick(
+        &mut self,
+        roster: &[String],
+        leader: Option<&str>,
+        now_us: u64,
+    ) -> (Vec<Outbound>, Vec<String>) {
+        let mut out = Vec::new();
         let mut events = Vec::new();
 
-        // Requeue expired leases first so they compete for assignment in
-        // the same pass.
-        for t in self.tasks.iter_mut() {
-            if t.holder.is_some() && !t.is_leased(now_us) {
-                events.push(format!("[event] task t{} requeued (lease expired)", t.id));
-                t.holder = None;
-                t.until = 0;
+        // Expire leases first, so the freed sub-tasks compete for an offer
+        // in this same pass.
+        for s in self.subs.iter_mut() {
+            if matches!(s.state, SubState::InProgress) && s.until <= now_us {
+                events.push(format!("[event] {} lease expired, requeued", s.label()));
+                s.state = SubState::Pending;
+                s.until = 0;
             }
         }
 
         if roster.is_empty() {
-            return (messages, events);
+            return (out, events);
         }
 
-        // Live load per roster member, computed once: assignment picks the
-        // least-loaded agent, ties broken round-robin, so one busy agent
-        // never accumulates while an idle one starves.
-        let loads: Vec<usize> = roster
-            .iter()
-            .map(|name| {
-                self.tasks
-                    .iter()
-                    .filter(|t| t.holder.as_deref() == Some(name.as_str()) && t.is_leased(now_us))
-                    .count()
-            })
-            .collect();
-        let mut next = 0usize;
-        for t in self.tasks.iter_mut() {
-            if t.holder.is_some() {
+        // Re-home anything directed at an agent that is no longer here.
+        // Least-loaded rather than round-robin: the point is not fairness
+        // across a queue, it is not piling three orphans on one survivor.
+        for i in 0..self.subs.len() {
+            if !matches!(self.subs[i].state, SubState::Pending) {
                 continue;
             }
-            let mut best = 0usize;
-            for i in 1..roster.len() {
-                if loads[i] < loads[best] || (loads[i] == loads[best] && i == next) {
-                    best = i;
-                }
+            if roster.iter().any(|m| m == &self.subs[i].assignee) {
+                continue;
             }
-            let holder = roster[best].clone();
-            t.holder = Some(holder.clone());
-            t.until = now_us + LEASE_US;
-            events.push(format!("[event] task t{} assigned to {}", t.id, holder));
-            messages.push((holder, t.assignment_message()));
-            next = (next + 1) % roster.len();
+            let Some(new_home) = self.least_loaded(roster, now_us) else { continue };
+            let label = self.subs[i].label();
+            let gone = self.subs[i].assignee.clone();
+            self.subs[i].assignee = new_home.clone();
+            self.subs[i].until = 0; // offer it immediately below
+            events.push(format!("[event] {} re-homed from {} to {} (left the litter)", label, gone, new_home));
         }
 
-        (messages, events)
+        // Standing offers: an offer that lapsed is simply made again.
+        for s in self.subs.iter_mut() {
+            if !matches!(s.state, SubState::Pending) || s.until > now_us {
+                continue;
+            }
+            if !roster.iter().any(|m| m == &s.assignee) {
+                continue;
+            }
+            s.until = now_us.saturating_add(CLAIM_WINDOW_US);
+            out.push(Outbound {
+                to: s.assignee.clone(),
+                body: s.offer_message(),
+                kind: OutKind::Assignment,
+            });
+            events.push(format!("[event] {} offered to {}", s.label(), s.assignee));
+        }
+
+        // The election wake comes first, and unconditionally: a fresh
+        // leader with an empty table has no parent to generate a directive
+        // from, so without this it would sit silent while the litter's
+        // carried-over work went unclaimed.
+        if let Some(name) = self.leader_wake.take() {
+            let body = self.election_wake_body(&name, roster, now_us);
+            out.push(Outbound { to: name, body, kind: OutKind::Assignment });
+        }
+
+        if let Some(leader) = leader {
+            self.leader_directives(leader, roster, now_us, &mut out);
+        }
+
+        (out, events)
     }
+
+    /// What a newly elected leader is told. Two situations, and they need
+    /// different instructions:
+    ///
+    /// - **Tickets outstanding in our own table.** Rare (the table normally
+    ///   dies with its leader) but possible for a leader that never lost
+    ///   the socket. Name them and chase the holders.
+    /// - **Nothing in the table** — the usual case after a death. The
+    ///   danger here is the *silent* one: agents may still be holding
+    ///   sub-tasks the old leader leased them, and nothing in this process
+    ///   knows that. The successor cannot deduce it, so it has to ask. A
+    ///   roll call is the only way that state is ever recovered; without it
+    ///   the work sits claimed by someone nobody is tracking.
+    fn election_wake_body(&self, name: &str, roster: &[String], now_us: u64) -> String {
+        let mut body = format!("[leader-elected] You are now the leader of this litter.");
+
+        let open: Vec<&SubTask> = self.subs.iter().filter(|s| !matches!(s.state, SubState::Cleared)).collect();
+        if !open.is_empty() {
+            body.push_str("\n\nOutstanding tickets you now own — issue a ROLL CALL and chase them:");
+            for s in &open {
+                body.push_str(&format!(
+                    "\n  {} [{}] held by {}: {}",
+                    s.label(),
+                    s.state.as_str(),
+                    s.assignee,
+                    truncate(&s.body, 100)
+                ));
+            }
+            body.push_str(
+                "\n\nSend the roll call with SendMessage(to=\"litter\", body=\"...\"): ask each \
+                 holder to confirm whether their ticket is still in progress. Anything nobody \
+                 answers for, take back with TaskUpdate(task=\"tN.M\", status=\"reopen\", \
+                 text=\"no answer at roll call\").",
+            );
+        } else {
+            body.push_str(
+                "\n\nYour task table is EMPTY — it was the previous leader's memory and died \
+                 with it. Two places the litter's real state still lives:\
+                 \n1. The `[still open]` block in your compaction marker: work that was being \
+                 tracked when the old leader went. Nothing will happen to it unless you act.\
+                 \n2. The other agents, who may still be holding tickets nobody is tracking now. \
+                 You cannot see those from here — ask. Issue a ROLL CALL with \
+                 SendMessage(to=\"litter\", body=\"roll call: what task are you holding, and \
+                 what is its status?\").",
+            );
+        }
+
+        let needs_plan: Vec<&Parent> = self.parents.iter().filter(|p| !p.closed && !p.planned).collect();
+        if !needs_plan.is_empty() {
+            body.push_str("\n\nTasks still awaiting a plan — call TaskPlan for each:");
+            for p in needs_plan {
+                body.push_str(&format!("\n  {}: {}", p.label(), truncate(&p.body, 120)));
+            }
+        }
+
+        let members: Vec<&str> = roster.iter().map(|s| s.as_str()).filter(|n| *n != name).collect();
+        body.push_str(&format!("\n\nAgents available: {}", members.join(", ")));
+        let _ = now_us;
+        body
+    }
+
+    fn least_loaded(&self, roster: &[String], now_us: u64) -> Option<String> {
+        let _ = now_us;
+        roster
+            .iter()
+            .map(|name| {
+                let load = self
+                    .subs
+                    .iter()
+                    .filter(|s| &s.assignee == name && s.is_open())
+                    .count();
+                (load, name)
+            })
+            .min_by_key(|(load, _)| *load)
+            .map(|(_, name)| name.clone())
+    }
+
+    /// Whatever decision the leader currently owes, phrased as the literal
+    /// verb to reply with. One directive per parent per nag interval: they
+    /// are re-sent because a directive delivered once and dropped would
+    /// stall its parent permanently, and they are rate-limited because a
+    /// leader nagged every tick never finishes a turn.
+    fn leader_directives(
+        &mut self,
+        leader: &str,
+        roster: &[String],
+        now_us: u64,
+        out: &mut Vec<Outbound>,
+    ) {
+        for i in 0..self.parents.len() {
+            if self.parents[i].closed {
+                continue;
+            }
+            let pid = self.parents[i].id;
+            if self.parents[i].nagged != 0 && now_us < self.parents[i].nagged.saturating_add(NAG_US) {
+                continue;
+            }
+            let label = self.parents[i].label();
+
+            let body = if !self.parents[i].planned {
+                let who: Vec<&str> = roster
+                    .iter()
+                    .map(|s| s.as_str())
+                    .filter(|n| *n != leader)
+                    .collect();
+                format!(
+                    "[plan-needed: {label}] You are the leader. Split this task into one \
+                     sub-task per agent and submit them in a SINGLE TaskPlan call:\
+                     \n  TaskPlan(task=\"{label}\", assignments=[{{\"who\":\"<agent>\",\
+                     \"what\":\"<what they should do>\"}}, ...])\
+                     \nOne call, every sub-task — a partial plan cannot be completed later.\
+                     \n\nThe task is: {body}\
+                     \nAgents available: {who}",
+                    label = label,
+                    body = self.parents[i].body,
+                    who = who.join(", ")
+                )
+            } else {
+                let awaiting: Vec<&SubTask> = self
+                    .subs
+                    .iter()
+                    .filter(|s| s.parent == pid && matches!(s.state, SubState::AwaitingClearance))
+                    .collect();
+                if !awaiting.is_empty() {
+                    let mut lines = String::new();
+                    for s in &awaiting {
+                        lines.push_str(&format!(
+                            "\n\n{} ({} reported): {}",
+                            s.label(),
+                            s.assignee,
+                            truncate(&s.result, 600)
+                        ));
+                    }
+                    format!(
+                        "[clearance-needed: {label}] You are the leader. Verify each result \
+                         below. Accept one with TaskUpdate(task=\"tN.M\", status=\"clear\"), \
+                         or send it back with TaskUpdate(task=\"tN.M\", status=\"reopen\", \
+                         text=\"<what is missing>\"). A result marked [FAILED] needs the same \
+                         decision: clear it to accept the failure, or reopen it to retry.{lines}",
+                        label = label,
+                        lines = lines
+                    )
+                } else {
+                    let cleared: Vec<&SubTask> = self
+                        .subs
+                        .iter()
+                        .filter(|s| s.parent == pid && matches!(s.state, SubState::Cleared))
+                        .collect();
+                    // Planned, nothing awaiting, nothing cleared yet =>
+                    // work is simply in flight. Say nothing.
+                    if cleared.is_empty() || cleared.len() != self.subs.iter().filter(|s| s.parent == pid).count() {
+                        continue;
+                    }
+                    let mut lines = String::new();
+                    for s in &cleared {
+                        lines.push_str(&format!(
+                            "\n\n{} ({}): {}",
+                            s.label(),
+                            s.assignee,
+                            truncate(&s.result, 600)
+                        ));
+                    }
+                    format!(
+                        "[artifact-needed: {label}] Every sub-task is cleared. Synthesize the \
+                         findings below into the final answer to the original task and submit it \
+                         with TaskUpdate(task=\"{label}\", status=\"artifact\", \
+                         text=\"<your report>\"). This closes the task.\
+                         \n\nOriginal task: {task}{lines}",
+                        label = label,
+                        task = self.parents[i].body,
+                        lines = lines
+                    )
+                }
+            };
+
+            self.parents[i].nagged = now_us;
+            out.push(Outbound { to: String::from(leader), body, kind: OutKind::Assignment });
+        }
+    }
+}
+
+/// `"t1"` → `1`. Tolerates a bare `"1"`.
+fn parse_parent(s: &str) -> Option<u64> {
+    let s = s.trim().trim_start_matches('t');
+    if s.is_empty() || s.contains('.') {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// `"t1.2"` → `(1, 2)`.
+fn parse_sub(s: &str) -> Option<(u64, u64)> {
+    let s = s.trim().trim_start_matches('t');
+    let (p, n) = s.split_once('.')?;
+    Some((p.trim().parse().ok()?, n.trim().parse().ok()?))
+}
+
+/// Truncate on a char boundary. Directives carry submitted results back to
+/// the leader, and an unbounded result would blow the turn's token budget.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 #[cfg(feature = "tests")]
 pub fn run_tests() -> i32 {
+    use alloc::vec;
     let mut passed = 0usize;
     let mut total = 0usize;
     libakuma::print("--- litter tasks tests ---\n");
 
-    // [task] opens, tick assigns, [done: tN] closes — full life cycle
-    total += 1;
-    {
-        let mut table = TaskTable::new();
-        let roster = [String::from("sherlock"), String::from("hercules")];
-        match table.note_message("root", "[task] audit main.rs", 100, true) {
-            TableEvent::Noted => {}
-            _ => libakuma::print("  [!] [task] should only note\n"),
+    fn roster() -> Vec<String> {
+        vec![String::from("mimi"), String::from("tama"), String::from("kuro")]
+    }
+    fn op(act: TaskAct, id: &str, text: &str) -> TaskOp {
+        TaskOp::new(act, String::from(id), String::from(text))
+    }
+    fn plan_op(id: &str, pairs: &[(&str, &str)]) -> TaskOp {
+        TaskOp {
+            act: TaskAct::Plan,
+            id: String::from(id),
+            text: String::new(),
+            plan: pairs.iter().map(|(a, b)| (String::from(*a), String::from(*b))).collect(),
         }
-        let (msgs, events) = table.tick(&roster, 100);
-        let assigned_ok = msgs.len() == 1 && msgs[0].0 == "sherlock" && msgs[0].1.contains("[assigned: t1]") && msgs[0].1.contains("audit main.rs");
-        let event_ok = events.iter().any(|e| e.contains("t1 assigned to sherlock"));
-        let done = table.note_message("sherlock", "[done: t1] found 3 issues", 200, true);
-        let done_ok = matches!(done, TableEvent::Done(ref e, ref s) if e.contains("t1 done by sherlock") && s == "found 3 issues");
-        if assigned_ok && event_ok && done_ok && table.is_empty() {
-            passed += 1;
+    }
+    let mut check = |name: &str, cond: bool, passed: &mut usize| {
+        if cond {
+            *passed += 1;
         } else {
-            libakuma::print(&format!("  [!] lifecycle: assigned_ok={} event_ok={} done_ok={}\n", assigned_ok, event_ok, done_ok));
+            libakuma::print(&format!("  [!] {}\n", name));
+        }
+    };
+
+    // ---- the whole lifecycle, end to end -------------------------------
+    // open -> plan -> claim -> done -> clear -> artifact. The states are
+    // asserted between every step, because a table that reaches the right
+    // end through the wrong middle is the failure this protocol is most
+    // prone to.
+    total += 1;
+    {
+        let mut t = TaskTable::new();
+        let r = roster();
+        let (_, _, n1) = t.apply("root", Authority::Root, &op(TaskAct::Open, "", "debate the kernel"), 100, &r);
+        let (_, _, n2) = t.apply("mimi", Authority::Leader,
+            &plan_op("t1", &[("tama", "run the tests"), ("kuro", "audit locking")]), 100, &r);
+        let planned = t.subs().len() == 2
+            && t.subs()[0].assignee == "tama"
+            && t.subs()[1].assignee == "kuro"
+            && t.subs().iter().all(|s| s.state == SubState::Pending);
+
+        // tick offers both, to their NAMED assignees
+        let (offers, _) = t.tick(&r, Some("mimi"), 200);
+        let offered_to: Vec<&str> = offers.iter().map(|o| o.to.as_str()).collect();
+        let offers_ok = offered_to.contains(&"tama") && offered_to.contains(&"kuro");
+
+        let (_, _, n3) = t.apply("tama", Authority::Peer, &op(TaskAct::Claim, "t1.1", ""), 300, &r);
+        let claimed = t.subs()[0].state == SubState::InProgress;
+        let (_, _, n4) = t.apply("tama", Authority::Peer, &op(TaskAct::Done, "t1.1", "all green"), 400, &r);
+        let submitted = t.subs()[0].state == SubState::AwaitingClearance && t.subs()[0].result == "all green";
+        let (_, _, n5) = t.apply("mimi", Authority::Leader, &op(TaskAct::Clear, "t1.1", ""), 500, &r);
+        let cleared = t.subs()[0].state == SubState::Cleared;
+
+        // artifact must be refused while kuro's half is outstanding
+        let (_, _, early) = t.apply("mimi", Authority::Leader, &op(TaskAct::Artifact, "t1", "report"), 600, &r);
+        let refused_early = early.contains("uncleared") && !t.parents()[0].closed;
+
+        t.apply("kuro", Authority::Peer, &op(TaskAct::Done, "t1.2", "one lock is unheld"), 700, &r);
+        t.apply("mimi", Authority::Leader, &op(TaskAct::Clear, "t1.2", ""), 800, &r);
+        let (out, _, n6) = t.apply("mimi", Authority::Leader, &op(TaskAct::Artifact, "t1", "FINAL: it works"), 900, &r);
+        let closed = t.parents()[0].closed
+            && t.parents()[0].artifact == "FINAL: it works"
+            && t.subs().is_empty()
+            && t.is_empty();
+        // the artifact is broadcast, and must NOT wake the litter
+        let broadcast_ok = out.len() == 1 && out[0].to == GROUP && out[0].kind == OutKind::Done;
+
+        let ok = n1.contains("t1") && n2.contains("2 sub-task") && planned && offers_ok
+            && n3.contains("claimed") && claimed && n4.contains("submitted") && submitted
+            && n5.contains("cleared") && cleared && refused_early && n6.contains("closed")
+            && closed && broadcast_ok;
+        check("lifecycle open->plan->claim->done->clear->artifact", ok, &mut passed);
+        if !ok {
+            libackuma_note(&n1, &n2, &n3, &n4, &n5, &n6);
         }
     }
 
-    // expired lease requeues and reassigns
+    // ---- authority is enforced, not advisory ---------------------------
+    // Every privileged act refused for a plain peer. This is the check that
+    // stops an agent minting work for the whole litter, which happened live.
     total += 1;
     {
-        let mut table = TaskTable::new();
-        let roster = [String::from("sherlock")];
-        table.note_message("root", "[task] slow job", 100, true);
-        table.tick(&roster, 100);
-        let (msgs, events) = table.tick(&roster, 100 + LEASE_US + 1);
-        let requeued = events.iter().any(|e| e.contains("requeued"));
-        let reassigned = msgs.len() == 1 && msgs[0].0 == "sherlock" && msgs[0].1.contains("[assigned: t1]");
-        if requeued && reassigned { passed += 1; }
-        else { libakuma::print(&format!("  [!] requeue: requeued={} reassigned={}\n", requeued, reassigned)); }
+        let mut t = TaskTable::new();
+        let r = roster();
+        let (_, _, open_peer) = t.apply("tama", Authority::Peer, &op(TaskAct::Open, "", "do my bidding"), 100, &r);
+        let no_open = open_peer.starts_with("refused") && t.parents().is_empty();
+
+        t.apply("root", Authority::Root, &op(TaskAct::Open, "", "real task"), 100, &r);
+        let (_, _, plan_peer) = t.apply("tama", Authority::Peer, &plan_op("t1", &[("kuro", "x")]), 100, &r);
+        let no_plan = plan_peer.starts_with("refused") && t.subs().is_empty();
+
+        t.apply("mimi", Authority::Leader, &plan_op("t1", &[("tama", "x")]), 100, &r);
+        t.apply("tama", Authority::Peer, &op(TaskAct::Done, "t1.1", "done"), 200, &r);
+        let (_, _, clear_peer) = t.apply("kuro", Authority::Peer, &op(TaskAct::Clear, "t1.1", ""), 300, &r);
+        let no_clear = clear_peer.starts_with("refused") && t.subs()[0].state == SubState::AwaitingClearance;
+
+        t.apply("mimi", Authority::Leader, &op(TaskAct::Clear, "t1.1", ""), 300, &r);
+        let (_, _, art_peer) = t.apply("tama", Authority::Peer, &op(TaskAct::Artifact, "t1", "mine"), 400, &r);
+        let no_artifact = art_peer.starts_with("refused") && !t.parents()[0].closed;
+
+        check("peers may not open, plan, clear or close",
+              no_open && no_plan && no_clear && no_artifact, &mut passed);
     }
 
-    // only the holder can close a task
+    // ---- a sub-task belongs to its assignee ----------------------------
     total += 1;
     {
-        let mut table = TaskTable::new();
-        let roster = [String::from("sherlock")];
-        table.note_message("root", "[task] secret", 100, true);
-        table.tick(&roster, 100);
-        match table.note_message("hercules", "[done: t1] i did nothing", 150, true) {
-            TableEvent::Noted | TableEvent::Requeued => {}
-            TableEvent::Done(..) => libakuma::print("  [!] non-holder closed a task\n"),
-        }
-        match table.note_message("sherlock", "[done: t1] all clear", 160, true) {
-            TableEvent::Done(..) => passed += 1,
-            other => libakuma::print(&format!("  [!] holder's done was not applied: {:?}\n", other)),
-        }
+        let mut t = TaskTable::new();
+        let r = roster();
+        t.apply("root", Authority::Root, &op(TaskAct::Open, "", "task"), 100, &r);
+        t.apply("mimi", Authority::Leader, &plan_op("t1", &[("tama", "work")]), 100, &r);
+        let (_, _, thief_claim) = t.apply("kuro", Authority::Peer, &op(TaskAct::Claim, "t1.1", ""), 200, &r);
+        let (_, _, thief_done) = t.apply("kuro", Authority::Peer, &op(TaskAct::Done, "t1.1", "I did it"), 200, &r);
+        check("only the assignee may claim or submit",
+              thief_claim.starts_with("refused") && thief_done.starts_with("refused")
+                  && t.subs()[0].state == SubState::Pending,
+              &mut passed);
     }
 
-    // load balancing: with two agents and two tasks, both get one
+    // ---- submitting without claiming is accepted -----------------------
+    // Deliberate divergence from the diagrams: a small model that skips the
+    // handshake has still done the work.
     total += 1;
     {
-        let mut table = TaskTable::new();
-        let roster = [String::from("a"), String::from("b")];
-        table.note_message("root", "[task] one", 10, true);
-        table.note_message("root", "[task] two", 10, true);
-        let (msgs, _) = table.tick(&roster, 10);
-        let holders: Vec<&str> = msgs.iter().map(|(to, _)| to.as_str()).collect();
-        if holders.contains(&"a") && holders.contains(&"b") { passed += 1; }
-        else { libakuma::print(&format!("  [!] balance: {:?}\n", holders)); }
+        let mut t = TaskTable::new();
+        let r = roster();
+        t.apply("root", Authority::Root, &op(TaskAct::Open, "", "task"), 100, &r);
+        t.apply("mimi", Authority::Leader, &plan_op("t1", &[("tama", "work")]), 100, &r);
+        let (_, _, note) = t.apply("tama", Authority::Peer, &op(TaskAct::Done, "t1.1", "skipped the claim"), 200, &r);
+        check("submit without claim is accepted",
+              !note.starts_with("refused") && t.subs()[0].state == SubState::AwaitingClearance,
+              &mut passed);
+    }
+
+    // ---- failed is its own act, not a flavour of done ------------------
+    total += 1;
+    {
+        let mut t = TaskTable::new();
+        let r = roster();
+        t.apply("root", Authority::Root, &op(TaskAct::Open, "", "task"), 100, &r);
+        t.apply("mimi", Authority::Leader, &plan_op("t1", &[("tama", "impossible")]), 100, &r);
+        t.apply("tama", Authority::Peer, &op(TaskAct::Failed, "t1.1", "no such file"), 200, &r);
+        let marked = t.subs()[0].state == SubState::AwaitingClearance
+            && t.subs()[0].result.starts_with("[FAILED]")
+            && t.subs()[0].result.contains("no such file");
+        // the leader can still reopen it for a retry
+        t.apply("mimi", Authority::Leader, &op(TaskAct::Reopen, "t1.1", "try /etc instead"), 300, &r);
+        let reopened = t.subs()[0].state == SubState::Pending
+            && t.subs()[0].result.is_empty()
+            && t.subs()[0].body.contains("try /etc instead");
+        check("failed lands as a clearance decision, and reopen retries it",
+              marked && reopened, &mut passed);
+    }
+
+    // ---- planning is atomic and one-shot -------------------------------
+    total += 1;
+    {
+        let mut t = TaskTable::new();
+        let r = roster();
+        t.apply("root", Authority::Root, &op(TaskAct::Open, "", "task"), 100, &r);
+        t.apply("mimi", Authority::Leader, &plan_op("t1", &[("tama", "a")]), 100, &r);
+        let (_, _, second) = t.apply("mimi", Authority::Leader, &plan_op("t1", &[("kuro", "b")]), 100, &r);
+        let one_shot = second.contains("already planned") && t.subs().len() == 1;
+        // an assignee nobody can deliver to is surfaced, not silently kept
+        let mut t2 = TaskTable::new();
+        t2.apply("root", Authority::Root, &op(TaskAct::Open, "", "task"), 100, &r);
+        let (_, _, note) = t2.apply("mimi", Authority::Leader,
+            &plan_op("t1", &[("tama", "a"), ("ghost", "b")]), 100, &r);
+        let ghost_skipped = t2.subs().len() == 1 && note.contains("ghost");
+        check("plan is atomic, one-shot, and rejects absent assignees",
+              one_shot && ghost_skipped, &mut passed);
+    }
+
+    // ---- offers lapse and are made again; leases expire and requeue -----
+    total += 1;
+    {
+        let mut t = TaskTable::new();
+        let r = roster();
+        t.apply("root", Authority::Root, &op(TaskAct::Open, "", "task"), 100, &r);
+        t.apply("mimi", Authority::Leader, &plan_op("t1", &[("tama", "work")]), 100, &r);
+        let (first, _) = t.tick(&r, Some("mimi"), 1_000);
+        let offered_once = first.iter().any(|o| o.to == "tama");
+        // ...nothing yet at the same instant (the offer still stands)
+        let (again, _) = t.tick(&r, Some("mimi"), 1_100);
+        let not_spammed = !again.iter().any(|o| o.to == "tama");
+        // ...but re-offered once the claim window lapses
+        let (relisted, _) = t.tick(&r, Some("mimi"), 1_000 + CLAIM_WINDOW_US + 1);
+        let reoffered = relisted.iter().any(|o| o.to == "tama");
+
+        // a claimed sub-task whose worker died comes back
+        t.apply("tama", Authority::Peer, &op(TaskAct::Claim, "t1.1", ""), 2_000, &r);
+        let (_, events) = t.tick(&r, Some("mimi"), 2_000 + LEASE_US + 1);
+        let requeued = events.iter().any(|e| e.contains("lease expired"))
+            && t.subs()[0].state == SubState::Pending;
+        check("offers lapse and re-offer; leases expire and requeue",
+              offered_once && not_spammed && reoffered && requeued, &mut passed);
+    }
+
+    // ---- the leader is told, in order, exactly what to type -------------
+    // plan-needed -> clearance-needed -> artifact-needed. If this sequence
+    // breaks, a parent task stalls forever while looking healthy.
+    total += 1;
+    {
+        let mut t = TaskTable::new();
+        let r = roster();
+        t.apply("root", Authority::Root, &op(TaskAct::Open, "", "debate"), 100, &r);
+        let (d1, _) = t.tick(&r, Some("mimi"), 1_000);
+        let plan_needed = d1.iter().any(|o| o.to == "mimi" && o.body.contains("[plan-needed: t1]")
+            && o.body.contains("TaskPlan") && o.kind == OutKind::Assignment);
+
+        t.apply("mimi", Authority::Leader, &plan_op("t1", &[("tama", "work")]), 1_100, &r);
+        // work in flight: nothing owed, so the leader is left alone
+        let (d2, _) = t.tick(&r, Some("mimi"), 1_200);
+        let quiet = !d2.iter().any(|o| o.to == "mimi");
+
+        t.apply("tama", Authority::Peer, &op(TaskAct::Done, "t1.1", "finding"), 1_300, &r);
+        let (d3, _) = t.tick(&r, Some("mimi"), 1_300 + NAG_US + 1);
+        let clearance_needed = d3.iter().any(|o| o.to == "mimi"
+            && o.body.contains("[clearance-needed: t1]") && o.body.contains("finding"));
+
+        t.apply("mimi", Authority::Leader, &op(TaskAct::Clear, "t1.1", ""), 1_400, &r);
+        let (d4, _) = t.tick(&r, Some("mimi"), 1_400 + NAG_US + 1);
+        let artifact_needed = d4.iter().any(|o| o.to == "mimi"
+            && o.body.contains("[artifact-needed: t1]") && o.body.contains("TaskUpdate"));
+        check("leader directives fire in order and name the tool",
+              plan_needed && quiet && clearance_needed && artifact_needed, &mut passed);
+    }
+
+    // ---- a sub-task whose assignee left is re-homed ---------------------
+    total += 1;
+    {
+        let mut t = TaskTable::new();
+        let full = roster();
+        t.apply("root", Authority::Root, &op(TaskAct::Open, "", "task"), 100, &full);
+        t.apply("mimi", Authority::Leader, &plan_op("t1", &[("kuro", "work")]), 100, &full);
+        let survivors = vec![String::from("mimi"), String::from("tama")];
+        let (out, events) = t.tick(&survivors, Some("mimi"), 1_000);
+        check("a departed assignee's sub-task is re-homed",
+              events.iter().any(|e| e.contains("re-homed"))
+                  && t.subs()[0].assignee != "kuro"
+                  && out.iter().any(|o| o.to == t.subs()[0].assignee),
+              &mut passed);
+    }
+
+    // ---- open work survives compaction ---------------------------------
+    total += 1;
+    {
+        let mut t = TaskTable::new();
+        let r = roster();
+        t.apply("root", Authority::Root, &op(TaskAct::Open, "", "task"), 100, &r);
+        t.apply("mimi", Authority::Leader,
+            &plan_op("t1", &[("tama", "still going"), ("kuro", "also going")]), 100, &r);
+        t.apply("tama", Authority::Peer, &op(TaskAct::Done, "t1.1", "result"), 200, &r);
+        t.apply("mimi", Authority::Leader, &op(TaskAct::Clear, "t1.1", ""), 200, &r);
+        let lines = t.open_work_lines();
+        // the cleared one is finished knowledge; only live work carries over
+        check("compaction carries open sub-tasks, not cleared ones",
+              lines.len() == 1 && lines[0].contains("t1.2") && lines[0].contains("kuro"),
+              &mut passed);
     }
 
     libakuma::print(&format!("  result: {}/{}\n", passed, total));
     if passed == total { 0 } else { 1 }
+}
+
+#[cfg(feature = "tests")]
+fn libackuma_note(a: &str, b: &str, c: &str, d: &str, e: &str, f: &str) {
+    libakuma::print(&format!("      notes: {} | {} | {} | {} | {} | {}\n", a, b, c, d, e, f));
 }

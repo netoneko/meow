@@ -143,6 +143,64 @@ pub fn tool_send_message(to: &str, body: &str, round: i64) -> ToolResult {
     hub::tool_send_message(&addr, &from, to, body, round)
 }
 
+/// `TaskUpdate` — the single public verb for every per-sub-task act.
+///
+/// One tool with a `status` enum rather than five (`claim`/`done`/`failed`/
+/// `clear`/`reopen`/`artifact`): the acts share their arguments, a small
+/// model picks a value more reliably than it picks among near-identical
+/// tool names, and a new act — `failed` was the first — costs a value
+/// rather than new surface.
+pub fn tool_task_update(task: &str, status: &str, text: &str) -> ToolResult {
+    let from = match require_agent_name() {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let Some(act) = litter_wire::TaskAct::parse(status) else {
+        return ToolResult::err(
+            "'status' must be one of: claim, done, failed, clear, reopen, artifact",
+        );
+    };
+    if matches!(act, litter_wire::TaskAct::Plan) {
+        return ToolResult::err("use the TaskPlan tool to plan a task");
+    }
+    if text.len() > MAX_MESSAGE_SIZE {
+        return ToolResult::err("'text' too large (max 32KB)");
+    }
+    let addr = match hub_gate() {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    hub::tool_task(&addr, &from, litter_wire::TaskOp::new(act, String::from(task), String::from(text)))
+}
+
+/// `TaskPlan` — the leader splitting a parent into directed sub-tasks.
+///
+/// Separate from `TaskUpdate` because it is the one act with a different
+/// shape: a list of (assignee, brief) pairs, submitted **atomically**. A
+/// plan that arrived in pieces would leave the table unable to tell that
+/// planning had finished, and "all sub-tasks cleared" — the trigger for the
+/// final artifact — would never fire.
+pub fn tool_task_plan(task: &str, assignments: &[(String, String)]) -> ToolResult {
+    let from = match require_agent_name() {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if assignments.is_empty() {
+        return ToolResult::err("TaskPlan needs at least one assignment");
+    }
+    let addr = match hub_gate() {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    let op = litter_wire::TaskOp {
+        act: litter_wire::TaskAct::Plan,
+        id: String::from(task),
+        text: alloc::string::String::new(),
+        plan: assignments.to_vec(),
+    };
+    hub::tool_task(&addr, &from, op)
+}
+
 pub fn tool_read_inbox() -> ToolResult {
     let me = match require_agent_name() {
         Ok(n) => n,

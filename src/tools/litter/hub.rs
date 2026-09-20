@@ -263,6 +263,26 @@ pub fn tool_send_message(addr: &str, from: &str, to: &str, body: &str, round: i6
     }
 }
 
+/// Submit one task record and hand the state machine's note straight back
+/// to the model. The note is the only way an agent learns it guessed wrong
+/// — "refused: t1.1 is assigned to kuro" is actionable, a silent no-op is
+/// not.
+pub fn tool_task(addr: &str, from: &str, op: litter_wire::TaskOp) -> ToolResult {
+    let req = Request::Task { from: String::from(from), op };
+    match call(addr, &req) {
+        Ok(Response::Task { note }) => {
+            if note.starts_with("refused") {
+                ToolResult::err(note)
+            } else {
+                ToolResult::ok(note)
+            }
+        }
+        Ok(Response::Error { message }) => ToolResult::err(message),
+        Ok(other) => ToolResult::err(format!("hub returned an unexpected response to 'task': {:?}", other)),
+        Err(e) => ToolResult::err(e),
+    }
+}
+
 pub fn tool_read_inbox(addr: &str, me: &str) -> ToolResult {
     match inbox_messages(addr, me) {
         Ok(messages) => ToolResult::ok(format_inbox(me, &messages)),

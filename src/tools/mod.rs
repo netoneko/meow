@@ -100,7 +100,26 @@ pub fn execute_tool_by_name(name: &str, args_json: &str) -> Option<ToolResult> {
             Some(litter::tool_send_message(&to, &body, round))
         }
         #[cfg(feature = "litter")]
-        "ReadInbox" => Some(litter::tool_read_inbox()),
+        "TaskUpdate" => {
+            let task = extract_string_field(args_json, "task")?;
+            let status = extract_string_field(args_json, "status")?;
+            // `text` is optional: claim and clear carry none.
+            let text = extract_string_field(args_json, "text").unwrap_or_default();
+            Some(litter::tool_task_update(&task, &status, &text))
+        }
+        #[cfg(feature = "litter")]
+        "TaskPlan" => {
+            let task = extract_string_field(args_json, "task")?;
+            // Two parallel arrays out of the flat walker, zipped back into
+            // pairs. A model that emits a ragged plan (a `who` with no
+            // `what`) loses the tail rather than the whole call — `zip`
+            // stops at the shorter side, which is the forgiving reading.
+            let who = crate::json::strings_at(args_json, &["assignments", "*", "who"]);
+            let what = crate::json::strings_at(args_json, &["assignments", "*", "what"]);
+            let pairs: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> =
+                who.into_iter().zip(what).collect();
+            Some(litter::tool_task_plan(&task, &pairs))
+        }
         #[cfg(feature = "litter")]
         "ListPeers" => Some(litter::tool_list_peers()),
         _ => None,
