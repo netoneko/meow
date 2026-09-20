@@ -51,6 +51,26 @@ pub extern "C" fn main() {
     tools::litter::set_static_peers_spec(app_config.litter_static_peers.clone());
     #[cfg(feature = "litter")]
     tools::litter::set_litter_name(app_config.litter_name.clone());
+    #[cfg(feature = "litter")]
+    {
+        // No signing key configured → generate one now and persist it: a
+        // litter's key must be stable or peers pinning its public key see
+        // every signature break on the next boot. One line of warning, once.
+        if app_config.litter_key.is_none() {
+            match tools::litter::sig::generate_seed() {
+                Some(seed) => {
+                    app_config.litter_key = Some(seed.clone());
+                    match app_config.save() {
+                        Ok(()) => libakuma::print("litter: no signing key found — generated a new litter signing key and saved it to the config\n"),
+                        Err(e) => libakuma::print(&format!("litter: generated a signing key but could NOT save it ({}): signatures will rotate every boot!\n", e)),
+                    }
+                }
+                None => libakuma::print("litter: no signing key configured and key generation failed — relay disabled\n"),
+            }
+        }
+        tools::litter::sig::set_our_key(app_config.litter_key.as_deref());
+        tools::litter::sig::set_peer_keys(app_config.litter_peer_keys.as_deref());
+    }
     // Bootstrap: a hub-backed litter member joins the hub's roster as part of
     // its own startup, every invocation — see `tools::litter::hub::bootstrap`.
     // Filesystem-mode litter (no `litter_hub_addr`) needs no equivalent step:

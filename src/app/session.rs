@@ -1,21 +1,39 @@
 //! Session management.
 //!
-//! Each conversation lives in its own directory under `/tmp/meow/<id>/`
-//! (sandbox-prefixed when running sandboxed). A session id is derived from the
-//! wall clock and pid so concurrent `meow` invocations don't collide and the
-//! id is easy to correlate with logs after the fact.
+//! Each conversation lives in its own directory under `<root>/tmp/meow/<id>/`,
+//! where `<root>` carries both the sandbox prefix and the `MEOW_HOME` scope.
+//! A session id is derived from the wall clock and pid so concurrent `meow`
+//! invocations don't collide and the id is easy to correlate with logs.
 
 use alloc::format;
 use alloc::string::String;
 
-/// Sandbox-aware root directory holding every session.
+/// Root directory holding every session, scoped two ways.
+///
+/// **`MEOW_HOME` first**, because sessions are per-agent state and several
+/// resident agents share one box's filesystem: an unscoped `/tmp/meow` puts
+/// every agent's conversations in one directory, told apart only by the
+/// `<secs>-<pid>` leaf — i.e. by a pid, not by who the agent is. Scoping it
+/// gives `/agents/panther/tmp/meow`, beside that agent's `etc/meow/config`,
+/// which is where the rest of its state already lives.
+///
+/// Unlike `config::scoped()`, the leading slash is kept: that helper returns
+/// a path relative to `/` and works only because the agents are launched with
+/// `cd /`. A session root is handed to `mkdir_p` and printed in logs, so it
+/// is built absolute here rather than inheriting that assumption.
 pub fn sessions_root() -> String {
     let sandbox = crate::tools::get_sandbox_root();
-    if sandbox == "/" {
-        String::from("/tmp/meow")
-    } else {
-        format!("{}/tmp/meow", sandbox)
+    let scope = crate::config::scope();
+    let mut root = String::new();
+    if sandbox != "/" {
+        root.push_str(&sandbox);
     }
+    if !scope.is_empty() {
+        root.push('/');
+        root.push_str(scope);
+    }
+    root.push_str("/tmp/meow");
+    root
 }
 
 /// Generate a reasonably-unique, filesystem-safe session id.

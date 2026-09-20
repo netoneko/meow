@@ -61,14 +61,54 @@ const EVENT_LOG_CAP: usize = 512;
 const RELAY_LOG_CAP: usize = 256;
 
 /// One outbound message recorded for the relay plane: `to` as the sender
-/// addressed it (GROUP_NAME for broadcasts) plus the stamped message. The
-/// raft thread drains this log to peer litters (see `live::relay_tick`).
+/// addressed it (GROUP_NAME for broadcasts), the stamped message, and the
+/// sender's own envelope — origin litter, origin ts and origin signature,
+/// exactly as they arrived. The hub is a courier here, not a signer: it
+/// never mints a signature over words it did not say.
+/// The raft thread drains this log to peer litters (see `live::relay_tick`).
 pub struct RelayEntry {
     pub to: String,
     pub msg: Message,
+    /// The litter the sender belongs to (envelope `ol`) — ours, since only
+    /// locally-originated traffic is ever captured here.
+    pub origin_litter: String,
+    /// The SENDER's timestamp, which is what its signature commits to.
+    /// Distinct from `msg.ts`, the hub's own monotonic stamp: that one
+    /// orders our history and drives the relay cursor, this one goes on
+    /// the wire and must be reproduced byte-for-byte to verify `sig`.
+    pub origin_ts: u64,
+    /// The sender's signature, made in the sender's process with the
+    /// sender's key. Relayed verbatim; never re-signed.
+    pub origin_sig: String,
 }
+
+/// Cap on how many folded-message summaries one compaction marker
 /// carries. The marker is a summary, not an archive.
 const MARKER_SUMMARY_LINES: usize = 20;
+
+/// Seen-set entry: dedup metadata only — origin litter, origin **agent**
+/// and origin ts, plus the agent that relayed it here.
+///
+/// The identity is the (litter, agent, ts) triple rather than (litter, ts):
+/// now that the sender stamps `ot` from its own clock, two agents in one
+/// litter can hand out the same microsecond, and keying on the pair alone
+/// would silently drop the second one as a duplicate. `rl` is kept for
+/// provenance ("who carried it"), not for dedup — an echo of our own
+/// words is caught earlier, by `ol` matching our litter.
+///
+/// No bodies, no signatures — the history already has the transcript.
+pub struct Seen {
+    pub ol: String,
+    pub from: String,
+    pub ot: u64,
+    pub rl: String,
+}
+
+/// Seen-set cap backstop: entries are age-pruned every relayed-in accept
+/// (past the cutoff "seen" is forgotten on purpose — the age guard then
+/// discards the replayed message anyway), but a hostile flood must not
+/// grow the table unbounded between prunes either.
+const SEEN_CAP: usize = 512;
 
 pub struct HubState {
     roster: Vec<String>,
@@ -88,6 +128,9 @@ pub struct HubState {
     /// Captured in `handle` (pure state), drained by the raft thread's
     /// relay tick — never by `handle` itself, which does no I/O.
     pub relay_log: Vec<RelayEntry>,
+    /// Relay metadata for traffic already delivered from peer litters —
+    /// the dedup table ("delivered once is the contract"), pruned by age.
+    pub seen: Vec<Seen>,
 }
 
 impl HubState {
@@ -103,6 +146,7 @@ impl HubState {
             events: Vec::new(),
             tasks: TaskTable::new(),
             relay_log: Vec::new(),
+            seen: Vec::new(),
         }
     }
 
@@ -164,6 +208,18 @@ impl HubState {
         self.last_ts
     }
 
+    /// Drop seen-table entries past the relay age cutoff: past it the age
+    /// guard discards any replay anyway, so remembering the (ol, ot) pair
+    /// buys nothing. Called on every relayed-in accept, so the table is
+    /// steady-state small.
+    fn prune_seen(&mut self) {
+        let cutoff = crate::util::now_us().saturating_sub(super::live::RELAY_MAX_AGE_US);
+        self.seen.retain(|s| s.ot >= cutoff);
+        while self.seen.len() > SEEN_CAP {
+            self.seen.remove(0);
+        }
+    }
+
     /// Handle one already-decoded request and produce the response. Pure
     /// state transition, no I/O — the half the test suite drives directly.
     pub fn handle(&mut self, req: Request) -> Response {
@@ -181,7 +237,7 @@ impl HubState {
                 }
                 Response::Joined
             }
-            Request::Send { from, to, body, round } => {
+            Request::Send { from, to, body, round, ol, ot, sig, rl, rs } => {
                 if !is_valid_name(&from) {
                     return Response::Error { message: String::from("'from' must be a plain agent name") };
                 }
@@ -192,6 +248,60 @@ impl HubState {
                     return Response::Error { message: String::from("send requires a non-empty body") };
                 }
                 let bytes = body.len();
+                // Relay-plane split, first: is this relayed-in traffic?
+                // `rl` is the discriminator, not `sig` — locally originated
+                // messages are signed too now (the SENDER signs them, in
+                // its own process), and only a message some agent actually
+                // carried across a litter boundary has a relayer.
+                //
+                // Both signatures are checked against the same canonical
+                // payload: `sig` proves which agent said it, `rs` which
+                // agent brought it. Dedup is metadata-only — (origin
+                // litter, origin agent, origin ts) identifies the message,
+                // so a repeat is dropped without touching any inbox, and
+                // `ol == our litter` means our own words bounced back. The
+                // table is pruned by the relay age cutoff, so "already
+                // seen" only ever means "recently seen".
+                if rl.is_some() {
+                    let (Some(ol), Some(ot), Some(sig)) = (&ol, &ot, &sig) else {
+                        return Response::Error { message: String::from("relayed send is missing its origin envelope") };
+                    };
+                    let Some(rs) = &rs else {
+                        return Response::Error { message: String::from("relayed send is missing its relayer signature") };
+                    };
+                    let rl = match &rl { Some(rl) => rl, None => unreachable!() };
+                    let payload = super::sig::relay_payload(ol, &from, &to, &body, *ot);
+                    if !super::sig::verify_payload(&from, &payload, sig) {
+                        return Response::Error { message: format!("origin signature from '{}' failed verification", from) };
+                    }
+                    if !super::sig::verify_payload(rl, &payload, rs) {
+                        return Response::Error { message: format!("relayer signature from '{}' failed verification", rl) };
+                    }
+                    // Our own litter's words coming back to us: never
+                    // deliver them a second time, whoever carried them.
+                    if super::sig::our_litter_name().as_deref() == Some(ol.as_str()) {
+                        return Response::Sent { bytes };
+                    }
+                    self.prune_seen();
+                    let duplicate = self.seen.iter().any(|s| s.ol == *ol && s.ot == *ot && s.from == from);
+                    if !duplicate {
+                        self.seen.push(Seen { ol: ol.clone(), from: from.clone(), ot: *ot, rl: rl.clone() });
+                        // The sender is the sender: `from` stays the bare
+                        // origin agent name — provenance rides the envelope
+                        // (ol/rl), it never rewrites who said it.
+                        let ts = self.stamp();
+                        if to == GROUP_NAME {
+                            let members = self.roster.clone();
+                            for member in members {
+                                self.deliver(&member, Message::chat(from.clone(), round, body.clone(), ts));
+                            }
+                        } else {
+                            self.deliver(&to, Message::chat(from.clone(), round, body.clone(), ts));
+                        }
+                    }
+                    return Response::Sent { bytes };
+                }
+
                 // Sender role is hub-authoritative, stamped at delivery:
                 // the leader's own messages are leader-traffic, the fixed
                 // `root` identity is the operator, everyone else is a peer.
@@ -204,17 +314,32 @@ impl HubState {
                 };
                 let msg = Message { role, ..Message::chat(from, round, body, self.stamp()) };
 
-                // Relay-plane capture: every outbound chat is recorded (with
-                // its original `to`) for the raft thread to forward to peer
-                // litters. Relayed-IN traffic (from `<litter>-<agent>`) is
-                // never captured — the hyphen marks it: capture would make
-                // every hub a transit node and the mesh a broadcast storm
-                // (caught live by the swarm sim). Task/system traffic
-                // (assignments, markers, done lines) stays litter-local.
-                if msg.kind == litter_wire::MessageKind::Chat && !msg.from.contains('-') {
-                    self.relay_log.push(RelayEntry { to: to.clone(), msg: msg.clone() });
-                    if self.relay_log.len() > RELAY_LOG_CAP {
-                        self.relay_log.remove(0);
+                // Relay-plane capture: every locally-originated outbound
+                // chat is recorded (with its original `to` and its origin
+                // signature, signed here exactly once) for the raft thread
+                // to forward. Envelope-carrying traffic never reaches this
+                // branch (returned above), so no hub is ever a transit
+                // node: relay is exactly one hop, by construction. Task/
+                // system traffic (assignments, markers, done lines) stays
+                // litter-local.
+                if msg.kind == litter_wire::MessageKind::Chat {
+                    // The sender's own signature is what gets relayed — the
+                    // hub carries it, it does not mint one. An unsigned
+                    // message (no litter identity configured at the sender,
+                    // or a client from before the envelope) is simply not
+                    // relayable: it stays litter-local rather than going out
+                    // over someone else's name.
+                    if let (Some(ol), Some(ot), Some(sig)) = (&ol, &ot, &sig) {
+                        self.relay_log.push(RelayEntry {
+                            to: to.clone(),
+                            msg: msg.clone(),
+                            origin_litter: ol.clone(),
+                            origin_ts: *ot,
+                            origin_sig: sig.clone(),
+                        });
+                        if self.relay_log.len() > RELAY_LOG_CAP {
+                            self.relay_log.remove(0);
+                        }
                     }
                 }
 
@@ -234,12 +359,9 @@ impl HubState {
                         // Completion knowledge belongs in history: a short
                         // system line under the group name.
                         let done_line = Message {
-                            from: String::from(GROUP_NAME),
-                            round: msg.round,
-                            body: format!("[done] {}", summary),
-                            ts: self.stamp(),
                             kind: litter_wire::MessageKind::Done,
                             role: litter_wire::SenderRole::Leader,
+                            ..Message::chat(String::from(GROUP_NAME), msg.round, format!("[done] {}", summary), self.stamp())
                         };
                         let members = self.roster.clone();
                         for member in members {
@@ -326,7 +448,7 @@ impl HubState {
             let members_ok = self.roster.iter().any(|n| n == &to);
             if members_ok {
                 let ts = self.stamp();
-self.deliver(&to, Message { from: String::from(GROUP_NAME), round: 0, body, ts, kind: litter_wire::MessageKind::Assignment, role: litter_wire::SenderRole::Leader });
+self.deliver(&to, Message { kind: litter_wire::MessageKind::Assignment, role: litter_wire::SenderRole::Leader, ..Message::chat(String::from(GROUP_NAME), 0, body, ts) });
             }
         }
         for e in events {
@@ -361,12 +483,9 @@ self.deliver(&to, Message { from: String::from(GROUP_NAME), round: 0, body, ts, 
                     msgs.drain(..idx);
                     for b in prior_marker_bodies.drain(..) {
                         msgs.insert(0, Message {
-                            from: String::from(GROUP_NAME),
-                            round: 0,
-                            body: b,
-                            ts: Self::now_us(),
                             kind: litter_wire::MessageKind::Marker,
                             role: litter_wire::SenderRole::Leader,
+                            ..Message::chat(String::from(GROUP_NAME), 0, b, Self::now_us())
                         });
                     }
                 }
@@ -401,12 +520,9 @@ self.deliver(&to, Message { from: String::from(GROUP_NAME), round: 0, body, ts, 
         }
 
         let marker = Message {
-            from: String::from(GROUP_NAME),
-            round: 0,
-            body,
-            ts: Self::now_us(),
             kind: litter_wire::MessageKind::Marker,
             role: litter_wire::SenderRole::Leader,
+            ..Message::chat(String::from(GROUP_NAME), 0, body, Self::now_us())
         };
         for (_, msgs) in self.inboxes.iter_mut() {
             // replace any surviving old markers with the single fresh one
@@ -556,7 +672,7 @@ pub fn run_tests() -> i32 {
         let mut hub = HubState::new();
         hub.handle(Request::Join { name: String::from("hercules") });
         for i in 0..10u64 {
-            let r = hub.handle(Request::Send { from: String::from("hercules"), to: String::from("hercules"), body: format!("m{}", i), round: i as i64 });
+            let r = hub.handle(Request::send(String::from("hercules"), String::from("hercules"), format!("m{}", i), i as i64));
             let _ = r;
         }
         // Give the messages distinct ts values by construction: send twice
@@ -579,7 +695,7 @@ pub fn run_tests() -> i32 {
         for n in ["sherlock", "hercules", "zenigata"] {
             hub.handle(Request::Join { name: String::from(n) });
         }
-        hub.handle(Request::Send { from: String::from("sherlock"), to: String::from(GROUP_NAME), body: String::from("attention all"), round: 2 });
+        hub.handle(Request::send(String::from("sherlock"), String::from(GROUP_NAME), String::from("attention all"), 2));
         let every_member_has_it = ["sherlock", "hercules", "zenigata"].iter().all(|n| {
             matches!(hub.handle(Request::Inbox { name: String::from(*n) }),
                 Response::Inbox { messages } if messages.iter().any(|m| m.body == "attention all"))
@@ -595,7 +711,7 @@ pub fn run_tests() -> i32 {
         let mut hub = HubState::new();
         hub.handle(Request::Join { name: String::from("sherlock") });
         for i in 0..KEEP_RECENT + 5 {
-            hub.handle(Request::Send { from: String::from("sherlock"), to: String::from("sherlock"), body: format!("msg {}", i), round: i as i64 });
+            hub.handle(Request::send(String::from("sherlock"), String::from("sherlock"), format!("msg {}", i), i as i64));
         }
         let folded = hub.compact();
         let inbox = hub.handle(Request::Inbox { name: String::from("sherlock") });
@@ -610,20 +726,37 @@ pub fn run_tests() -> i32 {
         }
     }
 
-    // relay log: outbound chat is captured with its original `to`, ts
-    // strictly increasing (the per-peer relay cursor's ordering key)
+    // relay log: outbound chat is captured with its original `to` and the
+    // SENDER's envelope, carried verbatim. An unsigned send is never
+    // captured — the hub will not put words on the wire under a name it
+    // cannot prove, so no identity/key means an empty log.
     total += 1;
     {
+        crate::tools::litter::set_litter_name(Some(String::from("yard")));
+        // A real 32-byte Ed25519 seed: `SigningKey::from_bytes` takes
+        // exactly 32, and a short hex string silently leaves the key unset
+        // (relay off) rather than failing loudly — which is what made this
+        // test pass vacuously before.
+        super::sig::set_our_key(Some(&"ab".repeat(32)));
         let mut hub = HubState::new();
-        hub.handle(Request::Send { from: String::from("sherlock"), to: String::from(GROUP_NAME), body: String::from("broadcast"), round: 1 });
-        hub.handle(Request::Send { from: String::from("sherlock"), to: String::from("rylen-tiger"), body: String::from("direct"), round: 1 });
+        hub.handle(super::sig::signed_send("sherlock", GROUP_NAME, "broadcast", 1));
+        hub.handle(super::sig::signed_send("sherlock", "tiger", "direct", 1));
+        // ...and one unsigned send, which must not be relayable.
+        hub.handle(Request::send(String::from("sherlock"), String::from(GROUP_NAME), String::from("unsigned"), 1));
         let ok = hub.relay_log.len() == 2
             && hub.relay_log[0].to == GROUP_NAME
-            && hub.relay_log[1].to == "rylen-tiger"
+            && hub.relay_log[1].to == "tiger"
             && hub.relay_log[0].msg.ts < hub.relay_log[1].msg.ts
-            && hub.relay_log.iter().all(|e| e.msg.kind == litter_wire::MessageKind::Chat);
+            && hub.relay_log.iter().all(|e| {
+                e.msg.kind == litter_wire::MessageKind::Chat
+                    && e.origin_litter == "yard"
+                    && e.origin_ts > 0
+                    && !e.origin_sig.is_empty()
+            });
         if ok { passed += 1; }
         else { libakuma::print(&format!("  [!] relay log: {:?}\n", hub.relay_log.iter().map(|e| (e.to.clone(), e.msg.ts)).collect::<Vec<_>>())); }
+        crate::tools::litter::set_litter_name(None);
+        super::sig::set_our_key(None);
     }
 
     // task hooks: [task] seeds the table, coordinator tick assigns and
@@ -632,12 +765,12 @@ pub fn run_tests() -> i32 {
     {
         let mut hub = HubState::new();
         hub.handle(Request::Join { name: String::from("sherlock") });
-        hub.handle(Request::Send { from: String::from("root"), to: String::from(GROUP_NAME), body: String::from("[task] audit main.rs"), round: 0 });
+        hub.handle(Request::send(String::from("root"), String::from(GROUP_NAME), String::from("[task] audit main.rs"), 0));
         hub.task_tick();
         let inbox = hub.handle(Request::Inbox { name: String::from("sherlock") });
         let msgs = match inbox { Response::Inbox { messages } => messages, _ => Vec::new() };
         let got_assignment = msgs.iter().any(|m| m.body.starts_with("[assigned: t1]") && m.body.contains("audit main.rs"));
-        let done = hub.handle(Request::Send { from: String::from("sherlock"), to: String::from(GROUP_NAME), body: String::from("[done: t1] all clear"), round: 0 });
+        let done = hub.handle(Request::send(String::from("sherlock"), String::from(GROUP_NAME), String::from("[done: t1] all clear"), 0));
         let peers = hub.handle(Request::Peers { since: 0 });
         let done_ok = matches!(done, Response::Sent { .. })
             && matches!(&peers, Response::Peers { events, .. } if events.iter().any(|e| e.contains("t1 done by sherlock")))

@@ -19,6 +19,7 @@ pub mod live;
 pub mod observe;
 pub mod raft;
 pub mod serve;
+pub mod sig;
 pub mod tasks;
 
 use alloc::string::String;

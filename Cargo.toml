@@ -77,6 +77,13 @@ litter-raft = { path = "crates/litter-raft" }
 # as litter-raft, and shared with `litter-hub` itself so the two ends of the
 # wire can't independently drift.
 litter-wire = { path = "crates/litter-wire" }
+# Ed25519 keys/signatures + sha256 for the relay envelope (origin/relayer
+# signatures, dedup checksums) — same versions akuma-ssh-crypto pins (sshd
+# uses the identical pair), no_std; default features off sheds the curve25519
+# precomputed tables (~30 KB) and zeroize: a hub signs once per outbound
+# chat, not a hot loop.
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10", default-features = false }
 # JSON. no_std, allocation-free, non-recursive pull parser — same choice and
 # feature set `box` already made (see userspace/box/Cargo.toml): no floats
 # needed for chat-API/tool-call JSON, and float-skip steps over one rather

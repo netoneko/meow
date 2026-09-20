@@ -197,10 +197,22 @@ pub struct Config {
     /// instead — the hub is opt-in, not a replacement, so an install with no
     /// hub configured keeps working exactly as before.
     pub litter_hub_addr: Option<String>,
-    /// This litter's own identity for cross-litter relay: relayed messages
-    /// travel as `<litter_name>-<agent>` on the remote side (see
-    /// `live::relay_tick`). Absent = relay disabled.
+    /// The litter (swarm) this agent belongs to: the wire envelope's `ol`
+    /// field, which says where a relayed message came from. Absent = relay
+    /// disabled. It is not a signing identity — agents sign, litters do not.
     pub litter_name: Option<String>,
+    /// **This agent's** Ed25519 secret seed, 64 hex chars. It signs the
+    /// messages this agent says (`sig`) and, when this agent's hub relays
+    /// someone else's, the carrying hop (`rs`). Every scope has its own,
+    /// generated and saved on first run when absent — so keep it stable:
+    /// anyone pinning this agent's public key is pinning this seed
+    /// (docs/LITTER_RELAY_TOPOLOGY.md).
+    pub litter_key: Option<String>,
+    /// Known public keys, `name:<64-hex-pubkey>,...` — a **guest list**,
+    /// not a name binding: any listed key may verify any envelope. Unset
+    /// (the default) accepts every well-formed envelope, which is what
+    /// lets two fresh litters join by pointing at each other.
+    pub litter_peer_keys: Option<String>,
     /// Static peers the raft thread probes on its tick — `name@host:port`
     /// entries (comma-separated) for agents on other hosts (the
     /// trashcan/laptop split). First answer registers the peer with a
@@ -220,6 +232,8 @@ impl Default for Config {
             litter_agent_name: None,
             litter_hub_addr: None,
             litter_name: None,
+            litter_key: None,
+            litter_peer_keys: None,
             litter_static_peers: None,
         }
     }
@@ -329,6 +343,8 @@ impl Config {
             litter_agent_name: None,
             litter_hub_addr: None,
             litter_name: None,
+            litter_key: None,
+            litter_peer_keys: None,
             litter_static_peers: None,
         };
 
@@ -402,6 +418,16 @@ impl Config {
                         "litter_name" => {
                             if !value.is_empty() {
                                 config.litter_name = Some(String::from(value));
+                            }
+                        }
+                        "litter_key" => {
+                            if !value.is_empty() {
+                                config.litter_key = Some(String::from(value));
+                            }
+                        }
+                        "litter_peer_keys" => {
+                            if !value.is_empty() {
+                                config.litter_peer_keys = Some(String::from(value));
                             }
                         }
                         _ => {}
@@ -489,6 +515,16 @@ impl Config {
         if let Some(ref name) = self.litter_name {
             content.push_str("litter_name=");
             content.push_str(name);
+            content.push('\n');
+        }
+        if let Some(ref key) = self.litter_key {
+            content.push_str("litter_key=");
+            content.push_str(key);
+            content.push('\n');
+        }
+        if let Some(ref keys) = self.litter_peer_keys {
+            content.push_str("litter_peer_keys=");
+            content.push_str(keys);
             content.push('\n');
         }
 
@@ -627,18 +663,19 @@ impl Config {
         total += 1;
         {
             let empty = Config::parse("current_model=testmodel\n");
-            let set = Config::parse("litter_name=yard\n");
+            let set = Config::parse("litter_name=yard\nlitter_key=aabb0011\nlitter_peer_keys=island:ccdd2233\n");
             let blank = Config::parse("litter_name=\n");
             if empty.litter_name.is_none()
                 && set.litter_name.as_deref() == Some("yard")
                 && blank.litter_name.is_none()
+                && set.litter_key.as_deref() == Some("aabb0011")
+                && set.litter_peer_keys.as_deref() == Some("island:ccdd2233")
                 && set.serialize().contains("litter_name=yard")
+                && set.serialize().contains("litter_key=aabb0011")
+                && set.serialize().contains("litter_peer_keys=island:ccdd2233")
             { passed += 1; }
             else {
-                libakuma::print(&format!(
-                    "  [!] litter_name: empty={:?} set={:?} blank={:?}\n",
-                    empty.litter_name, set.litter_name, blank.litter_name
-                ));
+                libakuma::print("  [!] litter relay key config round-trip failed\n");
             }
         }
 

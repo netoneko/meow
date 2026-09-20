@@ -44,6 +44,29 @@ api_key=your-gemini-key-here
 | `render_markdown` | Render Markdown in TUI | `true` |
 | `exit_on_escape` | Exit app on Escape key | `false` |
 
+## Litter Settings
+
+The swarm protocol (`docs/LITTER_EXPERIMENT.md`, `docs/LITTER_RAFT_LOOP.md`).
+All of it is inert until `litter_agent_name` is set, so a non-litter install
+can ignore this table.
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `litter_agent_name` | This agent's name in the litter. **Unset = not a litter member**; nothing below has any effect. | (unset) |
+| `litter_hub_addr` | `host:port` of the hub. One address for both jobs: agents *connect* to it, and whoever wins the bind race *listens* on it. `127.0.0.1:7700` keeps a litter inside one box; bind on a reachable address to let another host's relay in. | `127.0.0.1:7700` |
+
+### Cross-litter relay
+
+Joins two swarms (`docs/LITTER_RELAY_TOPOLOGY.md`). Keys belong to
+**agents**: each scope signs its own words.
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `litter_name` | The swarm this agent belongs to — the envelope's `ol`. **Unset ⇒ relay off.** Not a signing identity. | (unset) |
+| `litter_key` | **This agent's** Ed25519 seed, 64 hex chars. Generated and saved on first run when absent; keep it stable, since pinning this agent means pinning this seed. | (generated) |
+| `litter_peer_keys` | `name:<64-hex-pubkey>,…` — a **guest list**, not a name binding: any listed key may verify any envelope. Unset accepts every well-formed envelope, which is what lets two fresh litters join by pointing at each other. | (unset) |
+| `litter_static_peers` | `name@host:port,…` — peer litters to probe and relay to. | (unset) |
+
 ## Provider Settings
 
 Each `[provider:name]` section accepts:

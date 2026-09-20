@@ -50,7 +50,11 @@ pub use nojson::JsonParseError;
 /// not a field added, since every decode here already ignores unknown keys).
 /// v2: `Peers` became the pulse (event-bearing, cursor-aware) and `History`
 /// added paged reads.
-pub const PROTOCOL_VERSION: i64 = 2;
+/// v3: `Message` grew the relay envelope — `ol`/`ot`/`sig` (origin litter /
+/// origin ts / origin signature) and `rl`/`rs` (relayer litter / relayer
+/// signature). A v2 peer refuses a v3 client outright, so both sides of a
+/// relay link must run v3; plain same-litter traffic is shape-identical.
+pub const PROTOCOL_VERSION: i64 = 3;
 
 /// Sanity cap on a single frame's declared length, checked against the 4-byte
 /// header before a caller allocates a buffer for it — generous enough for a
@@ -159,12 +163,36 @@ pub struct Message {
     pub ts: u64,
     pub kind: MessageKind,
     pub role: SenderRole,
+    /// Relay envelope (all absent for locally-originated traffic):
+    /// `ol`/`ot`/`sig` — the ORIGIN litter's name, the ORIGIN hub's ts
+    /// (never re-stamped by a relayer), and the origin litter key's
+    /// signature over the canonical payload (see meow's sig module).
+    /// `rl`/`rs` — the relaying litter's name and its signature over the
+    /// same payload, one hop deep. Presence of `ol` is what marks a
+    /// message as relayed-in; a hub never re-captures or re-relays one.
+    pub ol: Option<String>,
+    pub ot: Option<u64>,
+    pub sig: Option<String>,
+    pub rl: Option<String>,
+    pub rs: Option<String>,
 }
 
 impl Message {
     /// A plain peer chat message (the overwhelmingly common case).
     pub fn chat(from: String, round: i64, body: String, ts: u64) -> Self {
-        Message { from, round, body, ts, kind: MessageKind::Chat, role: SenderRole::Peer }
+        Message {
+            from,
+            round,
+            body,
+            ts,
+            kind: MessageKind::Chat,
+            role: SenderRole::Peer,
+            ol: None,
+            ot: None,
+            sig: None,
+            rl: None,
+            rs: None,
+        }
     }
 }
 
@@ -183,6 +211,23 @@ impl DisplayJson for Message {
             }
             if self.role != SenderRole::Peer {
                 f.member("role", self.role.as_str())?;
+            }
+            // Relay envelope: absent unless this message crossed a litter
+            // boundary; ordinary litter-local traffic stays light.
+            if let Some(ol) = &self.ol {
+                f.member("ol", ol)?;
+            }
+            if let Some(ot) = self.ot {
+                f.member("ot", ot)?;
+            }
+            if let Some(sig) = &self.sig {
+                f.member("sig", sig)?;
+            }
+            if let Some(rl) = &self.rl {
+                f.member("rl", rl)?;
+            }
+            if let Some(rs) = &self.rs {
+                f.member("rs", rs)?;
             }
             Ok(())
         })
@@ -207,7 +252,12 @@ impl<'text, 'raw> TryFrom<RawJsonValue<'text, 'raw>> for Message {
             None => SenderRole::Peer,
             Some(r) => r.ok_or_else(|| value.invalid("unknown message 'role'"))?,
         };
-        Ok(Message { from, round: round.unwrap_or(0), body, ts: ts.unwrap_or(0), kind, role })
+        let ol: Option<String> = value.to_member("ol")?.try_into()?;
+        let ot: Option<u64> = value.to_member("ot")?.try_into()?;
+        let sig: Option<String> = value.to_member("sig")?.try_into()?;
+        let rl: Option<String> = value.to_member("rl")?.try_into()?;
+        let rs: Option<String> = value.to_member("rs")?.try_into()?;
+        Ok(Message { from, round: round.unwrap_or(0), body, ts: ts.unwrap_or(0), kind, role, ol, ot, sig, rl, rs })
     }
 }
 
@@ -219,7 +269,37 @@ pub enum Request {
     /// protocol"). Idempotent: joining a name already in the roster is a
     /// no-op, not an error, so re-sending it on every invocation is free.
     Join { name: String },
-    Send { from: String, to: String, body: String, round: i64 },
+    /// A message from one agent to another (or to the group).
+    ///
+    /// The envelope is signed by **agents**, and a key is an agent's
+    /// identity:
+    ///
+    /// - `ol`/`ot`/`sig` — origin litter, the **sender's own** timestamp,
+    ///   and the sender's signature over the canonical payload. The
+    ///   sending agent fills these in its own process, before the hub sees
+    ///   the message, so `sig` means "this agent said this" and nothing
+    ///   weaker. `ot` is the sender's clock rather than the hub's because
+    ///   the signed payload has to contain the timestamp.
+    /// - `rl`/`rs` — the relaying **agent's** name and its signature over
+    ///   that same payload, added by whichever agent's hub carried the
+    ///   message across a litter boundary. It never touches `sig`.
+    ///
+    /// `rl` is therefore the discriminator: present ⇒ this arrived from a
+    /// peer litter (verify, dedup, deliver); absent ⇒ locally originated
+    /// (role stamping, task hooks, relay capture). `from`/`to` are bare
+    /// agent names in every case — provenance rides the envelope and never
+    /// rewrites who said it.
+    Send {
+        from: String,
+        to: String,
+        body: String,
+        round: i64,
+        ol: Option<String>,
+        ot: Option<u64>,
+        sig: Option<String>,
+        rl: Option<String>,
+        rs: Option<String>,
+    },
     Inbox { name: String },
     /// The pulse: doubles as heartbeat observation (any answer = leader
     /// alive), roster fetch, and change feed. `since` is the caller's last
@@ -231,6 +311,24 @@ pub enum Request {
     History { name: String, before: u64, limit: u32 },
 }
 
+impl Request {
+    /// An ordinary litter-local send: no relay envelope. The overwhelmingly
+    /// common construction; envelope-carrying relays build the variant
+    /// directly.
+    /// An unsigned local send — litter-local traffic that will never be
+    /// relayed (and every caller from before the envelope existed).
+    pub fn send(from: String, to: String, body: String, round: i64) -> Self {
+        Request::Send { from, to, body, round, ol: None, ot: None, sig: None, rl: None, rs: None }
+    }
+
+    /// A locally-originated send carrying the sender's own signature.
+    /// `rl`/`rs` stay empty: nobody has relayed it yet, and that is what
+    /// tells the receiving hub this is local traffic.
+    pub fn signed(from: String, to: String, body: String, round: i64, ol: String, ot: u64, sig: String) -> Self {
+        Request::Send { from, to, body, round, ol: Some(ol), ot: Some(ot), sig: Some(sig), rl: None, rs: None }
+    }
+}
+
 impl DisplayJson for Request {
     fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> core::fmt::Result {
         match self {
@@ -239,13 +337,30 @@ impl DisplayJson for Request {
                 f.member("op", "join")?;
                 f.member("name", name)
             }),
-            Request::Send { from, to, body, round } => f.object(|f| {
+            Request::Send { from, to, body, round, ol, ot, sig, rl, rs } => f.object(|f| {
                 f.member("v", PROTOCOL_VERSION)?;
                 f.member("op", "send")?;
                 f.member("from", from)?;
                 f.member("to", to)?;
                 f.member("body", body)?;
-                f.member("round", *round)
+                f.member("round", *round)?;
+                // Relay envelope: absent on ordinary litter-local sends.
+                if let Some(ol) = ol {
+                    f.member("ol", ol)?;
+                }
+                if let Some(ot) = ot {
+                    f.member("ot", *ot)?;
+                }
+                if let Some(sig) = sig {
+                    f.member("sig", sig)?;
+                }
+                if let Some(rl) = rl {
+                    f.member("rl", rl)?;
+                }
+                if let Some(rs) = rs {
+                    f.member("rs", rs)?;
+                }
+                Ok(())
             }),
             Request::Inbox { name } => f.object(|f| {
                 f.member("v", PROTOCOL_VERSION)?;
@@ -374,7 +489,12 @@ pub fn decode_request(json: &str) -> Result<Request, WireError> {
             let to: String = value.to_member("to")?.required()?.try_into()?;
             let body: String = value.to_member("body")?.required()?.try_into()?;
             let round: Option<i64> = value.to_member("round")?.try_into()?;
-            Ok(Request::Send { from, to, body, round: round.unwrap_or(0) })
+            let ol: Option<String> = value.to_member("ol")?.try_into()?;
+            let ot: Option<u64> = value.to_member("ot")?.try_into()?;
+            let sig: Option<String> = value.to_member("sig")?.try_into()?;
+            let rl: Option<String> = value.to_member("rl")?.try_into()?;
+            let rs: Option<String> = value.to_member("rs")?.try_into()?;
+            Ok(Request::Send { from, to, body, round: round.unwrap_or(0), ol, ot, sig, rl, rs })
         }
         "inbox" => {
             let name: String = value.to_member("name")?.required()?.try_into()?;
@@ -478,10 +598,37 @@ mod tests {
             ts: 1234567890,
             kind: MessageKind::Chat,
             role: SenderRole::Peer,
+            ol: None,
+            ot: None,
+            sig: None,
+            rl: None,
+            rs: None,
         };
         let json = encode_message(&m);
+        // Envelope fields stay off the wire for litter-local traffic.
+        assert!(!json.contains("ol") && !json.contains("sig"));
         let back = decode_message(&json).expect("decode");
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn relay_envelope_round_trips() {
+        let m = Message {
+            from: String::from("al"),
+            round: 1,
+            body: String::from("cross-litter"),
+            ts: 42, // relayer's restamp
+            kind: MessageKind::Chat,
+            role: SenderRole::Peer,
+            ol: Some(String::from("yard")),
+            ot: Some(7), // origin ts survives
+            sig: Some(String::from("a1b2c3")),
+            rl: Some(String::from("island")),
+            rs: Some(String::from("d4e5f6")),
+        };
+        let json = encode_message(&m);
+        assert!(json.contains("\"ol\":\"yard\"") && json.contains("\"ot\":7") && json.contains("\"rs\":\"d4e5f6\""));
+        assert_eq!(decode_message(&json).expect("decode"), m);
     }
 
     #[test]
@@ -505,12 +652,12 @@ mod tests {
 
     #[test]
     fn send_request_round_trips() {
-        let r = Request::Send {
-            from: String::from("sherlock"),
-            to: String::from("hercules"),
-            body: String::from("what have you found?"),
-            round: 2,
-        };
+        let r = Request::send(
+            String::from("sherlock"),
+            String::from("hercules"),
+            String::from("what have you found?"),
+            2,
+        );
         let json = encode_request(&r);
         assert_eq!(decode_request(&json).expect("decode"), r);
     }
@@ -527,7 +674,7 @@ mod tests {
 
     #[test]
     fn decode_request_rejects_unknown_op() {
-        let json = "{\"v\":2,\"op\":\"launch_missiles\"}";
+        let json = "{\"v\":3,\"op\":\"deploy_confetti\"}";
         assert!(matches!(decode_request(json), Err(WireError::Parse(_))));
     }
 
@@ -577,7 +724,7 @@ mod tests {
         let r = Request::History { name: String::from("ressler"), before: 999, limit: 16 };
         assert_eq!(decode_request(&encode_request(&r)).expect("decode"), r);
 
-        let bare = decode_request("{\"v\":2,\"op\":\"history\",\"name\":\"ressler\"}").expect("decode");
+        let bare = decode_request("{\"v\":3,\"op\":\"history\",\"name\":\"ressler\"}").expect("decode");
         assert_eq!(bare, Request::History { name: String::from("ressler"), before: 0, limit: 32 });
     }
 
@@ -585,7 +732,7 @@ mod tests {
     fn peers_request_carries_event_cursor() {
         let r = Request::Peers { since: 42 };
         assert_eq!(decode_request(&encode_request(&r)).expect("decode"), r);
-        let bare = decode_request("{\"v\":2,\"op\":\"peers\"}").expect("decode");
+        let bare = decode_request("{\"v\":3,\"op\":\"peers\"}").expect("decode");
         assert_eq!(bare, Request::Peers { since: 0 });
     }
 
@@ -593,8 +740,8 @@ mod tests {
     fn inbox_response_round_trips_several_messages_in_order() {
         let r = Response::Inbox {
             messages: alloc::vec![
-                Message { from: String::from("a"), round: 0, body: String::from("first"), ts: 1, kind: MessageKind::Chat, role: SenderRole::Peer },
-                Message { from: String::from("b"), round: 1, body: String::from("second, with a \"quote\""), ts: 2, kind: MessageKind::Chat, role: SenderRole::Peer },
+                Message { from: String::from("a"), round: 0, body: String::from("first"), ts: 1, kind: MessageKind::Chat, role: SenderRole::Peer, ol: None, ot: None, sig: None, rl: None, rs: None },
+                Message { from: String::from("b"), round: 1, body: String::from("second, with a \"quote\""), ts: 2, kind: MessageKind::Chat, role: SenderRole::Peer, ol: None, ot: None, sig: None, rl: None, rs: None },
             ],
         };
         let json = encode_response(&r);
@@ -606,8 +753,8 @@ mod tests {
 
     #[test]
     fn decode_response_rejects_wrong_version() {
-        let json = "{\"v\":3,\"ok\":true,\"op\":\"peers\",\"names\":[]}";
-        assert!(matches!(decode_response(json), Err(WireError::UnsupportedVersion(3))));
+        let json = "{\"v\":4,\"ok\":true,\"op\":\"peers\",\"names\":[]}";
+        assert!(matches!(decode_response(json), Err(WireError::UnsupportedVersion(4))));
     }
 
     #[test]

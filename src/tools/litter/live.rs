@@ -48,8 +48,10 @@ const KEEP_RECENT: usize = serve::KEEP_RECENT;
 /// History page size when a cold-starting agent walks back to the marker.
 const HISTORY_PAGE: u32 = 32;
 /// How old an outbound chat may be and still cross a litter boundary —
-/// past this it's history, not news; the peer gets it via history, not replay.
-const RELAY_MAX_AGE_US: u64 = 60 * 1_000_000;
+/// past this it's history, not news; the peer gets it via history, not
+/// replay. Also the seen-table's memory: dedup metadata older than the
+/// cutoff is forgotten (a replay past it is discarded by this same guard).
+pub const RELAY_MAX_AGE_US: u64 = 60 * 1_000_000;
 
 /// One `name@host:port` entry from `litter_static_peers` in the config —
 /// a peer we want to know about even before (or without) it ever joining
@@ -109,6 +111,56 @@ enum Machine {
     },
 }
 
+// ============================================================================
+// Raft log: an append-only event file at `<MEOW_HOME>/var/raft.log` — state
+// transitions, relay traffic, task churn, all with second timestamps. The
+// stdout log is for whoever watches the yard; this one is for post-hoc
+// debugging of WHY the swarm did what it did. Best-effort: a failing append
+// is silently ignored, the raft never blocks on its log.
+//
+// It lives at the root of this agent's session tree, deliberately NOT inside
+// one session directory. Session leaves are `<secs>-<pid>`, so a
+// session-scoped raft log would be (a) identified by a pid rather than by
+// who the agent is, and (b) a NEW file on every restart — and herd runs
+// these with `restart = true`. An agent that crash-loops is precisely the
+// one whose raft log you want, and that is the one that would be scattered
+// across a dozen directories with the history in none of them. One file per
+// agent, appended across restarts, is what makes it readable. The session
+// root is itself `MEOW_HOME`-scoped (see `session::sessions_root`), which is
+// what keeps several agents in one box from sharing this file.
+// ============================================================================
+
+static mut RAFT_LOG_PATH: Option<String> = None;
+static RAFT_LOG_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Point the raft log at this agent's session root — `MEOW_HOME`-scoped, so
+/// one file per agent, sitting beside that agent's session directories.
+/// Returns the path so the caller can say where it went: an agent that
+/// cannot tell you where its log is has a log nobody reads.
+fn set_raft_log() -> String {
+    let dir = session::sessions_root();
+    libakuma::mkdir_p(&dir);
+    let path = format!("{}/raft.log", dir);
+    unsafe { *core::ptr::addr_of_mut!(RAFT_LOG_PATH) = Some(path.clone()) };
+    RAFT_LOG_INIT.store(true, core::sync::atomic::Ordering::Release);
+    path
+}
+
+fn raft_log(line: &str) {
+    if !RAFT_LOG_INIT.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let path = unsafe { (*core::ptr::addr_of!(RAFT_LOG_PATH)).clone() };
+    let Some(path) = path else { return };
+    let stamp = crate::util::now_us() / 1_000_000;
+    let full = format!("[{}] {}\n", stamp, line);
+    let fd = libakuma::open(&path, libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_APPEND);
+    if fd >= 0 {
+        libakuma::write_fd(fd, full.as_bytes());
+        libakuma::close(fd);
+    }
+}
+
 pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
     let me = match super::agent_name() {
         Some(n) => n,
@@ -118,6 +170,12 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
         }
     };
     let addr = hub::hub_addr().unwrap_or_else(|| String::from("127.0.0.1:7700"));
+
+    // Raft log rides this agent's own scope from here on, appended across
+    // restarts (see the note above `set_raft_log`).
+    let raft_log_path = set_raft_log();
+    raft_log(&format!("start agent={} hub={} model={}", me, addr, model));
+    libakuma::print(&format!("[live] raft log: {}\n", raft_log_path));
 
     // ---- Bootstrap (self-serve): join, then walk history back to the
     // marker. Both are plain client calls; if the hub isn't up, they fail
@@ -149,10 +207,12 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
             let static_peers = parse_static_peers(super::static_peers_spec().as_deref());
             start_raft_thread(&listener, &state, static_peers);
             libakuma::print(&format!("[live] {} holds the hub at {} (won the bind race) — raft thread up\n", me, addr));
+            raft_log(&format!("state=leader term=1 hub={}", addr));
             Machine::Leader { listener, state }
         }
         Err(_) => {
             libakuma::print(&format!("[live] {} joined the litter at {} (hub already up)\n", me, addr));
+            raft_log(&format!("state=follower hub={}", addr));
             Machine::Follower { epoch: 0, roster: Vec::new(), term: 0 }
         }
     };
@@ -195,6 +255,7 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                     }
                     if hub::unresponsive() {
                         libakuma::print(&format!("[live] {} is WAYWARD: hub silent for {}s\n", me, hub::silent_for_secs()));
+                        raft_log(&format!("state=wayward silent_for_s={}", hub::silent_for_secs()));
                         machine = Machine::Wayward { epoch: *epoch, roster: core::mem::take(roster), term: *term };
                         continue;
                     }
@@ -239,6 +300,7 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                             if let Ok(Response::Peers { names, term: t, epoch: e, .. }) = hub::peers(&addr, *epoch) {
                                 hub::mark_alive();
                                 libakuma::print(&format!("[live] {} is FOLLOWER again (hub answered after {}s)\n", me, hub::silent_for_secs()));
+                                raft_log(&format!("state=follower recovered silent_for_s={}", hub::silent_for_secs()));
                                 machine = Machine::Follower { epoch: e, roster: core::mem::take(roster), term: t.max(*term) };
                                 let _ = names;
                                 continue;
@@ -300,7 +362,7 @@ fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, stat
     let mut tick: u64 = 0;
     loop {
         tick += 1;
-        let relay_jobs = {
+        let batch = {
             let mut st = state.lock();
             serve::drain(&listener, &mut st);
             if tick % PULSE_TICKS == 0 {
@@ -319,8 +381,8 @@ fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, stat
         // send deadlines, never the hub (same rule as deadline-bounded
         // serve_one — see docs/LITTER_RELAY_TOPOLOGY.md for where this goes
         // long-term).
-        if !relay_jobs.is_empty() {
-            relay_send(&relay_jobs, static_peers);
+        if !batch.is_empty() {
+            relay_send(&batch, static_peers);
         }
         libakuma::sleep(TICK_SECS);
     }
@@ -328,57 +390,105 @@ fn raft_tick_loop(listener: Arc<TcpListener>, state: Arc<PMutex<HubState>>, stat
 
 /// Snapshot the outbound relay batch for every online peer, oldest first.
 /// Pure state read — the I/O happens in `relay_send`, outside the locks.
-/// Loop guard: a message whose sender already carries any known litter
-/// prefix (a peer's, or our own) was relayed IN — it never relays onward.
+/// Entries whose message already carries an envelope (`ol`) are relayed-in
+/// copies and can't occur in the log (capture rejects them upstream), but
+/// the guard stays as belt-and-braces: relay is exactly one hop.
 /// Age guard: chat older than RELAY_MAX_AGE_US is never relayed — a peer
 /// that comes back after a long partition resyncs through history, it does
 /// not get a replay of the debate it missed (see docs/LITTER_RELAY_TOPOLOGY.md).
-fn relay_jobs(st: &mut HubState, peers: &mut [StaticPeer]) -> Vec<(String, String, String, String, i64, u64)> {
-    let our = match super::litter_name() {
-        Some(n) => n,
-        None => return Vec::new(), // relay off: no litter identity configured
-    };
+/// One message queued for one peer hub. A struct rather than a tuple
+/// because two timestamps travel here and they are NOT interchangeable:
+/// `ot` is the sender's clock (what its signature commits to, what goes on
+/// the wire) and `cursor_ts` is our hub's own monotonic stamp (what the
+/// peer cursor is measured in). They were the same number back when the
+/// hub minted the signature; conflating them now would compare a remote
+/// agent's clock against a local cursor and skip or re-send traffic.
+pub struct RelayJob {
+    pub addr: String,
+    pub from: String,
+    pub to: String,
+    pub body: String,
+    pub round: i64,
+    pub ol: String,
+    pub ot: u64,
+    pub sig: String,
+    pub cursor_ts: u64,
+}
+
+fn relay_jobs(st: &mut HubState, peers: &mut [StaticPeer]) -> Vec<RelayJob> {
+    if super::sig::our_litter_name().is_none() {
+        return Vec::new(); // relay off: no litter identity configured
+    }
     let now = crate::util::now_us();
     let fresh_enough = |ts: u64| now.saturating_sub(ts) <= RELAY_MAX_AGE_US;
     let mut jobs = Vec::new();
     for peer in peers.iter().filter(|p| p.online) {
-        let peer_prefix = format!("{}-", peer.name);
-        let our_prefix = format!("{}-", our);
         for entry in &st.relay_log {
-            if entry.msg.ts <= peer.last_relay_ts || entry.msg.kind != MessageKind::Chat || !fresh_enough(entry.msg.ts) {
+            if entry.msg.ts <= peer.last_relay_ts
+                || entry.msg.kind != MessageKind::Chat
+                || entry.msg.ol.is_some()
+                || !fresh_enough(entry.msg.ts)
+            {
                 continue;
             }
-            if entry.msg.from.starts_with(&peer_prefix) || entry.msg.from.starts_with(&our_prefix) {
-                continue;
-            }
-            // Routing: group broadcast stays group; direct traffic to
-            // `<peer>-<agent>` is rewritten to the bare agent name on the
-            // far side; everything else is litter-local and not relayed.
+            // Routing: group broadcast stays group; direct traffic to a
+            // peer's agent keeps the bare name (the far side delivers to
+            // its own agent); everything else is litter-local, not relayed.
             let to = if entry.to == serve::GROUP_NAME {
                 String::from(serve::GROUP_NAME)
+            } else if litter_wire::is_valid_name(&entry.to) {
+                entry.to.clone()
             } else {
-                match entry.to.strip_prefix(&peer_prefix) {
-                    Some(bare) if litter_wire::is_valid_name(bare) => String::from(bare),
-                    _ => continue,
-                }
+                continue;
             };
-            jobs.push((peer.addr.clone(), format!("{}-{}", our, entry.msg.from), to, entry.msg.body.clone(), entry.msg.round, entry.msg.ts));
+            jobs.push(RelayJob {
+                addr: peer.addr.clone(),
+                from: entry.msg.from.clone(),
+                to,
+                body: entry.msg.body.clone(),
+                round: entry.msg.round,
+                ol: entry.origin_litter.clone(),
+                ot: entry.origin_ts,
+                sig: entry.origin_sig.clone(),
+                cursor_ts: entry.msg.ts,
+            });
         }
     }
     jobs
 }
 
-/// Drive one relay batch: cursor only advances on a confirmed `Sent`, so an
-/// unreachable peer simply re-drives its batch on a later tick (bounded by
-/// the relay log's cap, never queued unboundedly).
-fn relay_send(jobs: &[(String, String, String, String, i64, u64)], static_peers: &PMutex<Vec<StaticPeer>>) {
-    for (addr, from, to, body, round, ts) in jobs {
-        let req = Request::Send { from: from.clone(), to: to.clone(), body: body.clone(), round: *round };
-        if matches!(hub::call_addr(addr, &req), Ok(Response::Sent { .. })) {
-            let mut peers = static_peers.lock();
-            if let Some(p) = peers.iter_mut().find(|p| &p.addr == addr) {
-                p.last_relay_ts = p.last_relay_ts.max(*ts);
+/// Drive one relay batch. The relayer signs the same canonical payload the
+/// sender signed (`rs`) and stamps its own **agent** name (`rl`) — that is
+/// what "who carried it here" means; the sender's `sig` is passed through
+/// untouched. The cursor only advances on a confirmed `Sent`, in our hub's
+/// clock, so an unreachable peer simply re-drives its batch on a later
+/// tick (bounded by the relay log's cap and the age guard, never queued
+/// unboundedly).
+fn relay_send(jobs: &[RelayJob], static_peers: &PMutex<Vec<StaticPeer>>) {
+    let Some(me) = super::agent_name() else { return };
+    for job in jobs {
+        let payload = super::sig::relay_payload(&job.ol, &job.from, &job.to, &job.body, job.ot);
+        let Some(rs) = super::sig::sign_payload(&payload) else { return };
+        let req = Request::Send {
+            from: job.from.clone(),
+            to: job.to.clone(),
+            body: job.body.clone(),
+            round: job.round,
+            ol: Some(job.ol.clone()),
+            ot: Some(job.ot),
+            sig: Some(job.sig.clone()),
+            rl: Some(me.clone()),
+            rs: Some(rs),
+        };
+        match hub::call_addr(&job.addr, &req) {
+            Ok(Response::Sent { .. }) => {
+                raft_log(&format!("relay out to={} from={} round={} ot={}", job.addr, job.from, job.round, job.ot));
+                let mut peers = static_peers.lock();
+                if let Some(p) = peers.iter_mut().find(|p| p.addr == job.addr) {
+                    p.last_relay_ts = p.last_relay_ts.max(job.cursor_ts);
+                }
             }
+            _ => raft_log(&format!("relay fail to={} from={} ot={}", job.addr, job.from, job.ot)),
         }
     }
 }
@@ -496,10 +606,10 @@ fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str) {
 pub mod sim {
     use alloc::format;
     use alloc::string::String;
-    use alloc::vec::Vec;
     use alloc::vec;
+    use alloc::vec::Vec;
 
-    use litter_wire::{Request, Response, SenderRole};
+    use litter_wire::{Request, Response};
 
     use super::{parse_static_peers, relay_jobs, StaticPeer};
     use crate::tools::litter::serve::{HubState, RelayEntry, GROUP_NAME};
@@ -509,14 +619,39 @@ pub mod sim {
         name: &'static str,
         /// This litter's own hub address (what peers aim at).
         addr: &'static str,
+        /// The agents living here. Each one is a signing identity of its
+        /// own — a litter does not sign, its agents do.
+        agents: Vec<&'static str>,
         hub: HubState,
         peers: Vec<StaticPeer>,
     }
 
+    /// A deterministic 32-byte seed per AGENT name, derivable by every
+    /// participant in the sim. Mixing the index in matters: a seed built
+    /// from the first byte alone gave `al` and `amber` the same key, which
+    /// would have made a per-agent identity test pass for the wrong reason.
+    fn seed_for(name: &str) -> [u8; 32] {
+        let b = name.as_bytes();
+        core::array::from_fn(|i| b[i % b.len()].wrapping_add(i as u8))
+    }
+
+    fn key_hex_for(name: &str) -> String {
+        hex(&seed_for(name))
+    }
+
+    fn pub_hex_for(name: &str) -> String {
+        use ed25519_dalek::SigningKey;
+        hex(&SigningKey::from_bytes(&seed_for(name)).verifying_key().to_bytes())
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+    }
+
     impl Litter {
         /// A litter with `agents` joined and one leader, peering at `peers`
-        /// (all links simulated up — tests toggle them explicitly).
-        fn seed(name: &'static str, addr: &'static str, agents: &[&str], peers_spec: &str) -> Self {
+        /// (links simulated up).
+        fn seed(name: &'static str, addr: &'static str, agents: &[&'static str], peers_spec: &str) -> Self {
             let mut hub = HubState::new();
             hub.set_leader(agents[0], 1);
             for a in agents {
@@ -526,7 +661,7 @@ pub mod sim {
             for p in peers.iter_mut() {
                 p.online = true;
             }
-            Litter { name, addr, hub, peers }
+            Litter { name, addr, agents: agents.to_vec(), hub, peers }
         }
 
         fn inbox_has(&mut self, agent: &str, body: &str) -> bool {
@@ -535,26 +670,83 @@ pub mod sim {
                 Response::Inbox { messages } if messages.iter().any(|m| m.body == body)
             )
         }
+
+        fn inbox_from_has(&mut self, agent: &str, from: &str) -> bool {
+            matches!(
+                self.hub.handle(Request::Inbox { name: String::from(agent) }),
+                Response::Inbox { messages } if messages.iter().any(|m| m.from == from)
+            )
+        }
     }
 
-    /// The mocked transport: one relay tick, exactly what `relay_send` does
-    /// on `Ok(Sent)` — apply the job to the destination hub, advance the
-    /// cursor. Returns how many frames crossed a link.
-    fn relay_tick(litters: &mut [( &'static str, Litter )], from: &str) -> usize {
-        let i = litters.iter().position(|(n, _)| *n == from).expect("litter");
-        crate::tools::litter::set_litter_name(Some(String::from(litters[i].0)));
-        let jobs = {
-            let (_, litter) = &mut litters[i];
-            relay_jobs(&mut litter.hub, &mut litter.peers)
-        };
+    /// The guest list every simulated node pins: the public key of every
+    /// agent in the world. Keys belong to agents, so this is a list of
+    /// agents, not of litters (`verify_payload` ignores the names anyway —
+    /// it is a guest list, not a binding — but building it this way keeps
+    /// the sim honest about what is being pinned).
+    fn guest_list(world: &[(&'static str, Litter)]) -> String {
+        let mut out = Vec::new();
+        for (_, l) in world {
+            for a in &l.agents {
+                out.push(format!("{}:{}", a, pub_hex_for(a)));
+            }
+        }
+        out.join(",")
+    }
+
+    /// Become `agent`, a member of litter `l`: its litter identity, that
+    /// AGENT's signing key, and the world's guest list.
+    fn become_agent(l: &Litter, agent: &str, guests: &str) {
+        crate::tools::litter::set_litter_name(Some(String::from(l.name)));
+        crate::tools::litter::sig::set_our_key(Some(&key_hex_for(agent)));
+        crate::tools::litter::sig::set_peer_keys(Some(guests));
+    }
+
+    /// One agent says something into its own hub — signed in "its process"
+    /// (i.e. under its own key), exactly as `hub::tool_send_message` does.
+    fn say(world: &mut [(&'static str, Litter)], litter: &str, agent: &str, to: &str, body: &str, round: i64) -> Response {
+        let guests = guest_list(world);
+        let i = world.iter().position(|(n, _)| *n == litter).expect("litter");
+        become_agent(&world[i].1, agent, &guests);
+        let req = crate::tools::litter::sig::signed_send(agent, to, body, round);
+        world[i].1.hub.handle(req)
+    }
+
+    /// The mocked transport: one relay tick. The relaying agent is the
+    /// litter's leader (whoever holds the hub), so the hop is signed with
+    /// ITS key and stamped with ITS name — the sender's `sig` rides along
+    /// untouched. Delivery happens under the receiving agent's identity,
+    /// since that is whose guest list must verify the envelope. Returns
+    /// how many frames crossed a link.
+    fn relay_tick(world: &mut [(&'static str, Litter)], from: &str) -> usize {
+        let guests = guest_list(world);
+        let i = world.iter().position(|(n, _)| *n == from).expect("litter");
+        let relayer = world[i].1.agents[0]; // the leader holds the hub
+        become_agent(&world[i].1, relayer, &guests);
+        let jobs = relay_jobs(&mut world[i].1.hub, &mut world[i].1.peers);
         let mut crossed = 0usize;
-        for (addr, from, to, body, round, ts) in jobs {
-            // resolve destination: the litter whose HUB listens on this addr
-            let dest = litters.iter().position(|(_, l)| l.addr == addr).expect("peer litter");
-            let req = Request::Send { from, to, body, round };
-            if matches!(litters[dest].1.hub.handle(req), Response::Sent { .. }) {
-                let peer = litters[i].1.peers.iter_mut().find(|p| p.addr == addr).unwrap();
-                peer.last_relay_ts = peer.last_relay_ts.max(ts);
+        for job in jobs {
+            let dest = world.iter().position(|(_, l)| l.addr == job.addr).expect("peer litter");
+            let payload = crate::tools::litter::sig::relay_payload(&job.ol, &job.from, &job.to, &job.body, job.ot);
+            let rs = crate::tools::litter::sig::sign_payload(&payload).expect("signer");
+            let req = Request::Send {
+                from: job.from.clone(),
+                to: job.to.clone(),
+                body: job.body.clone(),
+                round: job.round,
+                ol: Some(job.ol.clone()),
+                ot: Some(job.ot),
+                sig: Some(job.sig.clone()),
+                rl: Some(String::from(relayer)),
+                rs: Some(rs),
+            };
+            let receiver = world[dest].1.agents[0];
+            become_agent(&world[dest].1, receiver, &guests);
+            let accepted = matches!(world[dest].1.hub.handle(req), Response::Sent { .. });
+            become_agent(&world[i].1, relayer, &guests);
+            if accepted {
+                let peer = world[i].1.peers.iter_mut().find(|p| p.addr == job.addr).unwrap();
+                peer.last_relay_ts = peer.last_relay_ts.max(job.cursor_ts);
                 crossed += 1;
             }
         }
@@ -567,36 +759,31 @@ pub mod sim {
         libakuma::print("--- litter swarm sim tests ---\n");
 
         // 1. relay joins two litters: yard's broadcast lands in every
-        //    island inbox, prefixed with the origin litter's name
+        //    island inbox, from-line prefixed with the origin litter
         total += 1;
         {
             let mut sw = vec![
                 ("yard", Litter::seed("yard", "10.0.0.1:7700", &["al", "amber"], "island@10.0.0.2:7700")),
                 ("island", Litter::seed("island", "10.0.0.2:7700", &["bob", "bella"], "yard@10.0.0.1:7700")),
             ];
-            sw[0].1.hub.handle(Request::Send { from: String::from("al"), to: String::from(GROUP_NAME), body: String::from("hello island"), round: 1 });
+            say(&mut sw, "yard", "al", GROUP_NAME, "hello island", 1);
             let crossed = relay_tick(&mut sw, "yard");
             let ok = crossed == 1
                 && sw[1].1.inbox_has("bob", "hello island")
-                && sw[1].1.inbox_has("bella", "hello island");
-            if ok { passed += 1; } else {
-            let dump = |l: &mut Litter, a: &str| match l.hub.handle(Request::Inbox { name: String::from(a) }) {
-                Response::Inbox { messages } => messages.iter().map(|m| (m.from.clone(), m.body.clone())).collect::<Vec<_>>(),
-                _ => Vec::new(),
-            };
-            libakuma::print(&format!("  [!] join: crossed={} bob={:?} bella={:?}\n", crossed, dump(&mut sw[1].1, "bob"), dump(&mut sw[1].1, "bella")));
-        }
+                && sw[1].1.inbox_has("bella", "hello island")
+                && sw[1].1.inbox_from_has("bob", "al"); // sender never rewritten
+            if ok { passed += 1; } else { libakuma::print(&format!("  [!] join: crossed={}\n", crossed)); }
         }
 
-        // 2. storm bound: the relayed-in copy never relays onward — one
-        //    message crosses one link exactly once, no matter how many ticks
+        // 2. storm bound: relayed-in traffic is never re-captured — one
+        //    message crosses one link exactly once, no matter the ticks
         total += 1;
         {
             let mut sw = vec![
                 ("yard", Litter::seed("yard", "10.0.0.1:7700", &["al"], "island@10.0.0.2:7700")),
                 ("island", Litter::seed("island", "10.0.0.2:7700", &["bob"], "yard@10.0.0.1:7700")),
             ];
-            sw[0].1.hub.handle(Request::Send { from: String::from("al"), to: String::from(GROUP_NAME), body: String::from("once only"), round: 1 });
+            say(&mut sw, "yard", "al", GROUP_NAME, "once only", 1);
             let first = relay_tick(&mut sw, "yard");
             let again = relay_tick(&mut sw, "yard") + relay_tick(&mut sw, "island") + relay_tick(&mut sw, "island");
             if first == 1 && again == 0 { passed += 1; }
@@ -604,14 +791,16 @@ pub mod sim {
         }
 
         // 3. direct cross-litter reply: island's bob → yard's al arrives
-        //    only in al's inbox, still prefixed with the origin litter
+        //    only in al's inbox. The name on the envelope is BARE (`al`,
+        //    not `yard-al`): provenance rides `ol`/`rl`, never the name,
+        //    so the far hub delivers to its own agent of that name.
         total += 1;
         {
             let mut sw = vec![
                 ("yard", Litter::seed("yard", "10.0.0.1:7700", &["al", "amber"], "island@10.0.0.2:7700")),
                 ("island", Litter::seed("island", "10.0.0.2:7700", &["bob"], "yard@10.0.0.1:7700")),
             ];
-            sw[1].1.hub.handle(Request::Send { from: String::from("bob"), to: String::from("yard-al"), body: String::from("reply to yard"), round: 2 });
+            say(&mut sw, "island", "bob", "al", "reply to yard", 2);
             let crossed = relay_tick(&mut sw, "island");
             let ok = crossed == 1
                 && sw[0].1.inbox_has("al", "reply to yard")
@@ -630,14 +819,10 @@ pub mod sim {
             let old = now_us().saturating_sub(super::RELAY_MAX_AGE_US + 1_000_000);
             sw[0].1.hub.relay_log.push(RelayEntry {
                 to: String::from(GROUP_NAME),
-                msg: litter_wire::Message {
-                    from: String::from("al"),
-                    round: 1,
-                    body: String::from("stale news"),
-                    ts: old,
-                    kind: litter_wire::MessageKind::Chat,
-                    role: SenderRole::Peer,
-                },
+                msg: litter_wire::Message::chat(String::from("al"), 1, String::from("stale news"), old),
+                origin_litter: String::from("yard"),
+                origin_ts: old,
+                origin_sig: hex(&[0u8; 64]),
             });
             let crossed = relay_tick(&mut sw, "yard");
             if crossed == 0 && !sw[1].1.inbox_has("bob", "stale news") { passed += 1; }
@@ -653,7 +838,7 @@ pub mod sim {
                 ("yard", Litter::seed("yard", "10.0.0.1:7700", &["al"], "island@10.0.0.2:7700")),
                 ("island", Litter::seed("island", "10.0.0.2:7700", &["bob"], "yard@10.0.0.1:7700")),
             ];
-            sw[0].1.hub.handle(Request::Send { from: String::from("al"), to: String::from(GROUP_NAME), body: String::from("across the flake"), round: 1 });
+            say(&mut sw, "yard", "al", GROUP_NAME, "across the flake", 1);
             sw[0].1.peers[0].online = false;
             let while_down = relay_tick(&mut sw, "yard");
             sw[0].1.peers[0].online = true;
@@ -675,7 +860,7 @@ pub mod sim {
                 ("b", Litter::seed("b", "10.0.0.2:7700", &["y"], "a@10.0.0.1:7700,c@10.0.0.3:7700")),
                 ("c", Litter::seed("c", "10.0.0.3:7700", &["z"], "a@10.0.0.1:7700,b@10.0.0.2:7700")),
             ];
-            sw[0].1.hub.handle(Request::Send { from: String::from("x"), to: String::from(GROUP_NAME), body: String::from("mesh news"), round: 1 });
+            say(&mut sw, "a", "x", GROUP_NAME, "mesh news", 1);
             let mut crossings = 0;
             for _ in 0..3 {
                 crossings += relay_tick(&mut sw, "a");
@@ -689,7 +874,154 @@ pub mod sim {
             else { libakuma::print(&format!("  [!] mesh: crossings={} (want 2)\n", crossings)); }
         }
 
+        // 7. replay dedup: the same envelope (same ol/ot) delivered twice
+        //    is accepted twice at the wire but lands in inboxes ONCE
+        total += 1;
+        {
+            let mut sw = vec![
+                ("yard", Litter::seed("yard", "10.0.0.1:7700", &["al"], "island@10.0.0.2:7700")),
+                ("island", Litter::seed("island", "10.0.0.2:7700", &["bob"], "yard@10.0.0.1:7700")),
+            ];
+            let guests = guest_list(&sw);
+            say(&mut sw, "yard", "al", GROUP_NAME, "no double", 1);
+            assert_eq!(relay_tick(&mut sw, "yard"), 1);
+            let first = sw[1].1.inbox_has("bob", "no double");
+            let before = count(&mut sw[1].1, "bob");
+
+            // Replay the exact envelope that just crossed, by hand and with
+            // a FRESH relayer signature — the cursor cannot help here, so
+            // this is the seen-set doing the work.
+            let entry = &sw[0].1.hub.relay_log[0];
+            let (ol, ot, sig) = (entry.origin_litter.clone(), entry.origin_ts, entry.origin_sig.clone());
+            let body = entry.msg.body.clone();
+            become_agent(&sw[0].1, "al", &guests);
+            let payload = crate::tools::litter::sig::relay_payload(&ol, "al", GROUP_NAME, &body, ot);
+            let rs = crate::tools::litter::sig::sign_payload(&payload).expect("signer");
+            become_agent(&sw[1].1, "bob", &guests);
+            let replayed = sw[1].1.hub.handle(Request::Send {
+                from: String::from("al"),
+                to: String::from(GROUP_NAME),
+                body,
+                round: 1,
+                ol: Some(ol),
+                ot: Some(ot),
+                sig: Some(sig),
+                rl: Some(String::from("al")),
+                rs: Some(rs),
+            });
+            let after = count(&mut sw[1].1, "bob");
+            // Accepted at the wire (it is well-formed and verifies), but
+            // delivered exactly once.
+            let ok = first && matches!(replayed, Response::Sent { .. }) && before == after;
+            if ok { passed += 1; }
+            else { libakuma::print(&format!("  [!] replay: first={} before={} after={}\n", first, before, after)); }
+        }
+
+        // 8. forged envelope: a body tampered after signing is refused
+        //    outright (Error, nothing delivered)
+        total += 1;
+        {
+            let mut sw = vec![
+                ("yard", Litter::seed("yard", "10.0.0.1:7700", &["al"], "island@10.0.0.2:7700")),
+                ("island", Litter::seed("island", "10.0.0.2:7700", &["bob"], "yard@10.0.0.1:7700")),
+            ];
+            // al signs the REAL payload with al's own (guest-listed) key,
+            // then the body is swapped underneath it. The relayer signature
+            // is made over the TAMPERED payload and is therefore valid, so
+            // the only thing wrong with this envelope is the origin
+            // signature — which is exactly what must reject it.
+            let guests = guest_list(&sw);
+            become_agent(&sw[0].1, "al", &guests);
+            let real = crate::tools::litter::sig::relay_payload("yard", "al", GROUP_NAME, "signed as-is", 42);
+            let sig = crate::tools::litter::sig::sign_payload(&real).expect("signer");
+            let tampered = crate::tools::litter::sig::relay_payload("yard", "al", GROUP_NAME, "TAMPERED", 42);
+            let rs = crate::tools::litter::sig::sign_payload(&tampered).expect("signer");
+            become_agent(&sw[1].1, "bob", &guests);
+            let refused = matches!(
+                sw[1].1.hub.handle(Request::Send {
+                    from: String::from("al"),
+                    to: String::from(GROUP_NAME),
+                    body: String::from("TAMPERED"),
+                    round: 1,
+                    ol: Some(String::from("yard")),
+                    ot: Some(42),
+                    sig: Some(sig),
+                    rl: Some(String::from("al")),
+                    rs: Some(rs),
+                }),
+                Response::Error { .. }
+            );
+            let quiet = !sw[1].1.inbox_has("bob", "TAMPERED") && !sw[1].1.inbox_has("bob", "signed as-is");
+            if refused && quiet { passed += 1; }
+            else { libakuma::print(&format!("  [!] forged: refused={} quiet={}\n", refused, quiet)); }
+        }
+
+        // 9. permissive default: with NO guest list configured, an envelope
+        //    from a litter we have never heard of is accepted and delivered.
+        //    This is the shipped default (`litter_peer_keys` unset) — two
+        //    fresh litters join by pointing at each other and nothing else.
+        total += 1;
+        {
+            let mut sw = vec![
+                ("yard", Litter::seed("yard", "10.0.0.1:7700", &["al"], "island@10.0.0.2:7700")),
+                ("island", Litter::seed("island", "10.0.0.2:7700", &["bob"], "yard@10.0.0.1:7700")),
+            ];
+            // An agent nobody has a key for signs a well-formed envelope.
+            crate::tools::litter::set_litter_name(Some(String::from("stranger")));
+            crate::tools::litter::sig::set_our_key(Some(&key_hex_for("zed")));
+            let payload = crate::tools::litter::sig::relay_payload("stranger", "zed", GROUP_NAME, "knock knock", 77);
+            let sig = crate::tools::litter::sig::sign_payload(&payload).expect("signer");
+            let rs = crate::tools::litter::sig::sign_payload(&payload).expect("signer");
+
+            // Receiver: island's own identity, guest list explicitly unset.
+            become_agent(&sw[1].1, "bob", "");
+            crate::tools::litter::sig::set_peer_keys(None);
+            let accepted = matches!(
+                sw[1].1.hub.handle(Request::Send {
+                    from: String::from("zed"),
+                    to: String::from(GROUP_NAME),
+                    body: String::from("knock knock"),
+                    round: 1,
+                    ol: Some(String::from("stranger")),
+                    ot: Some(77),
+                    sig: Some(sig),
+                    rl: Some(String::from("zed")),
+                    rs: Some(rs),
+                }),
+                Response::Sent { .. }
+            );
+            // A broken signature is still refused, guest list or not.
+            let bad_refused = matches!(
+                sw[1].1.hub.handle(Request::Send {
+                    from: String::from("zed"),
+                    to: String::from(GROUP_NAME),
+                    body: String::from("garbage"),
+                    round: 1,
+                    ol: Some(String::from("stranger")),
+                    ot: Some(78),
+                    sig: Some(String::from("00")),
+                    rl: Some(String::from("zed")),
+                    rs: Some(String::from("00")),
+                }),
+                Response::Error { .. }
+            );
+            let ok = accepted
+                && sw[1].1.inbox_has("bob", "knock knock")
+                && sw[1].1.inbox_from_has("bob", "zed")
+                && bad_refused
+                && !sw[1].1.inbox_has("bob", "garbage");
+            if ok { passed += 1; }
+            else { libakuma::print(&format!("  [!] permissive: accepted={} bad_refused={}\n", accepted, bad_refused)); }
+        }
+
         libakuma::print(&format!("  result: {}/{}\n", passed, total));
         if passed == total { 0 } else { 1 }
+    }
+
+    fn count(l: &mut Litter, agent: &str) -> usize {
+        match l.hub.handle(Request::Inbox { name: String::from(agent) }) {
+            Response::Inbox { messages } => messages.len(),
+            _ => 0,
+        }
     }
 }

@@ -193,15 +193,22 @@ connection:
   same lease/`[done]` bookkeeping — without messaging anyone. Self-directed
   work with the same accountability as swarm-assigned work; nothing in the
   table's design assumes the issuer is another agent.
-- **Signed envelopes + the embedded root key.** `litter-raft`'s
-  `is_authorized(sender, root)` already implements the root override but
-  `sender` is still an unauthenticated string. Plan: every `Send`/`Join`
-  carries a signature over the frame (ed25519 via `userspace/akuma-ssh-crypto`,
-  no new dependency class); the operator's trusted key is the same one
-  `sshd`'s `authorized_keys` already holds (`userspace/sshd/src/keys.rs`) —
-  it IS the root identity, so `root`-role messages are verifiable, not
-  claimable. Until then the root role is goodwill plus the hub stamping
-  it at delivery.
+- **Signed envelopes + the embedded root key.** Half built (2026-09-20).
+  **Built:** ed25519 signatures on the *cross-litter relay* envelope —
+  each agent has its own key (`litter_key`), signs the messages it says
+  (`sig`) and the hops its hub carries (`rs`), and the receiving hub
+  verifies both. See `docs/LITTER_RELAY_TOPOLOGY.md`.
+  **Not built:** litter-*local* `Send`/`Join` are still unsigned, so
+  `litter-raft`'s `is_authorized(sender, root)` still takes `sender` as an
+  unauthenticated string — the root role remains goodwill plus the hub
+  stamping it at delivery. The operator's trusted key should be the one
+  `sshd`'s `authorized_keys` already holds (`userspace/sshd/src/keys.rs`):
+  it IS the root identity, so `root`-role messages become verifiable
+  rather than claimable.
+  Note the relay already limits the blast radius from the other side:
+  relayed-in traffic returns before the task-table hook and is delivered
+  as a plain peer message, so a peer litter can talk to ours but cannot
+  mint work in it or claim `root` in it.
 
 ## An agent turn: the tool calls
 

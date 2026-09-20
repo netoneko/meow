@@ -1,8 +1,66 @@
 # Litter relay topology: where the cross-litter message plane goes
 
-Status: OPEN DESIGN — to be reviewed. Nothing in here is built yet except
-the stopgap noted below. Companion to `docs/LITTER_STATE_MACHINE.md` and
+Status: OPEN DESIGN for §"Direction" — to be reviewed. The **stopgap relay
+is built** (see "What is built" below); the raft-collected, agent-to-agent
+end state is not. Companion to `docs/LITTER_STATE_MACHINE.md` and
 `docs/LITTER_RAFT_LOOP.md` (which see for states and traffic).
+
+## What is built (stopgap relay, 2026-09-20)
+
+Hub-to-hub, exactly one hop, signed **by agents**. A key is an agent's
+identity: a litter is not a signing party, it is the swarm a message came
+from. So `sig` names the agent that said something, `rs` names the agent
+that carried it, and `ol` names the swarm it started in.
+
+Config keys (`/etc/meow/config`):
+
+| Key | Meaning |
+|-----|---------|
+| `litter_name` | The swarm this agent belongs to — the envelope's `ol`. **Absent ⇒ relay off.** Not a signing identity. |
+| `litter_key` | **This agent's** Ed25519 seed, 64 hex chars — every scope has its own. Generated and saved on first run when absent; keep it stable, since pinning this agent means pinning this seed. |
+| `litter_peer_keys` | `name:<64-hex-pubkey>,…` — a **guest list**, not a name binding: any listed key may sign for any name. **Unset ⇒ everyone is accepted** (the default; this is a LAN, not a hostile network). With the list unset, only the signature's *shape* is checked — Ed25519 needs the signer's public key and the envelope carries none, so a stranger's signature is unverifiable by construction, not merely untrusted. Pinning a key later verifies that traffic retroactively. |
+| `litter_static_peers` | `name@host:port,…` — who to relay to, and the discovery probe list. |
+
+Mechanics:
+
+- **Sign, at the source.** The sending agent signs in its own process,
+  before any hub sees the message (`sig::signed_send`, called from
+  `hub::tool_send_message`). `ot` is the **sender's** clock, because the
+  signed payload has to contain the timestamp. A hub never mints a
+  signature over words it did not say.
+- **Capture.** `HubState::handle`'s `Send` arm records every *locally
+  originated* chat message in `relay_log` together with the sender's
+  envelope, verbatim. An unsigned send is simply not relayable and stays
+  litter-local. Relayed-in traffic (`rl` present) returns before this
+  point, so a hub is never a transit node — one hop, by construction.
+- **Forward.** The raft thread's `relay_jobs`/`relay_send` drain that log
+  to each online static peer, adding the relaying **agent's** name (`rl`)
+  and its signature (`rs`) beside the untouched `sig`, and advancing
+  `StaticPeer::last_relay_ts` **only on a confirmed `Sent`**. That cursor
+  is measured in our own hub's clock (`RelayJob::cursor_ts`), never in the
+  sender's `ot` — two different clocks, and comparing them would skip or
+  re-send traffic.
+- **Accept.** The receiving hub verifies `sig` (the sender) and `rs` (the
+  carrier) against its guest list — or accepts any well-formed envelope
+  when that list is unset — checks `(ol, from, ot)` against the seen-set,
+  drops anything whose `ol` is our own litter (our words bouncing back),
+  and delivers under the
+  **original sender's bare name**: provenance never rewrites who said it.
+  Relayed-in traffic returns before the task-table hook, so a peer litter
+  can talk to ours but cannot mint work in it; the operator (`root`) role
+  is only ever stamped on locally-originated messages.
+- **Bound.** `RELAY_LOG_CAP` (256) caps the outbox; `RELAY_MAX_AGE_US`
+  (60s) discards stale traffic and doubles as the seen-table's memory
+  (`prune_seen`), with `SEEN_CAP` as a flood backstop.
+- **Sim.** `meow test` → "litter swarm sim tests" (9): join, storm bound,
+  direct reply, age discard, flake+cursor, mesh (3 litters), replay dedup,
+  forged-signature rejection, permissive default. Real `HubState`, real
+  `relay_jobs` and real per-agent signing over a mocked transport — each
+  simulated agent has its own derived key, and messages are signed as the
+  agent that says them.
+- **Raft log.** Each `litter live` process appends state transitions and
+  relay traffic to `/tmp/meow/<session-id>/raft.log`, next to where its
+  conversation would sit — best-effort, never blocking the raft.
 
 ## Context: why the stopgap is not the destination
 
@@ -49,11 +107,19 @@ want, in the order the user stated them:
      "where did this come from, who carried it here" from the message
      alone, and a hub can reject envelopes whose relayer signature doesn't
      match a known peer.
-   - **Checksum dedup:** the envelope's checksum (over origin id + body +
-     origin ts) is the message's identity. Every node keeps a seen-set of
-     checksums; a message already present is dropped on receipt AND on
-     forward consideration. This alone kills loops — the reason the
-     stopgap relay needs litter-name prefixes and cursor discipline.
+   - **Metadata dedup** (built; the checksum this section originally
+     specced turned out to be unnecessary): the message's identity is the
+     `(origin litter, origin agent, origin ts)` triple. The agent has to
+     be in there — `ot` is the sender's own clock now, so two agents in
+     one litter can hand out the same microsecond, and keying on
+     `(litter, ts)` alone would drop the second message as a duplicate.
+     The seen-set also records the **relayer** (`rl`) for provenance; an
+     echo of our own words is caught earlier, by `ol` matching our litter. A message already present is dropped on receipt AND on
+     forward consideration. This is what kills loops — and it is why the
+     first stopgap's `<litter>-<agent>` name prefixes are gone: a mutated
+     prefix looked like a fresh sender and the mesh test caught the
+     resulting storm (14 crossings for one message). Names on the wire are
+     now always bare; provenance lives only in the envelope.
    - **Age discard:** messages older than X seconds (not yet seen) are
      dropped, not delivered — replaying stale debate into a freshly
      healed partition is exactly the storm shape we don't want. The
@@ -91,11 +157,25 @@ want, in the order the user stated them:
   clones each captured message (`msg.clone()` per send). Fine at litter
   scale; revisit with cursors/refs or a queue of owned frames once the
   design settles.
+- **Clock skew across `ot`.** Now that `ot` is the sender's own clock, it
+  is compared against the receiver's clock in one place: `prune_seen`
+  drops seen-entries older than `RELAY_MAX_AGE_US` measured locally. A
+  peer whose clock runs behind ours has its entries forgotten early (a
+  replay inside the window could be delivered twice); one running ahead
+  keeps them longer than needed. Harmless on a LAN with roughly-synced
+  clocks, wrong in principle — the fix is a received-at stamp for pruning,
+  keeping `ot` purely as identity. The relay *age guard* is unaffected: it
+  compares our own hub stamps.
 - Does cross-litter relay live in the raft log itself (relay as committed
   entries) or beside it (raft-acknowledged outbox)? Log-resident is
   simpler to reason about; outbox keeps the log small.
-- Identity: is `<litter>-<agent>` enough, or do agents need stable ids
-  that survive being re-homed across litters?
+- Identity: name prefixes are retired (see metadata dedup above) — an
+  agent is addressed by its **bare** name and the envelope says which
+  litter it came from. Two litters with an agent of the same name still
+  collide on direct addressing: `Send { to: "al" }` relays to every online
+  peer and lands in whatever `al` each one has. Stable per-agent ids that
+  survive re-homing across litters would fix that; the signed `ol` fixes
+  only the origin half.
 - What is "irrelevant" formally — per-agent (inbox-style) or per-link
   (policy on the edge), and who decides?
 - Does `litter-hub` (the standalone std hub) get the relay at all, or is

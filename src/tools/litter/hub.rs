@@ -197,12 +197,9 @@ pub fn inbox_messages(addr: &str, name: &str) -> Result<Vec<Message>, String> {
 }
 
 pub fn tool_send_message(addr: &str, from: &str, to: &str, body: &str, round: i64) -> ToolResult {
-    let req = Request::Send {
-        from: String::from(from),
-        to: String::from(to),
-        body: String::from(body),
-        round,
-    };
+    // The sender signs here, in its own process, with its own key — the
+    // hub only ever carries that signature (see `sig::signed_send`).
+    let req = super::sig::signed_send(from, to, body, round);
     match call(addr, &req) {
         Ok(Response::Sent { bytes }) => ToolResult::ok(format!("Sent to '{}' ({} bytes)", to, bytes)),
         Ok(Response::Error { message }) => ToolResult::err(message),
