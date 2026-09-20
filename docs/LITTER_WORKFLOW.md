@@ -672,13 +672,46 @@ Run the workers single-threaded (`-t 1 -np 1`): four servers each opening
 a full thread pool fight over the CPU, and on Metal the generation is
 GPU-bound anyway.
 
+### Nothing is allowed to stall silently
+
+Every state a sub-task can sit in now has a bounded exit, and each bound
+ends in a *decision* the leader can act on rather than in silence:
+
+| Situation | Bound | What happens at the end |
+|---|---|---|
+| Offered, never claimed | `MAX_WORK_NUDGES` offers, `CLAIM_WINDOW_US` apart | reported `FAILED` ("never claimed after N offers") |
+| Claimed, never reported | `MAX_WORK_NUDGES` nudges, `WORK_NAG_US` apart | table stops asking; `LEASE_US` requeues it |
+| Holder's endpoint is broken | `MAX_WORK_NUDGES` attempts per turn | the agent reports its own sub-tasks `failed` |
+| Holder has nothing to say | same budget | it announces that to the litter |
+| Assignee left the roster | next tick | re-homed to the least-loaded agent, fresh budget |
+
+The offer bound was the last hole, and it was found the way the others
+were — by watching. `MAX_WORK_NUDGES` originally covered only work that
+someone had *claimed*, so an offer nobody took was simply re-made every
+`CLAIM_WINDOW_US`, forever. Observed live 2026-09-21: zenigata's inference
+endpoint was returning 500s, so it never claimed t1.2; the sub-task sat
+`Pending` and, because the artifact requires *every* sub-task cleared, the
+parent could never close. Nothing was broken, nothing was reported, and
+nothing would ever have changed.
+
+The counters reset whenever the work genuinely restarts — on a claim, on a
+requeue, on a reopen, on a re-home — so a bound only expires against an
+assignee that has had its full budget and done nothing with it.
+
+The matching half is in the agent loop: a **transport failure counts as an
+attempt**, like an empty answer. It used to break out of the turn
+immediately, so an agent whose endpoint was erroring never retried and
+never reported anything. Retried with the original prompt rather than the
+"you said nothing" nudge, because on a transport failure the model never
+saw the request and there is nothing to scold it for.
+
 ### Where this stands
 
 | Piece | State |
 |-------|-------|
 | `HubState` split into membership / record / relay | **landed** |
 | Single owner, no locks (`PMutex` gone from the litter) | **landed** |
-| Parent → sub-task → claim → submit → clear → artifact | **landed** (`tasks.rs`, 13 tests) |
+| Parent → sub-task → claim → submit → clear → artifact | **landed** (`tasks.rs`, 16 tests) |
 | Typed task records on the wire (protocol v4) | **landed** |
 | Public/local tool surface (`TaskUpdate`, `TaskPlan`; `ReadInbox` gone) | **landed** |
 | `Applied` outcome typed, not sniffed from the note | **landed** |
@@ -687,6 +720,8 @@ GPU-bound anyway.
 | Drain to quiescence before a turn | **landed** |
 | Cluster events (incl. role changes) delivered to the model | **landed** |
 | Election wake / roll call on takeover | **landed** |
+| Bounded offers; unclaimed work ends as FAILED | **landed** |
+| Transport failure counts toward the retry budget | **landed** |
 | Bounded worker nudges after a claim | **landed** |
 | Operator (`root`) never assigned work | **landed** |
 | Compaction carrying open work | **landed** (`open_work_lines` → marker) |

@@ -218,3 +218,94 @@ instead of ~4 MB.
 `yard.sh start` now copies the binary to `target/yard/meow` and mounts
 that, so rebuilding is safe while a litter is running. Restarting the
 yard picks up the new build, as before.
+
+## The request-body truncation bug
+
+Symptom: agents sat at `[jacking in..] waiting` for tens of minutes, and
+`llama-server` logged
+
+```
+got exception: parse error at line 1, column 7440:
+  invalid string: missing closing quote; last read: '"na'
+```
+
+`ListPeers`/`name` being near the end of the tools schema — i.e. the body
+stopped part-way through the largest single write in the request.
+
+Three defects, all the same shape (a partial operation treated as a
+complete one):
+
+1. **`fd_write_str` did not loop.** `write(2)` may write fewer bytes than
+   asked and return the count; that is the contract, not an error. It
+   treated any short write as fatal and stopped, truncating the body.
+2. **`post_from_fd` (TLS) broke on any non-positive read.** `if n <= 0
+   { break }` treats a read error exactly like EOF, sending a short body
+   under a correct `Content-Length`.
+3. **`send_post_request_from_fd` (plain HTTP)** — the path `llama-server`
+   actually uses — had the identical bug and was missed on the first pass.
+
+Both send paths now count bytes and fail loudly if the body ends early.
+
+The two failure modes are worth recognising, because they look unrelated:
+
+- `Content-Length` matching the short body → the server parses incomplete
+  JSON and answers **500**;
+- `Content-Length` larger than what was sent → the server waits for bytes
+  that never arrive and the request **hangs forever**.
+
+Ruled out along the way, so it is not re-investigated: the conversation
+JSONL is valid, the tools schema is valid in all four feature variants,
+`TcpStream::write_all` loops correctly, and `write_chat_body` propagates
+errors properly. A capture proxy confirmed the fixed client sends
+`declared Content-Length = 5132, actually received = 5132, parses: YES`.
+
+## Where the wall-clock actually goes
+
+Worth writing down because the intuitive answer ("the models are slow") is
+half right in a way that sends you after the wrong lever, and because the
+first version of this section was **wrong** and is corrected here
+(2026-09-21).
+
+Measured within a single run:
+
+- **prompt caching works.** The first request evaluates the full prompt
+  (2090 tokens); later ones evaluate only what is new (55-580). Prompt
+  eval runs 167 ms - 4.4 s, so it is not the cost.
+- **generation is throughput-bound by contention.** One agent alone
+  measured 45-57 tok/s; with four agents each on their own
+  `llama-server` sharing one GPU it drops to **~17.6 tok/s**.
+- **the model spends its whole budget thinking.** `max_tokens` is 8192,
+  and qwen3:4b streams `reasoning_content` from the first token. At 17.6
+  tok/s a full budget is ~7.8 minutes *per request*, and a turn is several
+  requests (tool loop).
+
+That is the whole explanation: budget x contention. No stall, no defect.
+
+### The measurement trap that produced a wrong answer twice
+
+meow reports `First` (time to first byte) and `Stream` separately, which
+makes one behaviour look like two:
+
+```
+First: 137927ms | Stream:   4284ms                  model thinks internally,
+                                                    then answers in one burst
+First:      0ms | Stream: 2092380ms  Size: 0.00KB   model streams its
+                                     TPS: 0.0       reasoning from token one
+```
+
+Both are "total time = generation time". The split only reflects *when*
+the model starts emitting. `Size: 0.00KB` is not a fault either: meow
+renders `reasoning_content` but deliberately does not count it as answer
+content, so a thinking-only response legitimately shows zero.
+
+The wrong conclusion drawn from this — that meow spent ~90% of each turn
+idle after the server had finished — came from comparing meow's durations
+against the server's `total time` lines. **Those lines are only written
+when a request completes**, so the long-running requests had none, and the
+comparison was finished short requests against unfinished long ones. The
+same class of error as comparing logs across two experiment runs; a
+capture proxy in front of one agent settled it in one request.
+
+If this needs re-measuring, the honest instruments are: the proxy's
+first-byte timestamp, `n_gen`/`tg` from the server log while a request is
+*in flight*, and `litter/experiment.sh` so both sides belong to one run.
