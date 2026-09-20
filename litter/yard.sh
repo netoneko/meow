@@ -52,7 +52,15 @@ SRC_BIN="$PWD/target/aarch64-unknown-linux-musl/release/meow"
 # left, which reads as "the litter silently stopped" rather than as
 # anything to do with the build. Same trap as the devbox release ELF.
 BIN="$PWD/target/yard/meow"
-AKUMA_SRC="${2:-$(cd "$(dirname "$0")/../.." && pwd)}"   # akuma repo root by default
+# The akuma repo root. This script has already `cd`-ed to userspace/meow,
+# so it is two levels up from $PWD — not from $0.
+#
+# Two ways to get this wrong, both of which were: `$(dirname "$0")/../..`
+# is evaluated AFTER that `cd` and lands on `userspace/`, and
+# `git rev-parse --show-toplevel` answers `meow`, because meow is its own
+# repo (a submodule) rather than part of akuma's. Neither failure is
+# visible until something actually reads a path inside the mount.
+AKUMA_SRC="${2:-$(cd "$PWD/../.." && pwd)}"
 
 # What the agents actually get to read: the kernel source, and nothing else.
 #

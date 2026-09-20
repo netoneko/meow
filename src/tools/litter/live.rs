@@ -1158,6 +1158,34 @@ fn high_water(messages: &[Message], cursor: u64) -> u64 {
     messages.iter().map(|m| m.ts).fold(cursor, |a, b| if b > a { b } else { a })
 }
 
+/// Tell the litter this agent is giving up, on the protocol rather than
+/// only in its own log.
+///
+/// Holding work → each sub-task is reported `failed` with the reason, so
+/// the leader gets a clearance decision instead of waiting out a lease.
+/// Holding none → say so, because an agent that tried and could not answer
+/// must be distinguishable from one that was never asked.
+fn report_giving_up(me: &str, held: &[alloc::string::String]) {
+    if held.is_empty() {
+        let r = super::tool_send_message(
+            serve::GROUP_NAME,
+            "I had nothing to say this time — I could not produce an answer.",
+            0,
+        );
+        libakuma::safe_print!(160, "[live] {} announced its silence: {}\n", me, r.output);
+        return;
+    }
+    for label in held {
+        let r = super::tool_task_update(
+            label,
+            "failed",
+            "the agent produced no answer after repeated attempts",
+            "",
+        );
+        libakuma::safe_print!(192, "[live] {} -> failed {}: {}\n", me, label, r.output);
+    }
+}
+
 /// Sub-task labels this agent is currently on the hook for, scraped from
 /// the messages it was just handed.
 ///
@@ -1348,8 +1376,25 @@ fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str, fee
     let mut prompt = wake;
     loop {
         match chat_once(model, provider, &prompt, &mut conversation, None, system_prompt) {
+            // A transport failure counts against the same budget as an
+            // empty answer. It used to break out immediately, which meant an
+            // agent whose inference endpoint was erroring never retried and
+            // never reported anything — its sub-task sat Pending while the
+            // litter waited on work that was never going to arrive.
+            // Observed live 2026-09-21 (zenigata, repeated 500s).
+            //
+            // Retried with the ORIGINAL prompt, not the "you said nothing"
+            // nudge: the model never saw the request, so there is nothing to
+            // scold it for.
             Err(e) => {
                 libakuma::safe_print!(256, "[live] {}'s turn failed: {}\n", me, e);
+                attempt += 1;
+                if attempt < super::tasks::MAX_WORK_NUDGES as usize {
+                    libakuma::safe_print!(128, "[live] {} retrying after transport failure ({}/{})\n",
+                        me, attempt, super::tasks::MAX_WORK_NUDGES);
+                    continue;
+                }
+                report_giving_up(me, &held);
                 break;
             }
             Ok(true) => break,
@@ -1362,33 +1407,7 @@ fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str, fee
                         me,
                         attempt
                     );
-                    // Say so on the protocol, not just on the console. An
-                    // unanswered sub-task is indistinguishable from one in
-                    // progress; a failed one is a decision the leader can
-                    // act on immediately instead of waiting for a lease.
-                    if held.is_empty() {
-                        // Nothing was assigned, so there is no sub-task to
-                        // fail — but the silence should still be on the
-                        // record. An agent that says nothing is otherwise
-                        // indistinguishable from one that was never woken,
-                        // and the litter has no way to tell that it tried.
-                        let r = super::tool_send_message(
-                            serve::GROUP_NAME,
-                            "I had nothing to say this time — I could not produce an answer.",
-                            0,
-                        );
-                        libakuma::safe_print!(160, "[live] {} announced its silence: {}\n", me, r.output);
-                    } else {
-                        for label in &held {
-                            let r = super::tool_task_update(
-                                label,
-                                "failed",
-                                "the agent produced no answer after repeated attempts",
-                                "",
-                            );
-                            libakuma::safe_print!(192, "[live] {} -> failed {}: {}\n", me, label, r.output);
-                        }
-                    }
+                    report_giving_up(me, &held);
                     break;
                 }
                 libakuma::safe_print!(128, "[live] {} said nothing; asking it to continue ({}/{})\n",

@@ -142,6 +142,16 @@ pub struct SubTask {
     nagged: u64,
     /// Consecutive reminders this holder has not answered.
     nudges: u32,
+    /// How many times this has been offered without being claimed.
+    ///
+    /// Bounded for the same reason `nudges` is, and it was the hole left
+    /// when `nudges` was added: the reminder budget only covers a sub-task
+    /// that someone *claimed*. An offer nobody takes was re-made every
+    /// `CLAIM_WINDOW_US` forever, so an agent whose model endpoint was
+    /// broken left its sub-task Pending indefinitely — and since the
+    /// artifact needs every sub-task cleared, the parent could never close.
+    /// Observed live 2026-09-21 (zenigata, 3 server-side errors).
+    offers: u32,
 }
 
 impl SubTask {
@@ -467,6 +477,7 @@ impl TaskTable {
                 result: String::new(),
                 nagged: 0,
                 nudges: 0,
+                offers: 0,
             });
             events.push(format!("[event] t{}.{} assigned to {}", pid, n, who));
         }
@@ -502,6 +513,7 @@ impl TaskTable {
         // tick, not a reminder interval later.
         s.nagged = 0;
         s.nudges = 0;
+        s.offers = 0;
         events.push(format!("[event] {} claimed by {}", s.label(), from));
         Ok(format!("claimed {}", s.label()))
     }
@@ -593,6 +605,9 @@ impl TaskTable {
         }
         s.state = SubState::Pending;
         s.until = 0;
+        s.nagged = 0;
+        s.nudges = 0;
+        s.offers = 0;
         s.result = String::new();
         if !why.is_empty() {
             s.body = format!("{} (reopened: {})", s.body, why);
@@ -681,6 +696,7 @@ impl TaskTable {
                 s.until = 0;
                 s.nagged = 0;
                 s.nudges = 0;
+                s.offers = 0;
             }
         }
 
@@ -703,10 +719,16 @@ impl TaskTable {
             let gone = self.subs[i].assignee.clone();
             self.subs[i].assignee = new_home.clone();
             self.subs[i].until = 0; // offer it immediately below
+            self.subs[i].offers = 0;
+            self.subs[i].nudges = 0;
             events.push(format!("[event] {} re-homed from {} to {} (left the litter)", label, gone, new_home));
         }
 
-        // Standing offers: an offer that lapsed is simply made again.
+        // Standing offers: an offer that lapsed is made again, up to
+        // `MAX_WORK_NUDGES` times. Past that the sub-task is reported
+        // FAILED rather than re-offered forever — an assignee that has not
+        // taken the work in that many windows is not going to, and the
+        // leader needs a decision to act on, not silence.
         for s in self.subs.iter_mut() {
             if !matches!(s.state, SubState::Pending) || s.until > now_us {
                 continue;
@@ -714,19 +736,36 @@ impl TaskTable {
             if !assignable(&s.assignee) || !roster.iter().any(|m| m == &s.assignee) {
                 continue;
             }
+            if s.offers >= MAX_WORK_NUDGES {
+                s.state = SubState::AwaitingClearance;
+                s.until = 0;
+                s.result = format!(
+                    "[FAILED] {} never claimed this after {} offers",
+                    s.assignee, MAX_WORK_NUDGES
+                );
+                events.push(format!(
+                    "[event] {} unclaimed after {} offers; reported FAILED",
+                    s.label(),
+                    MAX_WORK_NUDGES
+                ));
+                continue;
+            }
+            s.offers += 1;
             s.until = now_us.saturating_add(CLAIM_WINDOW_US);
             out.push(Outbound {
                 to: s.assignee.clone(),
                 body: s.offer_message(),
                 kind: OutKind::Assignment,
             });
-            events.push(format!("[event] {} offered to {}", s.label(), s.assignee));
+            events.push(format!(
+                "[event] {} offered to {} ({} of {})",
+                s.label(),
+                s.assignee,
+                s.offers,
+                MAX_WORK_NUDGES
+            ));
         }
 
-        // The election wake comes first, and unconditionally: a fresh
-        // leader with an empty table has no parent to generate a directive
-        // from, so without this it would sit silent while the litter's
-        // carried-over work went unclaimed.
         // Tell whoever is holding work to get on with it: once right after
         // the claim, then on each reminder interval, up to
         // `MAX_WORK_NUDGES` consecutive unanswered times.
@@ -1404,6 +1443,47 @@ pub fn run_tests() -> i32 {
 
         check("the response contract reaches the worker, and is repeated",
               leader_told && worker_told && nudge_told, &mut passed);
+    }
+
+    // ---- an offer nobody claims is bounded too --------------------------
+    // The hole the holder-nudge budget left: it only covers work someone
+    // CLAIMED. An unclaimed offer was re-made every window forever, so an
+    // agent with a broken endpoint stalled its parent permanently.
+    total += 1;
+    {
+        let mut t = TaskTable::new();
+        let r = roster();
+        t.apply("root", Authority::Root, &op(TaskAct::Open, "", "canvass"), 100, &r);
+        t.apply("mimi", Authority::Leader, &plan_op("t1", &[("tama", "answer me")]), 100, &r);
+
+        let mut at = 1_000u64;
+        let mut offered = 0usize;
+        for _ in 0..(MAX_WORK_NUDGES as usize + 2) {
+            let (out, _) = t.tick(&r, Some("mimi"), at);
+            offered += out.iter().filter(|o| o.to == "tama" && o.body.contains("[assigned:")).count();
+            at += CLAIM_WINDOW_US + 1;
+        }
+        let bounded = offered == MAX_WORK_NUDGES as usize;
+        // ...and it ends as a clearance decision, not as silence.
+        let failed = t.subs()[0].state == SubState::AwaitingClearance
+            && t.subs()[0].result.starts_with("[FAILED]")
+            && t.subs()[0].result.contains("never claimed");
+        // The leader can now act on it.
+        let (_, _, cleared) = t.apply("mimi", Authority::Leader, &op(TaskAct::Clear, "t1.1", ""), at, &r);
+
+        // A claim before the budget runs out resets it.
+        let mut t2 = TaskTable::new();
+        t2.apply("root", Authority::Root, &op(TaskAct::Open, "", "canvass"), 100, &r);
+        t2.apply("mimi", Authority::Leader, &plan_op("t1", &[("tama", "answer me")]), 100, &r);
+        t2.tick(&r, Some("mimi"), 1_000);
+        t2.apply("tama", Authority::Peer, &op(TaskAct::Claim, "t1.1", ""), 1_100, &r);
+        let reset = t2.subs()[0].state == SubState::InProgress;
+
+        check("an unclaimed offer is bounded and ends as FAILED",
+              bounded && failed && cleared.is_ok() && reset, &mut passed);
+        if !(bounded && failed && cleared.is_ok() && reset) {
+            libakuma::print(&format!("      offered={} failed={} reset={}\n", offered, failed, reset));
+        }
     }
 
     // ---- the operator is never given work ------------------------------

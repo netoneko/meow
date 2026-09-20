@@ -435,13 +435,30 @@ fn send_post_request_from_fd(
     );
     stream.write_all(header.as_bytes()).map_err(|_| "Failed to send request")?;
 
+    // Send exactly `body_len` bytes and say so if we cannot.
+    //
+    // `if n <= 0 { break }` treated a read error the same as EOF, which
+    // sends a short body under a correct Content-Length. The far end then
+    // either parses incomplete JSON (500, `missing closing quote`) or waits
+    // forever for bytes that are not coming — both observed live
+    // 2026-09-21, and neither says anything about meow in meow's own logs.
+    // A request we cannot finish is worth one clear error here.
     let mut buf = [0u8; 8192];
-    loop {
+    let mut sent = 0usize;
+    while sent < body_len {
         let n = libakuma::read_fd(body_fd, &mut buf);
-        if n <= 0 {
-            break;
+        if n < 0 {
+            return Err("Failed to read request body");
         }
-        stream.write_all(&buf[..n as usize]).map_err(|_| "Failed to send request body")?;
+        if n == 0 {
+            break; // genuine EOF
+        }
+        let n = n as usize;
+        stream.write_all(&buf[..n]).map_err(|_| "Failed to send request body")?;
+        sent += n;
+    }
+    if sent != body_len {
+        return Err("Request body ended early (truncated request)");
     }
     Ok(())
 }
@@ -469,14 +486,35 @@ fn request_body_path() -> String {
 }
 
 /// Write `s` to `fd`, accumulating the byte count. Returns false on short write.
+/// Write the whole string, looping over partial writes.
+///
+/// `write(2)` is allowed to write fewer bytes than asked and return the
+/// count; that is not an error, it is the normal contract. This used to
+/// treat any short write as a hard failure and stop, which silently
+/// **truncated the request body** — and because the caller derives
+/// `Content-Length` from the bytes it managed to write, the result was a
+/// perfectly framed HTTP request containing incomplete JSON. The server
+/// answered 500 and meow retried the whole turn.
+///
+/// Observed live 2026-09-21 against llama-server:
+/// `parse error at line 1, column 7541: invalid string: missing closing
+/// quote; last read: '"ListPeer'` — `ListPeers` being the last entry in the
+/// tools schema, i.e. the body stopped mid-way through the largest single
+/// write in the request.
 fn fd_write_str(fd: i32, s: &str, total: &mut usize) -> bool {
     let bytes = s.as_bytes();
-    if bytes.is_empty() {
-        return true;
-    }
-    let n = libakuma::write_fd(fd, bytes);
-    if n < 0 || n as usize != bytes.len() {
-        return false;
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let n = libakuma::write_fd(fd, &bytes[written..]);
+        if n < 0 {
+            return false;
+        }
+        if n == 0 {
+            // No progress and no error: nothing more can be written, and
+            // looping would spin forever on a body we cannot finish.
+            return false;
+        }
+        written += n as usize;
     }
     *total += bytes.len();
     true
