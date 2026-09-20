@@ -29,12 +29,47 @@ use litter_wire::{TaskAct, TaskOp};
 /// How long an *offer* stands before it is made again. An assignee that is
 /// mid-turn on something else, or has just died, should not hold a
 /// sub-task hostage — but an LLM turn is minutes, so this is not short.
-pub const CLAIM_WINDOW_US: u64 = 180 * 1_000_000;
+///
+/// It was 180 s, which is *shorter than a turn* on the models this runs
+/// against: measured live, a wake-to-tool-call round on qwen3:4b took
+/// 120-200 s, so an offer lapsed and was re-made while its assignee was
+/// still thinking about the first copy. A re-offer window has to be
+/// comfortably longer than the time it takes to answer one.
+pub const CLAIM_WINDOW_US: u64 = 600 * 1_000_000;
 
 /// How long a *claimed* sub-task may go without a submission. Generous on
 /// purpose: an expired lease just means the work is re-offered — assume
 /// good will, accept duplicate work on the margin.
 pub const LEASE_US: u64 = 900 * 1_000_000;
+
+/// How often the holder of a claimed sub-task is reminded that it still
+/// owes a result.
+///
+/// The counterpart of "completion is explicit": an agent claims, its turn
+/// ends, and then *nothing wakes it again* — the replicated record is
+/// non-waking by design, so a claimed sub-task would sit untouched
+/// forever. Observed live 2026-09-20: two agents claimed their sub-tasks
+/// through `TaskUpdate`, both turns ended cleanly, and neither ever
+/// reported, because between the claim and the deadline nothing in the
+/// protocol addressed them.
+///
+/// The leader has had directives from the start; this is the same idea
+/// pointed at workers.
+pub const WORK_NAG_US: u64 = 150 * 1_000_000;
+
+/// How many consecutive unanswered nudges a holder gets before the table
+/// stops asking and simply lets the lease run out.
+///
+/// Bounded on purpose. An unbounded reminder is a loop: every nudge wakes
+/// the holder, every wake costs an LLM turn, and an agent that is not
+/// going to answer never will — so the cost is paid forever for nothing,
+/// and the litter's other work queues behind it. Three is enough to cover
+/// a model that dropped one message or spent a turn thinking without
+/// emitting; past that the honest conclusion is that this holder is not
+/// going to finish, and requeueing (via the lease) is the right answer.
+///
+/// Counted per sub-task and reset whenever its holder actually acts.
+pub const MAX_WORK_NUDGES: u32 = 3;
 
 /// How often an outstanding leader directive is repeated. Directives are
 /// nagged rather than sent once because a single dropped message would
@@ -98,6 +133,12 @@ pub struct SubTask {
     pub until: u64,
     pub body: String,
     pub result: String,
+    /// When its holder was last reminded that it still owes a result.
+    /// `0` means "due now" — set at claim, so the first nudge goes out on
+    /// the very next tick rather than a nag interval later.
+    nagged: u64,
+    /// Consecutive reminders this holder has not answered.
+    nudges: u32,
 }
 
 impl SubTask {
@@ -183,6 +224,23 @@ pub type Applied = Result<String, String>;
 /// rather than imported so this module keeps depending on nothing.
 pub const GROUP: &str = "litter";
 
+/// The operator's reserved identity — the same name `serve` grants
+/// `Authority::Root` to.
+///
+/// The operator is in the roster because it joins in order to send, but it
+/// is a control channel, not a participant: there is no agent loop behind
+/// it, so anything assigned to it is never claimed and never reported.
+/// Measured live 2026-09-20: a leader asked to canvass the litter split
+/// its task four ways and handed the fourth to `operator`, which meant the
+/// parent could never close — the artifact requires every sub-task
+/// cleared, and that one had nobody to clear it.
+pub const OPERATOR: &str = "root";
+
+/// Can this roster member be given work? Everyone except the operator.
+fn assignable(name: &str) -> bool {
+    name != OPERATOR
+}
+
 pub struct TaskTable {
     next_parent: u64,
     parents: Vec<Parent>,
@@ -244,7 +302,21 @@ impl TaskTable {
     /// is in history — the compaction marker's `[still open]` block, put
     /// there by `open_work_lines`. Somebody has to go and read it, and the
     /// only agent that can act on it is the one now holding the socket.
-    pub fn note_new_leader(&mut self, name: &str) {
+    pub fn note_new_leader(&mut self, name: &str, term: u64) {
+        // A brand-new litter has no predecessor to take stock of: term 1
+        // with an empty table means nobody died, nothing was carried over
+        // and no agent is holding a ticket from anyone. Waking the leader
+        // to issue a roll call there is not merely redundant, it is
+        // expensive — measured live, it cost the leader its entire first
+        // turn (194 s on qwen3:4b) asking four idle agents what they were
+        // holding, before any real work could be planned.
+        //
+        // A takeover is the case this exists for, and `term > 1` is exactly
+        // what distinguishes one: the term only advances when somebody
+        // re-raced the bind.
+        if term <= 1 && self.parents.is_empty() && self.subs.is_empty() {
+            return;
+        }
         self.leader_wake = Some(String::from(name));
     }
 
@@ -348,9 +420,10 @@ impl TaskTable {
             if who.is_empty() || what.is_empty() {
                 continue;
             }
-            // An assignee nobody can deliver to is a sub-task that stalls
-            // forever while looking healthy. Surface it instead.
-            if !roster.iter().any(|m| m == who) {
+            // An assignee nobody can deliver to — absent, or the operator,
+            // which has no agent loop — is a sub-task that stalls forever
+            // while looking healthy. Surface it instead.
+            if !assignable(who) || !roster.iter().any(|m| m == who) {
                 skipped.push(String::from(who));
                 events.push(format!("[event] plan for t{} skipped '{}': not in the roster", pid, who));
                 continue;
@@ -364,6 +437,8 @@ impl TaskTable {
                 until: 0, // never offered yet; the next tick offers it
                 body: String::from(what),
                 result: String::new(),
+                nagged: 0,
+                nudges: 0,
             });
             events.push(format!("[event] t{}.{} assigned to {}", pid, n, who));
         }
@@ -395,6 +470,10 @@ impl TaskTable {
         }
         s.state = SubState::InProgress;
         s.until = now_us.saturating_add(LEASE_US);
+        // Due now: the holder should be told to proceed on the very next
+        // tick, not a reminder interval later.
+        s.nagged = 0;
+        s.nudges = 0;
         events.push(format!("[event] {} claimed by {}", s.label(), from));
         Ok(format!("claimed {}", s.label()))
     }
@@ -572,6 +651,8 @@ impl TaskTable {
                 events.push(format!("[event] {} lease expired, requeued", s.label()));
                 s.state = SubState::Pending;
                 s.until = 0;
+                s.nagged = 0;
+                s.nudges = 0;
             }
         }
 
@@ -586,7 +667,7 @@ impl TaskTable {
             if !matches!(self.subs[i].state, SubState::Pending) {
                 continue;
             }
-            if roster.iter().any(|m| m == &self.subs[i].assignee) {
+            if assignable(&self.subs[i].assignee) && roster.iter().any(|m| m == &self.subs[i].assignee) {
                 continue;
             }
             let Some(new_home) = self.least_loaded(roster, now_us) else { continue };
@@ -602,7 +683,7 @@ impl TaskTable {
             if !matches!(s.state, SubState::Pending) || s.until > now_us {
                 continue;
             }
-            if !roster.iter().any(|m| m == &s.assignee) {
+            if !assignable(&s.assignee) || !roster.iter().any(|m| m == &s.assignee) {
                 continue;
             }
             s.until = now_us.saturating_add(CLAIM_WINDOW_US);
@@ -618,6 +699,67 @@ impl TaskTable {
         // leader with an empty table has no parent to generate a directive
         // from, so without this it would sit silent while the litter's
         // carried-over work went unclaimed.
+        // Tell whoever is holding work to get on with it: once right after
+        // the claim, then on each reminder interval, up to
+        // `MAX_WORK_NUDGES` consecutive unanswered times.
+        //
+        // Claiming ends a turn. Without this nothing ever addresses the
+        // holder again and the sub-task rides its lease out in silence —
+        // observed live 2026-09-20, two agents claimed through
+        // `TaskUpdate`, both turns ended cleanly, and neither ever
+        // reported.
+        for s in self.subs.iter_mut() {
+            if !matches!(s.state, SubState::InProgress) {
+                continue;
+            }
+            if !assignable(&s.assignee) || !roster.iter().any(|m| m == &s.assignee) {
+                continue;
+            }
+            if s.nudges >= MAX_WORK_NUDGES {
+                if s.nudges == MAX_WORK_NUDGES {
+                    s.nudges += 1; // say it once, not every tick
+                    events.push(format!(
+                        "[event] {} unanswered after {} reminders; leaving it to the lease",
+                        s.label(),
+                        MAX_WORK_NUDGES
+                    ));
+                }
+                continue;
+            }
+            // `nagged == 0` is "due now": set at claim so the first nudge
+            // follows immediately.
+            let due = s.nagged == 0 || now_us >= s.nagged.saturating_add(WORK_NAG_US);
+            if !due {
+                continue;
+            }
+            s.nagged = now_us;
+            s.nudges += 1;
+            let tail = if s.nudges >= MAX_WORK_NUDGES {
+                "\n\nThis is the last reminder — if you do not answer, the sub-task goes back \
+                 to the litter for someone else."
+            } else {
+                ""
+            };
+            out.push(Outbound {
+                to: s.assignee.clone(),
+                body: format!(
+                    "[still yours: {label}] You claimed this and have not reported yet \
+                     (reminder {n} of {max}):\
+                     \n\n{body}\
+                     \n\nProceed with the work now and report it with \
+                     TaskUpdate(task=\"{label}\", status=\"done\", text=\"<what you found>\"). \
+                     If you cannot do it, say so with status=\"failed\" and why. Until you send \
+                     one of those, this stays open and nobody else can finish it.{tail}",
+                    label = s.label(),
+                    n = s.nudges,
+                    max = MAX_WORK_NUDGES,
+                    body = truncate(&s.body, 300),
+                    tail = tail
+                ),
+                kind: OutKind::Assignment,
+            });
+        }
+
         if let Some(name) = self.leader_wake.take() {
             let body = self.election_wake_body(&name, roster, now_us);
             out.push(Outbound { to: name, body, kind: OutKind::Assignment });
@@ -684,7 +826,8 @@ impl TaskTable {
             }
         }
 
-        let members: Vec<&str> = roster.iter().map(|s| s.as_str()).filter(|n| *n != name).collect();
+        let members: Vec<&str> =
+            roster.iter().map(|s| s.as_str()).filter(|n| *n != name && assignable(n)).collect();
         body.push_str(&format!("\n\nAgents available: {}", members.join(", ")));
         let _ = now_us;
         body
@@ -694,6 +837,7 @@ impl TaskTable {
         let _ = now_us;
         roster
             .iter()
+            .filter(|name| assignable(name))
             .map(|name| {
                 let load = self
                     .subs
@@ -729,10 +873,13 @@ impl TaskTable {
             let label = self.parents[i].label();
 
             let body = if !self.parents[i].planned {
+                // Neither the leader (it coordinates) nor the operator (no
+                // agent loop) belongs on this list: a name offered here is
+                // a name the model will assign to.
                 let who: Vec<&str> = roster
                     .iter()
                     .map(|s| s.as_str())
-                    .filter(|n| *n != leader)
+                    .filter(|n| *n != leader && assignable(n))
                     .collect();
                 format!(
                     "[plan-needed: {label}] You are the leader. Split this task into one \
@@ -1112,6 +1259,105 @@ pub fn run_tests() -> i32 {
         check("compaction carries open sub-tasks, not cleared ones",
               lines.len() == 1 && lines[0].contains("t1.2") && lines[0].contains("kuro"),
               &mut passed);
+    }
+
+    // ---- a claimed sub-task's holder is nudged, boundedly ---------------
+    // The counterpart of explicit completion: claiming ends a turn, so
+    // without a nudge nothing ever addresses the holder again. Bounded,
+    // because every nudge costs the holder an LLM turn.
+    total += 1;
+    {
+        let mut t = TaskTable::new();
+        let r = roster();
+        t.apply("root", Authority::Root, &op(TaskAct::Open, "", "task"), 100, &r);
+        t.apply("mimi", Authority::Leader, &plan_op("t1", &[("tama", "go and look")]), 100, &r);
+        t.tick(&r, Some("mimi"), 1_000);
+        t.apply("tama", Authority::Peer, &op(TaskAct::Claim, "t1.1", ""), 1_100, &r);
+
+        // First nudge lands on the very next tick: proceed with the work.
+        let (n1, _) = t.tick(&r, Some("mimi"), 1_200);
+        let proceeds = n1.iter().any(|o| {
+            o.to == "tama" && o.body.contains("[still yours: t1.1]")
+                && o.body.contains("go and look") && o.kind == OutKind::Assignment
+        });
+        // ...but not again until the interval is up.
+        let (n2, _) = t.tick(&r, Some("mimi"), 1_250);
+        let not_spammed = !n2.iter().any(|o| o.body.contains("[still yours"));
+
+        // Reminders 2 and 3, then it stops asking.
+        let mut at = 1_200u64;
+        let mut sent = 1usize;
+        for _ in 0..4 {
+            at += WORK_NAG_US + 1;
+            let (n, ev) = t.tick(&r, Some("mimi"), at);
+            sent += n.iter().filter(|o| o.body.contains("[still yours")).count();
+            let _ = ev;
+        }
+        let bounded = sent == MAX_WORK_NUDGES as usize;
+        // ...and says so once, rather than silently going quiet.
+        let (_, ev) = t.tick(&r, Some("mimi"), at + WORK_NAG_US + 1);
+        let _ = ev;
+
+        // A fresh holder after a requeue starts with a clean count.
+        let (_, ev2) = t.tick(&r, Some("mimi"), 1_100 + LEASE_US + 1);
+        let requeued = ev2.iter().any(|e| e.contains("lease expired"));
+        t.apply("tama", Authority::Peer, &op(TaskAct::Claim, "t1.1", ""), 9_000_000_000, &r);
+        let (again, _) = t.tick(&r, Some("mimi"), 9_000_000_001);
+        let fresh_start = again.iter().any(|o| o.body.contains("reminder 1 of"));
+
+        check("holder is nudged after claim, bounded, and reset on requeue",
+              proceeds && not_spammed && bounded && requeued && fresh_start, &mut passed);
+        if !(proceeds && not_spammed && bounded && requeued && fresh_start) {
+            libakuma::print(&format!(
+                "      proceeds={} not_spammed={} sent={} requeued={} fresh={}\n",
+                proceeds, not_spammed, sent, requeued, fresh_start));
+        }
+    }
+
+    // ---- the operator is never given work ------------------------------
+    total += 1;
+    {
+        let mut t = TaskTable::new();
+        // root is in the roster (it joins in order to send) but has no
+        // agent loop, so a sub-task handed to it can never be claimed.
+        let r = vec![String::from("mimi"), String::from("tama"), String::from(OPERATOR)];
+        t.apply("root", Authority::Root, &op(TaskAct::Open, "", "canvass everyone"), 100, &r);
+        let (_, _, note) = t.apply("mimi", Authority::Leader,
+            &plan_op("t1", &[("tama", "a"), (OPERATOR, "b")]), 100, &r);
+        let skipped = t.subs().len() == 1 && t.subs()[0].assignee == "tama";
+        // ...and it is not offered as a candidate either
+        let (out, _) = t.tick(&r, Some("mimi"), 1_000);
+        let not_listed = !out.iter().any(|o| o.to == OPERATOR);
+        check("the operator is never assigned work",
+              skipped && okc(&note, OPERATOR) && not_listed, &mut passed);
+    }
+
+    // ---- a fresh litter's first leader is not roll-called --------------
+    total += 1;
+    {
+        let r = roster();
+        let mut fresh = TaskTable::new();
+        fresh.note_new_leader("mimi", 1);
+        let (out, _) = fresh.tick(&r, Some("mimi"), 1_000);
+        let quiet = !out.iter().any(|o| o.body.contains("[leader-elected]"));
+
+        // ...but a takeover is, because a predecessor died holding state.
+        let mut taken = TaskTable::new();
+        taken.note_new_leader("mimi", 2);
+        let (out2, _) = taken.tick(&r, Some("mimi"), 1_000);
+        let roll_called = out2.iter().any(|o| {
+            o.to == "mimi" && o.body.contains("[leader-elected]") && o.body.contains("ROLL CALL")
+        });
+
+        // ...and so is a term-1 leader that somehow has work already.
+        let mut busy = TaskTable::new();
+        busy.apply("root", Authority::Root, &op(TaskAct::Open, "", "work"), 100, &r);
+        busy.note_new_leader("mimi", 1);
+        let (out3, _) = busy.tick(&r, Some("mimi"), 1_000);
+        let woken_anyway = out3.iter().any(|o| o.body.contains("[leader-elected]"));
+
+        check("election wake fires on takeover, not on a fresh litter",
+              quiet && roll_called && woken_anyway, &mut passed);
     }
 
     libakuma::print(&format!("  result: {}/{}\n", passed, total));

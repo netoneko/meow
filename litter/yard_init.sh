@@ -33,9 +33,14 @@ LITTER_STATIC_PEERS="${LITTER_STATIC_PEERS:-}"
 # The operator's identity: yard.sh talk/task run `meow litter send` as `root`
 # through this scope, without being an agent themselves. root outranks
 # debate (it's the root role on the wire).
+# The operator joins as `root`, not as a separate "operator" name: root is
+# the identity the hub grants operator authority to, and the task table
+# refuses to assign work to it (no agent loop stands behind it). Under the
+# old name it joined the roster as an ordinary member and a leader promptly
+# handed it a sub-task nobody could ever claim.
 mkdir -p /operator/etc/meow
 cat > /operator/etc/meow/config <<EOF
-litter_agent_name=operator
+litter_agent_name=root
 litter_hub_addr=${HUB_ADDR}
 litter_name=${LITTER_NAME}
 litter_static_peers=${LITTER_STATIC_PEERS}

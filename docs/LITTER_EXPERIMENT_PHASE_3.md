@@ -138,3 +138,65 @@ Two shape decisions worth repeating here:
 - `/proc/<pid>/task/*/syscall` inside the container is the fastest wedge
   triage there is: syscall 98 on aarch64 is futex, 203 is connect. Busybox
   `ps` in `alpine:3.20` prints nothing useful here; read `/proc` directly.
+
+## Live run, 2026-09-20/21 (yard, 4 personas / 4 Ollama models)
+
+The workflow was driven end to end against real models. What the protocol
+did, in order, from the event log:
+
+```
+[event] parent task t1 opened by root
+[event] t1.1 assigned to hercules / t1.2 assigned to zenigata / t1.3 assigned to ressler
+[event] t1.1 offered to hercules  / t1.2 offered to zenigata  / t1.3 offered to ressler
+[event] t1.3 claimed by ressler   / t1.2 claimed by zenigata  / t1.1 claimed by hercules
+[still yours: t1.3] ... (reminder 1 of 3)      <- delivered to ressler after its claim
+[event] t1.3 submitted by ressler, awaiting clearance
+[clearance-needed: t1] ...                     <- delivered to sherlock
+```
+
+Every step is a real typed tool call: `TaskPlan` from the leader,
+`TaskUpdate{status:"claim"}` and `TaskUpdate{status:"done"}` from the
+workers. **Six of the eight lifecycle steps are proven live**; `clear`
+and `artifact` were delivered to the leader and not yet acted on.
+
+### What the live run found that tests could not
+
+Four defects, each invisible to a unit test because each is a property of
+*how long a model takes* or *who is in a roster*:
+
+1. **A claimed sub-task was never worked on.** Claiming ends a turn, and
+   nothing then addressed the holder again — the replicated record is
+   non-waking by design. Two agents claimed cleanly and neither ever
+   reported. Fixed with bounded holder nudges (see `LITTER_WORKFLOW.md`
+   § "Nobody is left holding work in silence").
+2. **The operator was assigned a sub-task.** `operator` was an ordinary
+   roster member, so a leader splitting work four ways gave it a quarter —
+   unclaimable, and the artifact requires every sub-task cleared, so the
+   parent could never close. It now joins as the reserved `root` and is
+   never assignable.
+3. **`CLAIM_WINDOW_US` was shorter than a turn** (180 s vs a measured
+   120-200 s), so offers lapsed and re-offered while their assignee was
+   still thinking about the first copy. Now 600 s.
+4. **`max_tokens` was below the floor for a reasoning model.** At 2048,
+   qwen3:4b streamed 117 s and emitted zero visible tokens — the whole
+   budget went to thinking, so no tool call was made and the task could
+   not progress. The cap had been protecting the hub from a long agent
+   turn; single ownership removed that coupling, so it is now 8192.
+
+Plus one that was pure waste rather than a stall: the election wake fired
+unconditionally, so the first leader of a brand-new litter spent its
+entire opening turn (194 s) roll-calling four idle agents about work
+nobody was holding. It is now takeover-only.
+
+### The remaining limit is turn latency, not the protocol
+
+The leader was last observed **22.5 minutes inside one turn**, messaging
+agents individually. Nothing is wedged — the hub idles at ~1% CPU and the
+owner loop keeps serving — but a parent task cannot advance faster than
+its leader can finish a turn, and on a 4B reasoning model behind a tool
+loop that is tens of minutes.
+
+Two things worth trying, in order: cap the tool-loop iterations per wake
+(a turn that has made its decision should stop), and prefer a
+non-reasoning model for the leader, whose job is dispatch rather than
+analysis.

@@ -257,13 +257,58 @@ assignments are already delivered to workers:
 These are re-sent on a nag interval rather than once, because a dropped
 directive would otherwise stall a parent task permanently.
 
-### Timers
+### Timers, and the reminder budget
 
 | Name              | Value | What it protects |
 |-------------------|-------|------------------|
-| `CLAIM_WINDOW_US` | 180 s | An offer nobody claimed is re-offered (assignee busy or gone). |
-| `LEASE_US`        | 900 s | A claimed sub-task whose worker died is requeued. Generous: an LLM turn is minutes. |
-| `NAG_US`          | 120 s | How often an outstanding leader directive is repeated. |
+| `CLAIM_WINDOW_US` | 600 s | An offer nobody claimed is re-offered (assignee busy or gone). |
+| `LEASE_US`        | 900 s | A claimed sub-task whose worker died is requeued. |
+| `WORK_NAG_US`     | 150 s | How often a holder is told to get on with it. |
+| `MAX_WORK_NUDGES` | 3     | How many consecutive unanswered reminders a holder gets. |
+| `NAG_US`          | 120 s | How often an outstanding **leader** directive is repeated. |
+
+Every one of these is longer than it looks like it should be, because the
+unit that matters is *an LLM turn*, and a turn on a 4B model measured
+120–200 s. `CLAIM_WINDOW_US` was 180 s at first — **shorter than a single
+turn** — so an offer lapsed and was re-made while its assignee was still
+thinking about the first copy.
+
+### Nobody is left holding work in silence
+
+Claiming a sub-task ends a turn. Nothing in the protocol then addresses
+the holder again: the replicated record is non-waking by design, so a
+claimed sub-task would ride its lease out untouched. Observed live
+2026-09-20 — two agents claimed through `TaskUpdate`, both turns ended
+cleanly, and neither ever reported, because between the claim and the
+deadline no message was addressed to them.
+
+So the holder is nudged: once immediately after the claim ("proceed with
+the work"), then every `WORK_NAG_US`, up to `MAX_WORK_NUDGES` consecutive
+unanswered times. The last one says it is the last.
+
+It is **bounded**, and that is the whole design of it. Every nudge wakes
+the holder and every wake costs an LLM turn, so an unbounded reminder is a
+loop that pays forever for an agent that was never going to answer, while
+the litter's other work queues behind it. After the budget the table stops
+asking, says so once in the event log, and lets the lease requeue the work
+to somebody else. The counter resets whenever the holder actually acts, and
+a requeue hands the next holder a fresh budget.
+
+This is the exact counterweight to "completion is explicit". Making the
+agent say it is done is what buys throughput; making sure somebody is
+still asking is what stops that from becoming a silent stall.
+
+### The operator is not a worker
+
+`root` is in the roster — it joins in order to send — but there is no
+agent loop behind it, so it is never assignable: not planned to, not
+offered to, not listed as available, and not a re-homing candidate.
+
+Found the only way it could be. A leader asked to canvass the litter split
+its task four ways and gave the fourth to the operator; that sub-task
+could never be claimed, and since an artifact requires *every* sub-task
+cleared, the parent could never close. The yard's operator now joins under
+the reserved name rather than as an ordinary member.
 
 ### Divergences from the diagrams, deliberately
 
@@ -494,11 +539,34 @@ context.
 | Piece | State |
 |-------|-------|
 | `HubState` split into membership / record / relay | **landed** |
-| Lock never held across I/O | **landed** (interim; the lock itself is still there) |
-| Single owner, queues, no locks | not started |
-| Parent → sub-task → claim → submit → clear → artifact | written, not wired |
-| Public/local tool surface replacing bracket prefixes | not started |
-| Auto-feed + explicit completion | not started |
-| One working context per agent (not per wake) | not started |
+| Single owner, no locks (`PMutex` gone from the litter) | **landed** |
+| Parent → sub-task → claim → submit → clear → artifact | **landed** (`tasks.rs`, 13 tests) |
+| Typed task records on the wire (protocol v4) | **landed** |
+| Public/local tool surface (`TaskUpdate`, `TaskPlan`; `ReadInbox` gone) | **landed** |
+| `Applied` outcome typed, not sniffed from the note | **landed** |
+| Accepted records replicated to every agent | **landed** |
+| Auto-feed: inbox delivered into the turn | **landed** |
+| Drain to quiescence before a turn | **landed** |
+| Cluster events (incl. role changes) delivered to the model | **landed** |
+| Election wake / roll call on takeover | **landed** |
+| Bounded worker nudges after a claim | **landed** |
+| Operator (`root`) never assigned work | **landed** |
 | Compaction carrying open work | **landed** (`open_work_lines` → marker) |
+| JSON turn context (unspoofable provenance) | **landed** |
+| One working context per agent across turns | not started — a turn is still a fresh `Conversation` |
 | Signature verification / address recovery | not started — see "Future work" |
+| Cross-litter task records (relay carries chat only) | not started |
+| `connect` timeout for the peer probe | not started (`PHASE_3` § 4) |
+
+Two live-measured notes that are properties of the models, not the design:
+
+- **A reasoning model needs budget to decide.** The wake turn's
+  `max_tokens` was 2048, chosen when a long turn starved the hub. Single
+  ownership removed that coupling, and 2048 turned out to be *below the
+  floor*: qwen3:4b streamed 117 s and emitted zero visible tokens, so no
+  tool call was ever made and the task could not progress. Now 8192.
+- **Do not make a fresh leader do ceremony.** The election wake fired
+  unconditionally at first, so the first leader of a brand-new litter
+  spent its entire opening turn (194 s) roll-calling four idle agents
+  about work nobody was holding. It is now takeover-only (`term > 1`, or
+  a non-empty table).

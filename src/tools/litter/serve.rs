@@ -98,7 +98,7 @@ impl HubState {
     /// litter's outstanding work (`TaskTable::note_new_leader`).
     pub fn set_leader(&mut self, name: &str, new_term: u64) {
         self.record.set_leader(name, new_term);
-        self.record.tasks.note_new_leader(name);
+        self.record.tasks.note_new_leader(name, new_term);
     }
 
     /// Append one cluster event. Kept on the façade because callers

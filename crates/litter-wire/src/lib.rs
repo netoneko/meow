@@ -650,7 +650,7 @@ pub fn decode_request(json: &str) -> Result<Request, WireError> {
             let id: Option<String> = value.to_member("id")?.try_into()?;
             let text: Option<String> = value.to_member("text")?.try_into()?;
             let mut plan: Vec<(String, String)> = Vec::new();
-            if let Some(arr) = value.to_member("plan")?.get() {
+            if let Some(arr) = value.to_member("plan")?.optional() {
                 for entry in arr.to_array()? {
                     let who: String = entry.to_member("who")?.required()?.try_into()?;
                     let what: String = entry.to_member("what")?.required()?.try_into()?;
