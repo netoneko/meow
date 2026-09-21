@@ -594,6 +594,25 @@ itself, an agent ran `Shell`, `FolderList` and `FileList` before answering.
 Nothing had told it that a sentence was wanted, so it went looking for
 work to do. A stated contract is cheaper than a smarter model.
 
+**Say what is *not* needed, too.** Stating the shape of the answer was not
+enough on its own: agents — including the leader, sitting on a clearance
+decision — still opened files before acting. Every directive now ends with
+an explicit negative:
+
+- offer: "…and do no more work than that requires — if it can be answered
+  from what you already know, answer it and do not read files or run
+  commands."
+- `plan-needed`: "Splitting the task is all this step needs: you do not
+  have to read any files or run any commands first."
+- `clearance-needed` / `artifact-needed`: "Decide from the results below —
+  you do not need to read any files or run any commands to do this."
+
+Measured on gemma4:e4b, same task, same four agents: stray
+`FileRead`/`FileList`/`Shell`/`CodeSearch` calls went from present in every
+agent to **zero**. A model given tools will reach for them unless told the
+task does not call for it; the tools are advertised in the persona and in
+the schema, and nothing else says "not now".
+
 ### A turn that produces nothing is a first-class outcome
 
 Three separate mechanisms failed, live, in the same way: an agent was
@@ -647,30 +666,80 @@ distinguishable from an agent that was never asked.** Every silent path in
 this protocol eventually becomes a task nobody is working on and nobody
 knows is stalled.
 
-### One inference server per agent
+### Giving each agent its own inference capacity
 
-Four agents sharing one endpoint serialize: whichever model is loaded
+Four agents sharing one endpoint with one loaded model serialize: it
 serves one request at a time, and a model swap costs a reload. Measured
-against a single Ollama, turns ran 9-17 minutes each.
+against a default Ollama, turns ran 9-17 minutes each. There are two ways
+to fix that, and which one applies depends on the models.
 
-`LITTER_BASE_PORT=8081` gives agent *i* (in `AGENTS` order)
-`http://$LLM_HOST:$((8081+i))` and uses its own name as the model alias —
-which is what `llama-server --alias <name>` answers to. An entry may also
-pin its own endpoint as `name:model@url`, so a litter can be mixed:
+**One `llama-server` per agent.** `LITTER_BASE_PORT=8081` gives agent *i*
+(in `AGENTS` order) `http://$LLM_HOST:$((8081+i))` and uses its own name
+as the model alias — which is what `llama-server --alias <name>` answers
+to. Run them single-threaded (`-t 1 -np 1`): four servers each opening a
+full thread pool fight over the CPU, and on Metal generation is GPU-bound
+anyway. `llama-server` loads Ollama's own GGUF blobs directly
+(`~/.ollama/models/blobs/sha256-…`), so this needs no second copy on disk
+— but it needs a `llama.cpp` new enough for the architecture. A gemma3
+blob against an older build fails with `key not found in model:
+gemma3.attention.layer_norm_rms_epsilon`.
+
+**Or Ollama with concurrency.** `OLLAMA_MAX_LOADED_MODELS=4`
+`OLLAMA_NUM_PARALLEL=2` `OLLAMA_KEEP_ALIVE=2h` keeps every agent's model
+resident and serves them concurrently. Better whenever agents *share* a
+model: two agents on one model name load it once, where two
+`llama-server` instances would load two copies.
+
+An `AGENTS` entry may pin its own endpoint as `name:model@url`, so a
+litter can be mixed — the leader on a large model through one endpoint
+while the workers sit elsewhere. That is also how to compare models on
+identical work in one run:
 
 ```bash
-LITTER_BASE_PORT=8081 \
-LITTER_AGENTS="sherlock:gemma4:e4b@http://192.168.65.254:11434 hercules:x zenigata:x ressler:x" \
+# per-agent llama-server
+LITTER_BASE_PORT=8081 LITTER_AGENTS="sherlock:x hercules:x zenigata:x ressler:x" \
   litter/yard.sh start
+
+# two big, two small, through one Ollama
+LITTER_AGENTS="sherlock:gemma4:e4b hercules:gemma4-yolo-4b:latest \
+               zenigata:gemma3:4b ressler:gemma3:4b" litter/yard.sh start
 ```
 
-That runs the leader on a large model through Ollama while the three
-workers think concurrently on their own `llama-server` instances — which
-is also the way to compare models on identical work in a single run.
+**Pick a model that does not think.** This matters more than parameter
+count. A reasoning model streams `reasoning_content` from the first token
+and spends its whole `max_tokens` budget on it before emitting an answer
+or a tool call; under four-agent contention that is tens of minutes per
+request. `--reasoning off`, `--reasoning-budget 0` and
+`--chat-template-kwargs '{"enable_thinking":false}'` were each measured
+**not** to suppress it for qwen3:4b — they only move the thoughts between
+response fields. The gemma models do not do it at all, which is why the
+litter runs on them.
 
-Run the workers single-threaded (`-t 1 -np 1`): four servers each opening
-a full thread pool fight over the CPU, and on Metal the generation is
-GPU-bound anyway.
+Note `gemma4:e4b` and `gemma4-yolo-4b` are the *same weights* (identical
+blob digest, different template/params), so running both is two personas
+on one model rather than a comparison of two.
+
+**Check the model can call tools before anything else.** The entire
+protocol is tool calls, so a model without a tool template cannot be an
+agent at any size:
+
+```
+$ curl .../v1/chat/completions -d '{"model":"gemma3:4b", ..., "tools":[...]}'
+{"error":{"message":"registry.ollama.ai/library/gemma3:4b does not support tools"}}
+```
+
+`gemma3` has no tool template in Ollama — it is unusable here regardless
+of how well it chats. `gemma4:e4b` does. That one `curl` is worth running
+against any candidate before wiring it into a litter, because the failure
+otherwise surfaces only as every agent's turn dying with
+`Server returned error`.
+
+Sizing, measured: Ollama's default context of 131072 inflates a 9.6 GB
+model to **19 GB** resident, so `OLLAMA_MAX_LOADED_MODELS` cannot honour
+its own setting and models thrash in and out per request.
+`OLLAMA_CONTEXT_LENGTH=8192` brings the same model to 11 GB. Agents
+sharing one model name load it once, so four agents on `gemma4:e4b` with
+`OLLAMA_NUM_PARALLEL=4` cost 11 GB total rather than 44.
 
 ### Nothing is allowed to stall silently
 

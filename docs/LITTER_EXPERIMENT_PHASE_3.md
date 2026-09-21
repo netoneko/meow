@@ -219,93 +219,116 @@ instead of ~4 MB.
 that, so rebuilding is safe while a litter is running. Restarting the
 yard picks up the new build, as before.
 
-## The request-body truncation bug
+## Four agents, one temp file: the request-body bug
 
-Symptom: agents sat at `[jacking in..] waiting` for tens of minutes, and
-`llama-server` logged
+Every request-level failure chased in this session was one defect.
 
-```
-got exception: parse error at line 1, column 7440:
-  invalid string: missing closing quote; last read: '"na'
-```
+`request_body_path()` returned a **single fixed path**,
+`/tmp/.meow_request.json`. meow stages each outgoing request body in that
+file and then streams it to the socket. That is fine for one `meow`
+process and catastrophic for several sharing a filesystem — and the litter
+runs four agents in one container. Each opened the same file `O_TRUNC`,
+wrote its body, and read it back to send; they clobbered each other
+mid-request. Agent A writes an 8 KB body, agent B truncates the file and
+writes 5 KB, agent A then streams 5 KB under a `Content-Length` of 8 KB.
 
-`ListPeers`/`name` being near the end of the tools schema — i.e. the body
-stopped part-way through the largest single write in the request.
+It presented as three unrelated faults, which is why it took so long:
 
-Three defects, all the same shape (a partial operation treated as a
-complete one):
+| What was seen | What it was |
+|---|---|
+| `500 parse error ... missing closing quote; last read: '"ListPeer'` | short body whose length happened to match the declared one; server parsed incomplete JSON |
+| agent stuck at `[jacking in..] waiting` forever | declared length exceeded the bytes sent; server waited for a body that was never coming |
+| intermittent, worse as the litter grew | it scales with the number of concurrent agents |
+
+The path is now per-process (`/tmp/.meow_request.<pid>.json`). After the
+fix: **zero** truncation errors across four agents.
+
+### Hardening found on the way
+
+Three real defects of the same shape — a partial operation treated as
+complete — were fixed while hunting it, and are worth keeping regardless:
 
 1. **`fd_write_str` did not loop.** `write(2)` may write fewer bytes than
    asked and return the count; that is the contract, not an error. It
    treated any short write as fatal and stopped, truncating the body.
 2. **`post_from_fd` (TLS) broke on any non-positive read.** `if n <= 0
-   { break }` treats a read error exactly like EOF, sending a short body
-   under a correct `Content-Length`.
-3. **`send_post_request_from_fd` (plain HTTP)** — the path `llama-server`
-   actually uses — had the identical bug and was missed on the first pass.
+   { break }` treats a read error exactly like EOF.
+3. **`send_post_request_from_fd` (plain HTTP)** — the path Ollama and
+   `llama-server` actually use — had the identical bug and was missed on
+   the first pass.
 
-Both send paths now count bytes and fail loudly if the body ends early.
-
-The two failure modes are worth recognising, because they look unrelated:
-
-- `Content-Length` matching the short body → the server parses incomplete
-  JSON and answers **500**;
-- `Content-Length` larger than what was sent → the server waits for bytes
-  that never arrive and the request **hangs forever**.
+Both send paths now count bytes and fail with `Request body ended early
+(truncated request)` rather than sending a short body. That error message
+is what finally localized the shared-path bug: it turned a silent
+corruption into a statement about *this* process.
 
 Ruled out along the way, so it is not re-investigated: the conversation
 JSONL is valid, the tools schema is valid in all four feature variants,
 `TcpStream::write_all` loops correctly, and `write_chat_body` propagates
-errors properly. A capture proxy confirmed the fixed client sends
-`declared Content-Length = 5132, actually received = 5132, parses: YES`.
+errors properly. A capture proxy confirmed a fixed client sends
+`declared Content-Length = 7472, actually received = 7472, parses: YES`.
 
-## Where the wall-clock actually goes
+## The timing metric was lying (and took three wrong answers with it)
 
-Worth writing down because the intuitive answer ("the models are slow") is
-half right in a way that sends you after the wrong lever, and because the
-first version of this section was **wrong** and is corrected here
-(2026-09-21).
+Corrected 2026-09-21. Everything previously written here about "30-40
+minute turns" was reading a broken number.
 
-Measured within a single run:
+`src/api/client.rs` declared `let mut stream_start_us = 0;` and only set it
+when the **first content token** arrived. Three of the four sites that read
+it guarded on `first_token_received`; the early-return paths did not, so
+they computed
 
-- **prompt caching works.** The first request evaluates the full prompt
-  (2090 tokens); later ones evaluate only what is new (55-580). Prompt
-  eval runs 167 ms - 4.4 s, so it is not the cost.
-- **generation is throughput-bound by contention.** One agent alone
-  measured 45-57 tok/s; with four agents each on their own
-  `llama-server` sharing one GPU it drops to **~17.6 tok/s**.
-- **the model spends its whole budget thinking.** `max_tokens` is 8192,
-  and qwen3:4b streams `reasoning_content` from the first token. At 17.6
-  tok/s a full budget is ~7.8 minutes *per request*, and a turn is several
-  requests (tool loop).
-
-That is the whole explanation: budget x contention. No stall, no defect.
-
-### The measurement trap that produced a wrong answer twice
-
-meow reports `First` (time to first byte) and `Stream` separately, which
-makes one behaviour look like two:
-
-```
-First: 137927ms | Stream:   4284ms                  model thinks internally,
-                                                    then answers in one burst
-First:      0ms | Stream: 2092380ms  Size: 0.00KB   model streams its
-                                     TPS: 0.0       reasoning from token one
+```rust
+stream_us: now_us() - stream_start_us      // = now_us() - 0
 ```
 
-Both are "total time = generation time". The split only reflects *when*
-the model starts emitting. `Size: 0.00KB` is not a fault either: meow
-renders `reasoning_content` but deliberately does not count it as answer
-content, so a thinking-only response legitimately shows zero.
+which is the raw `CLOCK_MONOTONIC` value — inside a container, the Docker
+VM's uptime. Any response that carried only `reasoning_content` and no
+content token therefore reported the host clock as its own duration.
 
-The wrong conclusion drawn from this — that meow spent ~90% of each turn
-idle after the server had finished — came from comparing meow's durations
-against the server's `total time` lines. **Those lines are only written
-when a request completes**, so the long-running requests had none, and the
-comparison was finished short requests against unfinished long ones. The
-same class of error as comparing logs across two experiment runs; a
-capture proxy in front of one agent settled it in one request.
+The tell was there all along and was missed twice: an agent reported
+`Duration: 68m 42s` in a container that had been up fifteen minutes, and
+consecutive readings differed by exactly the real elapsed time
+(`68m42.034s` → `69m02.856s` = 20.8 s). A cumulative-looking counter on a
+process too young to have accumulated it is a broken baseline, not a slow
+model.
 
-If this needs re-measuring, the honest instruments are: the proxy's
-first-byte timestamp, `n_gen`/`tg` from the server log while a request is
-*in flight*, and `litter/experiment.sh` so both sides belong to one run.
+With the guard applied to all six unguarded sites, the same litter on the
+same hardware reports **11.7 s, 28.2 s, 44.1 s, 34.9 s** per request.
+
+### What this invalidated
+
+Three conclusions were drawn from that number and all three were wrong:
+
+1. "The models are slow, use bigger ones."
+2. "meow spends ~90% of each turn idle after the server finishes" — drawn
+   from comparing meow's durations against the server's `total time`
+   lines, which are only written for *completed* requests, so it compared
+   finished short requests against unfinished long ones.
+3. "Ollama is swapping 19 GB models per request" — the context cap
+   (`OLLAMA_CONTEXT_LENGTH=8192`, 19 GB → 11 GB) is still worth having,
+   but it was not what the 68 minutes measured.
+
+### What is actually true about performance
+
+- **Prompt caching works.** First request evaluates the full prompt (2090
+  tokens); later ones only the new tokens (55-580), at 167 ms - 4.4 s.
+- **Generation is 17-57 tok/s**, depending on how many agents share the GPU.
+- **A reasoning model is still the wrong choice**, for a real reason rather
+  than the imagined one: it spends its whole `max_tokens` budget on
+  `reasoning_content` before emitting an answer or a tool call. gemma does
+  not do this. `--reasoning off`, `--reasoning-budget 0` and
+  `--chat-template-kwargs '{"enable_thinking":false}'` were each measured
+  **not** to suppress it for qwen3:4b; they only move the thoughts between
+  response fields.
+- **Cap Ollama's context.** The default 131072 inflates a 9.6 GB model to
+  19 GB resident, so `OLLAMA_MAX_LOADED_MODELS` cannot honour its setting
+  and models thrash. `OLLAMA_CONTEXT_LENGTH=8192` brings it to 11 GB.
+
+### The lesson worth keeping
+
+Three separate wrong conclusions came from one unvalidated metric, and each
+time the instinct was to explain the number rather than to check it. A
+duration that exceeds its own process's lifetime, or a metric that only
+exists on success being used to characterise failures, is a measurement bug
+until proven otherwise.

@@ -189,7 +189,9 @@ impl SubTask {
         // own full stop onto "…Role, Skill, Interest." reads as a typo.
         let want = self.expect.trim_end_matches(['.', ',', ';', ' ']);
         format!(
-            "\n\nWhat is expected back: {}. Answer in exactly that form — do not do more work than that requires.",
+            "\n\nWhat is expected back: {}. Answer in exactly that form, and do no more work \
+             than that requires — if it can be answered from what you already know, answer it \
+             and do not read files or run commands.",
             want
         )
     }
@@ -965,6 +967,8 @@ impl TaskTable {
                      \"what\":\"<what they should do>\", \"expect\":\"<what their answer \
                      should look like>\"}}, ...])\
                      \nOne call, every sub-task — a partial plan cannot be completed later.\
+                     \nSplitting the task is all this step needs: you do not have to read any \
+                     files or run any commands first.\
                      \n\nUse `expect` to say what you want back — for example \"two sentences \
                      of plain text and nothing else\". An agent told what shape the answer \
                      takes does not go off and do work you did not ask for.\
@@ -996,7 +1000,9 @@ impl TaskTable {
                          below. Accept one with TaskUpdate(task=\"tN.M\", status=\"clear\"), \
                          or send it back with TaskUpdate(task=\"tN.M\", status=\"reopen\", \
                          text=\"<what is missing>\"). A result marked [FAILED] needs the same \
-                         decision: clear it to accept the failure, or reopen it to retry.{lines}",
+                         decision: clear it to accept the failure, or reopen it to retry.\
+                         \n\nDecide from the results below — you do not need to read any files or \
+                         run any commands to do this.{lines}",
                         label = label,
                         lines = lines
                     )
@@ -1025,6 +1031,8 @@ impl TaskTable {
                          findings below into the final answer to the original task and submit it \
                          with TaskUpdate(task=\"{label}\", status=\"artifact\", \
                          text=\"<your report>\"). This closes the task.\
+                         \n\nWrite it from the findings below — you do not need to read any files \
+                         or run any commands to do this.\
                          \n\nOriginal task: {task}{lines}",
                         label = label,
                         task = self.parents[i].body,

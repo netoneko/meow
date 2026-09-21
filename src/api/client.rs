@@ -476,12 +476,29 @@ fn build_request_path(provider: &Provider) -> String {
 }
 
 /// Path of the temp file used to stage the request body (sandbox-aware).
+/// Where this process stages its outgoing request body.
+///
+/// **Per-process, by pid.** This was a single fixed path, which is fine for
+/// one `meow` and catastrophic for several sharing a filesystem: the litter
+/// runs four agents in one container, and each one opened the same file
+/// `O_TRUNC`, wrote its body, then read it back to send. They clobbered each
+/// other mid-request — agent A writes an 8 KB body, agent B truncates the
+/// file and writes 5 KB, agent A then streams 5 KB under a
+/// `Content-Length` of 8 KB.
+///
+/// Every request-level failure chased in this session was this one bug
+/// (2026-09-21): `500 parse error ... missing closing quote` when the short
+/// body happened to match its declared length, an indefinite hang when it
+/// did not, and `Request body ended early` once the send paths were taught
+/// to count bytes. It scales with agent count, which is why it looked
+/// intermittent and why it worsened as the litter grew.
 fn request_body_path() -> String {
     let sandbox = crate::tools::get_sandbox_root();
+    let pid = libakuma::getpid();
     if sandbox == "/" {
-        String::from("/tmp/.meow_request.json")
+        format!("/tmp/.meow_request.{}.json", pid)
     } else {
-        format!("{}/tmp/.meow_request.json", sandbox)
+        format!("{}/tmp/.meow_request.{}.json", sandbox, pid)
     }
 }
 
@@ -629,6 +646,15 @@ fn read_streaming_with_http_stream_tls(
     let mut first_token_received = false;
     let mut stream_completed = false;
     let mut ttft_us = 0;
+    // 0 means "no content token has arrived yet", and every read of it must
+    // say so. `stream_us` is `now_us() - stream_start_us`, so computing it
+    // unguarded against a zero start yields the raw CLOCK_MONOTONIC value —
+    // inside a container, the VM's uptime. That is where "Duration: 68m 42s"
+    // on a fifteen-minute-old agent came from (2026-09-21), and it made every
+    // slow-looking turn in the litter unreadable: a response carrying only
+    // `reasoning_content` never sets this, so the stats line reported the
+    // host clock instead of the request. Three of the four read sites had the
+    // guard; the early returns did not.
     let mut stream_start_us = 0;
     let mut pending_tool_calls: Vec<ToolCallData> = Vec::new();
     let mut guard = RunawayGuard::new();
@@ -677,7 +703,7 @@ fn read_streaming_with_http_stream_tls(
                                 full_response.push_str(&content);
                                 if let Some(reason) = guard.check(&full_response) {
                                     cut_off(reason, is_tui);
-                                    let stats = StreamStats { ttft_us, stream_us: now_us() - stream_start_us, total_bytes: full_response.len() };
+                                    let stats = StreamStats { ttft_us, stream_us: if first_token_received { now_us() - stream_start_us } else { 0 }, total_bytes: full_response.len() };
                                     if !pending_tool_calls.is_empty() {
                                         return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
                                     }
@@ -687,7 +713,7 @@ fn read_streaming_with_http_stream_tls(
                             if done {
                                 if is_tui { tui_app::finish_streaming(); }
                                 tui_app::clear_streaming_status();
-                                let stats = StreamStats { ttft_us, stream_us: now_us() - stream_start_us, total_bytes: full_response.len() };
+                                let stats = StreamStats { ttft_us, stream_us: if first_token_received { now_us() - stream_start_us } else { 0 }, total_bytes: full_response.len() };
                                 if !pending_tool_calls.is_empty() {
                                     return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
                                 }
@@ -735,7 +761,7 @@ fn read_streaming_with_http_stream_tls(
                             full_response.push_str(&content);
                             if let Some(reason) = guard.check(&full_response) {
                                 cut_off(reason, is_tui);
-                                let stats = StreamStats { ttft_us, stream_us: now_us() - stream_start_us, total_bytes: full_response.len() };
+                                let stats = StreamStats { ttft_us, stream_us: if first_token_received { now_us() - stream_start_us } else { 0 }, total_bytes: full_response.len() };
                                 if !pending_tool_calls.is_empty() {
                                     return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
                                 }
@@ -791,6 +817,15 @@ fn read_streaming_response_with_progress(
     let mut any_data_received = false;
     let mut stream_completed = false;
     let mut ttft_us = 0;
+    // 0 means "no content token has arrived yet", and every read of it must
+    // say so. `stream_us` is `now_us() - stream_start_us`, so computing it
+    // unguarded against a zero start yields the raw CLOCK_MONOTONIC value —
+    // inside a container, the VM's uptime. That is where "Duration: 68m 42s"
+    // on a fifteen-minute-old agent came from (2026-09-21), and it made every
+    // slow-looking turn in the litter unreadable: a response carrying only
+    // `reasoning_content` never sets this, so the stats line reported the
+    // host clock instead of the request. Three of the four read sites had the
+    // guard; the early returns did not.
     let mut stream_start_us = 0;
     let mut pending_tool_calls: Vec<ToolCallData> = Vec::new();
     let mut guard = RunawayGuard::new();
@@ -831,7 +866,7 @@ fn read_streaming_response_with_progress(
                                 full_response.push_str(&content);
                                 if let Some(reason) = guard.check(&full_response) {
                                     cut_off(reason, is_tui);
-                                    let stats = StreamStats { ttft_us, stream_us: now_us() - stream_start_us, total_bytes: full_response.len() };
+                                    let stats = StreamStats { ttft_us, stream_us: if first_token_received { now_us() - stream_start_us } else { 0 }, total_bytes: full_response.len() };
                                     if !pending_tool_calls.is_empty() {
                                         return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
                                     }
@@ -907,7 +942,7 @@ fn read_streaming_response_with_progress(
                                 full_response.push_str(&content);
                                 if let Some(reason) = guard.check(&full_response) {
                                     cut_off(reason, is_tui);
-                                    let stats = StreamStats { ttft_us, stream_us: now_us() - stream_start_us, total_bytes: full_response.len() };
+                                    let stats = StreamStats { ttft_us, stream_us: if first_token_received { now_us() - stream_start_us } else { 0 }, total_bytes: full_response.len() };
                                     if !pending_tool_calls.is_empty() {
                                         return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
                                     }
@@ -924,7 +959,7 @@ fn read_streaming_response_with_progress(
                     }
                     if let Some(pos) = last_newline { pending_data.drain(..pos + 1); }
                     if is_done {
-                        let stats = StreamStats { ttft_us, stream_us: now_us() - stream_start_us, total_bytes: full_response.len() };
+                        let stats = StreamStats { ttft_us, stream_us: if first_token_received { now_us() - stream_start_us } else { 0 }, total_bytes: full_response.len() };
                         if !pending_tool_calls.is_empty() {
                             return Ok(StreamResponse::CompleteWithTools(full_response, pending_tool_calls, stats));
                         }
