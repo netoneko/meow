@@ -24,22 +24,42 @@ impl ToolResult {
     }
 }
 
-/// Create a fresh sandbox-aware `/tmp/meow_tool_<ts>.txt` for spilling oversized
-/// tool output. Returns the open write fd and its path, or `None` if the file
-/// could not be created. Shared by `handle_output_overflow` (whole-buffer spill)
-/// and the shell's streaming capture sink (`pretend_shell::ReportSink`).
+/// Create a fresh file for spilling oversized tool output. Returns the open
+/// write fd and its path, or `None` if the file could not be created. Shared
+/// by `handle_output_overflow` (whole-buffer spill) and the shell's streaming
+/// capture sink (`pretend_shell::ReportSink`).
+///
+/// Lives **inside the current conversation's session directory**, named after
+/// *this tool call's own id* (`tool_7.txt` for call `#7`) rather than a bare
+/// `/tmp/meow_tool_<timestamp>.txt` with no owner. The id itself is assigned
+/// once per call in `chat.rs`, before the call runs — read back here via
+/// `current_tool_output_seq()`, not drawn fresh, so a spill file's name always
+/// matches the `[tool #N]` reference the model was shown for that same call.
+/// Two things that buys: these are found next to the conversation that
+/// produced them for later inspection, and `Conversation::reseed` can delete
+/// exactly the ones tied to history it just dropped, by name, with no
+/// directory listing needed (this environment has no `readdir`). Falls back
+/// to the old bare-timestamp path under `/tmp` only when no session has set an
+/// output directory yet (a tool call before any `Conversation` exists — not
+/// expected in practice, but cheaper to handle than to rule out).
 pub fn create_tool_tempfile() -> Option<(i32, String)> {
-    let sandbox = get_sandbox_root();
-    let tmp_dir = if sandbox == "/" {
-        String::from("/tmp")
-    } else {
-        format!("{}/tmp", sandbox)
+    let filename = match super::context::tool_output_dir() {
+        Some(dir) => {
+            let _ = mkdir(&dir);
+            let seq = super::context::current_tool_output_seq();
+            format!("{}/tool_{}.txt", dir, seq)
+        }
+        None => {
+            let sandbox = get_sandbox_root();
+            let tmp_dir = if sandbox == "/" {
+                String::from("/tmp")
+            } else {
+                format!("{}/tmp", sandbox)
+            };
+            let _ = mkdir(&tmp_dir);
+            format!("{}/meow_tool_{}.txt", tmp_dir, crate::util::now_us())
+        }
     };
-
-    let _ = mkdir(&tmp_dir);
-
-    let timestamp = crate::util::now_us();
-    let filename = format!("{}/meow_tool_{}.txt", tmp_dir, timestamp);
 
     let fd = open(&filename, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
     if fd >= 0 {

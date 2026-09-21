@@ -184,16 +184,31 @@ mismatch above) — `SIGKILL`ing a process astride an in-progress connect
 and a second thread is exactly the kind of corner this kernel's amd64 port
 has repeatedly gotten wrong in the SMP/thread-teardown paths documented
 elsewhere in this tree (`AMD64_SWITCH_FREED_CR3_UAF`, the context-switch
-page fault under BKL, the orphan/no-slot-recycler class). **Do not `kill
+page fault under BKL, the orphan/no-slot-recycler class). ~~**Do not `kill
 -9` a `meow litter live` process on the real amd64 box** until this is
 root-caused; use a clean shutdown path (a signal `meow` actually handles,
-or let it exit on its own) instead. The operator confirmed independently
+or let it exit on its own) instead.~~ **(2026-09-21: root-caused and fixed —
+`docs/archive/AMD64_SMOLTCP_STALE_HANDLE_KILL9_WEDGE.md`. The kill path was
+never at fault; a stale smoltcp socket handle left behind by the teardown the
+kill triggered panicked inside `akuma-net`. The warning above is retired once
+the fixed kernel is deployed to the box.)** The operator confirmed independently
 that `kill -9` "does not work for unknown reason" on this box and is
 handing that specific investigation to another agent — this phase treats
 it as someone else's open item rather than re-chasing it, and simply avoids
 `kill -9` on `meow` processes here going forward.
 
 ### 4b. Root cause of the wedge, from a photo of the console — REAL kernel panic
+
+**SOLVED 2026-09-21** — this section's read was correct, and the full record
+is [`docs/archive/AMD64_SMOLTCP_STALE_HANDLE_KILL9_WEDGE.md`](../../../docs/archive/AMD64_SMOLTCP_STALE_HANDLE_KILL9_WEDGE.md):
+the stale handle was used by the **blocking syscall paths** in
+`akuma-net/src/socket.rs` and `udp_api.rs` (the `poll()` sweeps and the async
+connect path had guarded themselves; these had not). Every raw
+`net.sockets.get*` there now goes through guarded accessors that answer
+`None` for a dead handle, mapped onto the fallbacks those call sites already
+carried. Verified in QEMU/TCG at SMP=4 with a 10-round spawn-`meow`-`kill -9`
+loop: no wedge, no panic, ssh alive throughout. What remains is deploying the
+fixed kernel to the box.
 
 The third occurrence (after `meow-live` was disabled, no `kill -9` involved
 this time — the box went dark on its own, ~5 minutes after akuma's agent
@@ -300,10 +315,12 @@ yet rule it out as a contributing factor to the wedge.
 - **The akuma↔ryzen join was never confirmed** — both attempts ended with
   the box going dark before a join event reached either side's log.
 - **`kill -9` on `meow litter live` reliably wedges the box — reproduced
-  twice, root cause unknown.** See defect 4. This is now the actual blocker
-  for the phase, ahead of the join itself: until a `meow litter live`
-  process on amd64 can be stopped without wedging the box, iterating on the
-  join at all costs a physical power cycle per attempt.
+  twice, ~~root cause unknown~~ SOLVED 2026-09-21.** Root cause and fix:
+  `docs/archive/AMD64_SMOLTCP_STALE_HANDLE_KILL9_WEDGE.md` (a stale smoltcp
+  socket handle dereferenced by the blocking socket-syscall paths after a
+  sibling thread's teardown closed the fd — see §4b). Remaining work:
+  deploy the fixed kernel to the box and confirm the wedge is dead on the
+  metal; until then the "do not `kill -9` meow" rule stands.
 - **No remote power control for this box** — confirmed against
   `docs/runbooks/amd64-bare-metal-loop.md`; recovery is "hold the power
   button ~5s, or pull the plug," physical actions this session cannot
@@ -325,3 +342,171 @@ yet rule it out as a contributing factor to the wedge.
   permanently stuck — see above) shares any responsibility for the wedge
   by competing for the box's network stack is untested; the cleanest next
   repro is single-`meow`-process only.
+
+## §6: the static-peer relay is blocked by the same bug Phase-adjacent work already found
+
+With the config corrected (§5's fix applied for real this time: `akuma`
+binds `127.0.0.1:7700` locally and lists Ryzen as `litter_static_peers`,
+the way `LITTER_RELAY_TOPOLOGY.md` describes, instead of pointing its own
+`litter_hub_addr` at Ryzen's IP), the akuma-hosted agent correctly became
+its **own** local hub — no more foreign-IP bind. But the cross-litter
+relay to Ryzen never happened, and the reason is visible directly:
+
+```
+$ ssh akuma 'wc -l /tmp/meow/raft.log; ps aux | grep 28'
+18 /tmp/meow/raft.log
+   28 0         0:02 /bin/meow litter live
+# ... waited, checked again ...
+18 /tmp/meow/raft.log
+   28 0         0:04 /bin/meow litter live
+```
+
+The line count never grows past the initial `start` / `state=leader`
+lines — no `owner tick N top`, no `probed (…)`, no `drained (…)`, the
+periodic lines `mimi`'s raft log on Ryzen is full of. CPU time crept from
+0:02 to 0:04 once and then flatlined; the process is alive but its owner
+thread's actual loop body is not running. This is **not a new bug** — it
+is the exact signature `docs/archive/AMD64_SPAWNED_THREAD_NEVER_RUNS.md`
+already documented for the original trashcan↔ryzen join a day earlier: the
+thread starts, performs its one-time setup, and never reaches its first
+loop iteration. Static-peer probing happens inside that same loop
+(`owner tick N top` → `tick N probed (…)` in `mimi`'s log is literally
+where a peer probe would fire), so **no config on either side can make
+this relay work until that thread bug is fixed** — this was never a
+reachability or address-format problem downstream of it.
+
+## §7: narrowed further — it is the *native* thread-spawn path, not amd64 as a whole
+
+Challenged (rightly) on §6: is this really the same bug, given the native
+`/bin/meow` and Ryzen's `linux-net` build are not remotely the same binary
+(different commit, different target, different syscall path)? Tested
+directly rather than assumed — pushed Ryzen's exact `linux-net`
+(`x86_64-unknown-linux-musl`) binary onto the **akuma box itself** under a
+different name (`/bin/meow-linuxnet`), with its own isolated config
+(`MEOW_HOME=/tmp/lntest`, port 7701, no interaction with the native
+process already running on 7700). Same kernel, same physical hardware,
+only the binary's syscall path differs.
+
+**Its owner thread ticks perfectly:**
+
+```
+[763] tick 1 drained (served=1)
+[764] owner tick 2 top
+[765] tick 2 probed (0 results)
+[765] tick 2 drained (served=3)
+... (continues normally, tick count climbing, confirmed still advancing
+     after several more checks — 18 → 27 → 31 raft.log lines over time)
+```
+
+Same box, same amd64 core, same kernel binary the native `/bin/meow` (still
+running alongside on port 7700, still stuck at zero ticks) shares. The only
+variable is the syscall path: `linux-net` routes thread creation through
+Akuma's Linux-ABI-compatible amd64 syscall dispatch (whatever `clone`-style
+call that resolves to); the native build calls `litter_spawn_thread` — an
+`extern "C"` FFI import in `src/rt.rs:179` — straight into Akuma's own
+native thread-creation primitive.
+
+**So "spawned thread never runs its body" is not an amd64-wide limitation —
+it is specific to Akuma's native (non-`linux-net`) thread-spawn path on
+amd64.** The Linux-ABI path spawns a thread that actually executes fine on
+the exact same hardware. That is a much sharper lead than the archive doc
+had: whoever picks this up should diff what `litter_spawn_thread`'s native
+implementation does against whatever the `linux-net`/`clone`-syscall path
+does for thread creation on amd64 — the difference between "starts and
+never runs" and "runs and ticks correctly" lives in that gap, not in
+anything broader about the platform.
+
+**Practical unblock, independent of the kernel fix:** a `meow` built with
+`linux-net` on amd64, running natively on the real box (not cross-compiled
+for a different OS — just a different feature flag), sidesteps this bug
+entirely today. If commanding the akuma agent is the near-term goal, that
+is the path — build `/bin/meow` fresh with `linux-net` (default since
+`82b63c0`) targeting `x86_64-unknown-linux-musl`, not `x86_64-unknown-none`,
+and stage that instead of the current native binary.
+
+This closes out this phase's own investigation. Three kernel-side findings
+handed to whoever picks up the networking/threading work: the native
+amd64 thread-spawn bug is now scoped to a specific code path (§7, sharper
+than the archive's original finding); ~~the `kill -9` wedge traces to a real
+`smoltcp` panic — a stale socket handle (§4/§4b)~~ **the `kill -9` wedge was
+root-caused to that stale socket handle and fixed 2026-09-21 —
+`docs/archive/AMD64_SMOLTCP_STALE_HANDLE_KILL9_WEDGE.md`; §4b's "do not
+kill -9 meow" caution is retired once the fixed kernel reaches the box**;
+and the
+`ConnectionRefused`-for-timeout mislabeling was already flagged in
+`AMD64_PROXY_ARP_UNREACHABLE.md` §4, not new. Nothing further on the
+`meow` config or protocol side is expected to move any of these until they
+land — except the `linux-net` workaround above, which needs no kernel fix
+at all.
+
+## §8: four `meow`-side bugs found and fixed this round
+
+With the `linux-net` build deployed as `/bin/meow` on akuma (§7's workaround),
+sending it a real task ("does this codebase even work") surfaced problems in
+`meow` itself, not the kernel — found live, fixed, redeployed to both boxes.
+
+**1. Repeated identical tool calls had no loop-guard.** The exact loop from
+earlier in this session (`python3 -c "import akuma; ..."`, retried 10+ times
+verbatim, always `Exit code: 127` — there is no Python on Akuma) had nothing
+stopping it short of `MAX_TOOL_ITERATIONS`. Fixed in `chat_once`
+(`src/app/chat.rs`): a call repeated with byte-identical arguments a third
+time is refused outright — no execution, no wasted model turn — with a
+tool-result message telling the model plainly it is not allowed and to think
+of something else, rather than a bare failure it might read as "try again".
+
+**2. Every wake started a genuinely fresh, empty conversation.** `run_turn`
+called `Conversation::new_session` — `O_TRUNC`, id regenerated — on *every*
+wake, so a resident agent relearned everything from zero each time it was
+nudged, restarted, or rebooted; the loop-guard above only bounded the damage
+*within* one wake, not across the many wakes a stuck task produces overnight.
+Fixed with `Conversation::resume_or_new` (`src/app/history.rs`) and a stable
+per-agent id (`session::live_session_id()`, literally `"live"` — sessions are
+already `MEOW_HOME`-scoped, so no per-agent-name id was needed). The
+conversation is now built **once**, outside the main loop, and only ever
+reset by the same local `auto_compact_if_needed` threshold that already
+governed the interactive path — not by every wake, and not by any
+cluster-level signal either, matching the design intent this was checked
+against: compaction is a local decision a cluster event can inform, never an
+outside authority that truncates out from under it.
+
+**3. The raft log was never rotated.** `O_APPEND` forever, by design
+("appended across restarts") — measured at 400+ KB after about a day for an
+agent that was permanently stuck doing nothing but tick (the pre-existing
+`sherlock` litter, §"A pre-existing, unrelated litter"). Fixed with a 4 MB
+cap (`RAFT_LOG_CAP_BYTES`) checked every 10 ticks: past the cap, the log is
+rotated by reopening the same path with `O_TRUNC` and atomically swapping the
+shared fd — no `ftruncate` on this target, so this is the same "point at the
+file, not the fd" trick `set_raft_log` already used to open it the first
+time. A write racing the swap lands on whichever fd was current at that
+instant; losing one line to that race is the acceptable side of a trade
+against unbounded growth in a debug trail, not data anything depends on.
+
+**4. Oversized tool output spilled to orphaned, uncleaned files.** Confirmed
+on disk, not just in code: real `meow_tool_<timestamp>.txt` files from past
+sessions were found still sitting in `/tmp` and under `/src`, with no code
+path anywhere that ever deletes one. Redesigned rather than patched, per a
+design conversation mid-session:
+
+- Every tool call — not just ones that overflow — gets a session-scoped,
+  sequential id (`tools::context::next_tool_output_seq`), shown to the model
+  as `[tool #N]` in its result so a later turn can reference a specific past
+  call by name instead of only its own paraphrase.
+- A spill file lives **inside the session directory**, named after that same
+  id (`tool_7.txt` for call `#7`) — findable next to the conversation that
+  produced it, and inspectable later by a human or the model
+  (`FileReadLines`/`CodeSearch`, as the overflow message already suggested).
+- `Conversation::reseed` — the one place old history actually gets dropped —
+  unlinks every `tool_<n>.txt` up to the current count before truncating the
+  conversation and zeroing the counter. No `readdir` on this target, so
+  cleanup only works *because* the naming is deterministic; a resumed session
+  (fix 2) probes forward from `tool_1.txt` to find where it left off rather
+  than risk overwriting a file the resumed history still points at.
+
+Net effect: tool-output files now live exactly as long as the conversation
+section that references them, never longer, with no directory listing
+required anywhere in the mechanism.
+
+All four fixed, self-tested (`meow test`: same two pre-existing, unrelated
+failures as baseline — `StreamingRenderer` 2/4, `litter-tasks` 14/15 — no
+regressions), and redeployed to both `mimi` (Ryzen) and `akuma` (the real
+box, `linux-net` build) as of this writing.

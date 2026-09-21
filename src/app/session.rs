@@ -52,6 +52,18 @@ pub fn generate_session_id() -> String {
     format!("{:x}-{:x}", stamp, pid)
 }
 
+/// The live litter agent's own conversation, stable across process restarts.
+///
+/// Unlike `generate_session_id()` (fresh every call, by design, for the
+/// interactive/CLI path where each invocation is its own conversation), the
+/// live agent is one long-running identity and its conversation should
+/// survive a restart the same way — picked back up, not thrown away. A
+/// per-agent id isn't needed here: `sessions_root()` is already scoped by
+/// `MEOW_HOME`, so each resident agent has its own directory regardless.
+pub fn live_session_id() -> String {
+    String::from("live")
+}
+
 /// Directory that holds one session's files.
 pub fn session_dir(id: &str) -> String {
     format!("{}/{}", sessions_root(), id)

@@ -55,9 +55,20 @@ const PROBE_TIMEOUT_US: u64 = 500_000;
 /// How many pulses to skip after a failed probe, doubling to this cap.
 ///
 /// A peer that answers is probed every pulse; one that does not is probed on
-/// pulses 1, 2, 4, 8, 16 … so a dead or starved peer costs a bounded fraction of
+/// pulses 1, 2, 4, 8 … so a dead or starved peer costs a bounded fraction of
 /// this hub's serving time instead of all of it.
-const PROBE_BACKOFF_MAX: u32 = 5;
+///
+/// Was 5 (32-pulse cap, 160s at `PULSE_TICKS=5`/`TICK_SECS=1`) until
+/// `LITTER_EXPERIMENT_PHASE_4.md` measured what that costs on a LAN: `mimi`
+/// backed off to the cap while probing a genuinely-dead `akuma` binary, and
+/// after `akuma` came back with a *working* one, `mimi` sat for minutes
+/// before its next scheduled attempt happened to land — `probe_failures` is
+/// cleared the instant a probe succeeds (see `apply_probe_results` below),
+/// but a peer stuck at max backoff simply isn't tried often enough to
+/// notice. 3 (8-pulse cap, 40s) keeps the same shape — still a bounded,
+/// exponentially-decaying cost against a truly dead peer — while cutting
+/// worst-case rediscovery time on a LAN by 4x.
+const PROBE_BACKOFF_MAX: u32 = 3;
 
 /// How often the raft thread says it is alive, in ticks.
 const HEARTBEAT_TICKS: u64 = 10;
@@ -236,6 +247,58 @@ fn raft_log_fd() -> Option<i32> {
     if fd >= 0 { Some(fd) } else { None }
 }
 
+/// Cap on the raft log before it gets rotated (truncated). Set by measurement,
+/// not a guess: `docs/LITTER_EXPERIMENT_PHASE_4.md` found a resident agent's
+/// raft log at 400+ KB after roughly a day of an agent that was permanently
+/// stuck doing nothing but tick — the file was never rotated because nothing
+/// here ever did, `O_APPEND` forever, "appended across restarts" by design.
+/// 4 MB keeps tens of thousands of recent lines (this is a debug trail, not a
+/// record anything depends on) while making unbounded growth structurally
+/// impossible rather than merely unlikely.
+const RAFT_LOG_CAP_BYTES: i64 = 4 * 1024 * 1024;
+
+/// Rotate the raft log if it has grown past `RAFT_LOG_CAP_BYTES`.
+///
+/// Called periodically from the main loop's own tick (not from `raft_logf!`
+/// itself, which must stay allocation-free and cannot afford an `fstat` on
+/// every single line). Truncates rather than deletes-and-recreates: the path
+/// stays valid for whichever thread already has it open.
+///
+/// Reopens the *same path* with `O_TRUNC` and swaps the shared fd rather than
+/// calling a truncate syscall on the fd already held, because libakuma has no
+/// `ftruncate` — this is the same "point at the file, not the fd" trick
+/// `set_raft_log` uses to open it the first time. A write from the other
+/// thread racing this swap lands on whichever fd was current at that instant
+/// — the old one (fine, about to close) or the new one (fine, freshly
+/// truncated) — never a torn write or a crash; this is a diagnostic trail,
+/// not data anything correctness-depends on, and losing one line to a race
+/// during rotation is the acceptable side of that trade.
+fn rotate_raft_log_if_needed() {
+    let Some(old_fd) = raft_log_fd() else { return };
+    let Ok(stat) = libakuma::fstat(old_fd) else { return };
+    if stat.st_size < RAFT_LOG_CAP_BYTES {
+        return;
+    }
+    // Recomputed with the same formula `set_raft_log` used to open it the
+    // first time, rather than read back from the fixed-size `RAFT_LOG_PATH`
+    // buffer that stores it (no getter exists for that — it is written once
+    // and never read elsewhere in this file). `sessions_root()` is a pure
+    // function of process state that does not change over the agent's
+    // lifetime, so recomputing it here always lands on the same path.
+    let path = format!("{}/raft.log", session::sessions_root());
+    let new_fd = libakuma::open(
+        &path,
+        libakuma::open_flags::O_WRONLY | libakuma::open_flags::O_CREAT | libakuma::open_flags::O_TRUNC,
+    );
+    if new_fd < 0 {
+        return;
+    }
+    let prior = RAFT_LOG_FD.swap(new_fd, core::sync::atomic::Ordering::AcqRel);
+    if prior >= 0 {
+        libakuma::close(prior);
+    }
+}
+
 /// Append one formatted line to the raft log, allocating nothing.
 ///
 /// **The raft thread logs here and nowhere else.** It used to `libakuma::print`
@@ -364,6 +427,19 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
     let mut event_epoch: u64 = 0;
     let mut pending_events: Vec<String> = Vec::new();
 
+    // One identity, one conversation, resumed rather than recreated — see
+    // `Conversation::resume_or_new`. Built once here, outside the loop, and
+    // threaded into every `run_turn` call below; only `auto_compact_if_needed`
+    // (inside `chat_once`) ever resets it now.
+    let mut conversation = Conversation::resume_or_new(
+        session::live_session_id(),
+        &[
+            ChatMessage::new("system", &system_prompt),
+            ChatMessage::new("user", "[System Context] Current working directory: /\nNo sandbox restrictions."),
+            ChatMessage::new("assistant", "Understood."),
+        ],
+    );
+
     loop {
         tick += 1;
         // What has the raft thread managed? Reported from HERE, by the main
@@ -379,6 +455,7 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                 RAFT_ALIVE.load(core::sync::atomic::Ordering::Acquire),
                 RAFT_STAGE.load(core::sync::atomic::Ordering::Acquire)
             );
+            rotate_raft_log_if_needed();
         }
 
         match &mut machine {
@@ -403,7 +480,7 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                         let (feed, next) = drain_feed_local(ctx, listener, &me, cursor);
                         cursor = next;
                         if feed.iter().any(|m| rouses(m, &me)) {
-                            run_turn(&me, &model, &provider, &system_prompt, &feed, &pending_events, &addr);
+                            run_turn(&me, &model, &provider, &system_prompt, &feed, &pending_events, &addr, &mut conversation);
                         pending_events.clear();
                         }
                     }
@@ -429,7 +506,7 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                     let (feed, next) = drain_feed(&addr, &me, cursor);
                     cursor = next;
                     if feed.iter().any(|m| rouses(m, &me)) {
-                        run_turn(&me, &model, &provider, &system_prompt, &feed, &pending_events, &addr);
+                        run_turn(&me, &model, &provider, &system_prompt, &feed, &pending_events, &addr, &mut conversation);
                         pending_events.clear();
                     }
                 }
@@ -462,7 +539,7 @@ pub fn run(model: String, provider: Provider, system_prompt: String) -> ! {
                 let (feed, next) = drain_feed(&addr, &me, cursor);
                 cursor = next;
                 if feed.iter().any(|m| rouses(m, &me)) {
-                    run_turn(&me, &model, &provider, &system_prompt, &feed, &pending_events, &addr);
+                    run_turn(&me, &model, &provider, &system_prompt, &feed, &pending_events, &addr, &mut conversation);
                         pending_events.clear();
                 }
             }
@@ -1242,7 +1319,7 @@ fn wakeable(m: &Message) -> bool {
 /// `TaskUpdate`. That asymmetry is what lets an agent absorb a pile of
 /// events in one pass instead of round-tripping a whole turn per message
 /// (`docs/LITTER_WORKFLOW.md` § "Auto-feed, explicit completion").
-fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str, feed: &[Message], events: &[String], addr: &str) {
+fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str, feed: &[Message], events: &[String], addr: &str, conversation: &mut Conversation) {
     // Give the turn room. The old cap was protecting the hub from a long
     // agent turn; single ownership removed that coupling, and a cap that
     // cannot fit "think, then answer" produces nothing at all — a reasoning
@@ -1254,12 +1331,6 @@ fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str, fee
     // answer and no tool call at all. Not unlimited, because the budget is
     // also the ceiling on how long one agent can hold its own loop.
     api_client::set_max_tokens(8192);
-
-    let session_id = session::generate_session_id();
-    let mut conversation = Conversation::new_session(session_id);
-    conversation.append(&ChatMessage::new("system", system_prompt));
-    conversation.append(&ChatMessage::new("user", "[System Context] Current working directory: /\nNo sandbox restrictions."));
-    conversation.append(&ChatMessage::new("assistant", "Understood."));
 
     libakuma::safe_print!(128, "\n[live] {} wakes on {} new message(s)\n", me, feed.len());
 
@@ -1375,7 +1446,7 @@ fn run_turn(me: &str, model: &str, provider: &Provider, system_prompt: &str, fee
     let mut attempt = 0usize;
     let mut prompt = wake;
     loop {
-        match chat_once(model, provider, &prompt, &mut conversation, None, system_prompt) {
+        match chat_once(model, provider, &prompt, conversation, None, system_prompt) {
             // A transport failure counts against the same budget as an
             // empty answer. It used to break out immediately, which meant an
             // agent whose inference endpoint was erroring never retried and

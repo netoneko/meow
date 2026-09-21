@@ -1,5 +1,6 @@
 use alloc::string::String;
 use alloc::format;
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use crate::config::{Provider, DEFAULT_CONTEXT_WINDOW, COLOR_PEARL, COLOR_GREEN_LIGHT, COLOR_GRAY_BRIGHT, COLOR_RESET, COLOR_YELLOW, TOKEN_LIMIT_FOR_COMPACTION};
@@ -54,7 +55,14 @@ fn announce_tool_call(tc: &ToolCallData) {
     }
 }
 
-fn report_and_append_tool_result(conversation: &mut Conversation, tc: &ToolCallData, tool_result: tools::ToolResult, duration_us: u64) {
+/// `call_id` is this call's session-scoped sequence number (see
+/// `tools::context::next_tool_output_seq`) — surfaced to the model as
+/// `[tool #N]` so a later turn can refer back to a specific past call
+/// ("see tool #7") rather than only its own paraphrase of what happened.
+/// The same number is what a spill file gets named after when this call's
+/// output overflows (`create_tool_tempfile`), so the two references always
+/// agree.
+fn report_and_append_tool_result(conversation: &mut Conversation, tc: &ToolCallData, tool_result: tools::ToolResult, duration_us: u64, call_id: u64) {
     let (color, status) = if tool_result.success { (COLOR_GREEN_LIGHT, "Success") } else { (COLOR_PEARL, "Failed") };
     let status_content = format!("Tool Status: {}", status);
 
@@ -73,9 +81,9 @@ fn report_and_append_tool_result(conversation: &mut Conversation, tc: &ToolCallD
 
     let current_cwd = tools::get_working_dir();
     let result_content = if tool_result.success {
-        format!("{}\n[Current Directory: {}]", tool_result.output, current_cwd)
+        format!("[tool #{}] {}\n[Current Directory: {}]", call_id, tool_result.output, current_cwd)
     } else {
-        format!("Tool failed: {}\n[Current Directory: {}]\n\nPlease analyze the failure and try again.", tool_result.output, current_cwd)
+        format!("[tool #{}] Tool failed: {}\n[Current Directory: {}]\n\nPlease analyze the failure and try again.", call_id, tool_result.output, current_cwd)
     };
     let mut result_msg = Message::new("tool", &result_content);
     result_msg.tool_call_id = Some(tc.id.clone());
@@ -111,6 +119,15 @@ pub fn chat_once(
     // "nothing needed doing" unless we say so. Callers that must not lose a
     // turn (the live agent) use this to re-prompt.
     let mut produced = false;
+
+    // Loop-guard: a tool call repeated with byte-identical arguments is a
+    // model stuck retrying rather than adapting — e.g. assuming a Python
+    // toolchain exists, hitting ENOENT, and calling the exact same `python3`
+    // command again instead of reaching for FileRead/CodeSearch instead
+    // (observed live, `userspace/meow/docs/LITTER_EXPERIMENT_PHASE_4.md`).
+    // Tracked across the whole call, not per iteration, since the loop can
+    // span many iterations before `MAX_TOOL_ITERATIONS` gives up.
+    let mut recent_calls: Vec<(String, String)> = Vec::new();
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
         let current_tokens = conversation.tokens();
@@ -174,11 +191,35 @@ pub fn chat_once(
 
                     produced = true;
                     announce_tool_call(tc);
+                    // Assigned once per call, before it runs, so a spill file
+                    // this call produces (create_tool_tempfile) is named after
+                    // the exact same number shown to the model as `[tool #N]`.
+                    let call_id = tools::context::next_tool_output_seq();
+
+                    let repeats = recent_calls.iter()
+                        .filter(|(n, a)| n == &tc.name && a == &tc.arguments)
+                        .count();
+                    if repeats >= 2 {
+                        // Third identical call: refuse rather than run
+                        // something already proven not to help, and say so
+                        // in terms the model can act on rather than a bare
+                        // failure it might read as "try the same thing again".
+                        let result = tools::ToolResult::err(format!(
+                            "You've called {} with these exact same arguments {} times now. \
+                             Repeating it again will not produce a different result — it is \
+                             not allowed. Think of a different approach.",
+                            tc.name, repeats + 1
+                        ));
+                        report_and_append_tool_result(conversation, tc, result, 0, call_id);
+                        continue;
+                    }
+                    recent_calls.push((tc.name.clone(), tc.arguments.clone()));
+
                     let tool_start = crate::util::now_us();
                     let tool_result = tools::execute_tool_by_name(&tc.name, &tc.arguments)
                         .unwrap_or_else(|| tools::ToolResult::err("Unknown or unsupported tool"));
                     let tool_duration_us = crate::util::now_us() - tool_start;
-                    report_and_append_tool_result(conversation, tc, tool_result, tool_duration_us);
+                    report_and_append_tool_result(conversation, tc, tool_result, tool_duration_us, call_id);
                 }
 
                 auto_compact_if_needed(conversation, system_prompt);
